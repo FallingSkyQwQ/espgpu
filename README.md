@@ -6,6 +6,23 @@
 
 ## 当前状态
 
+**M2 — 2D 光栅器 + 命令流（进行中）**
+
+| 项 | 状态 |
+|---|---|
+| 设备：命令流执行（CLEAR / PIPELINE2D / BIND_TEXTURE / UPLOAD_TEXTURE / DRAW / SCISSOR / PRESENT） | ✅ |
+| 设备：2D 光栅器（边缘函数内测试、最近邻/双线性、alpha 混合、alpha 测试、scissor） | ✅ |
+| 设备：内部 SRAM 工作表面（128 KB，实测确认未退回 PSRAM） | ✅ |
+| 设备：RGB565 / RGBA4444 纹理，16 位像素 + 独立 alpha 平面 | ✅ |
+| 主机：`espgpu_cmd_*` 批量命令 API | ✅ |
+| 主机：`espgpu-demo.exe` 2D 演示（滚动纹理 / 旋转 alpha 精灵 / scissor 进度条） | ✅ |
+| 设备：纹理 LRU 换页 | ⬜ M3 |
+| 性能优化（IRAM 热循环、tile 化） | ⬜ 待做 |
+
+实测：320×200 RGB565，滚动纹理 + 旋转精灵 + 进度条，**7.6 fps / 201 KB/s**。
+带宽只用了 26%（201/768 KB/s），说明当前瓶颈在**光栅化与编码的 CPU 侧**
+（热循环还在 flash XIP 上跑，没搬进 IRAM）。这是 M3 开始前明确的优化项。
+
 **M1 — 链路打通（完成，已在真实硬件上验证）**
 
 | 项 | 状态 |

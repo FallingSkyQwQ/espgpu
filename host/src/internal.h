@@ -80,6 +80,7 @@ struct espgpu_device {
     std::thread reader;
     std::atomic<bool> running{false};
     std::atomic<bool> connected{false};
+    std::atomic<bool> need_keyframe{false}; /**< 解码失败后请求设备重新发关键帧 */
 
     /* 接收重组缓冲：USB 是字节流，Chunk 可以跨多次读到达 */
     std::vector<uint8_t> rx;
@@ -113,6 +114,9 @@ struct espgpu_device {
 
     /* 写串行化：控制请求和命令流共用同一条 OUT 端点 */
     std::mutex write_mu;
+
+    /* M2：命令批量缓冲 */
+    std::vector<uint8_t> cmd_buf;
 
     /* 统计 */
     std::mutex stats_mu;

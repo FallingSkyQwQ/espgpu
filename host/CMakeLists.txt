@@ -48,6 +48,7 @@ add_library(espgpu SHARED
     src/link.cpp
     src/winusb.cpp
     src/decode.cpp
+    src/draw.cpp
     src/log.cpp)
 target_include_directories(espgpu
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include ${ESPGPU_SHARED_DIR}
@@ -66,6 +67,11 @@ add_executable(espgpu-bench
     tests/bench.cpp)
 target_link_libraries(espgpu-bench PRIVATE espgpu)
 
+# ── espgpu-demo.exe — M2 的 2D 渲染演示 ─────────────────────────────
+add_executable(espgpu-demo
+    demo/main.cpp)
+target_link_libraries(espgpu-demo PRIVATE espgpu)
+
 # 让 exe 能从输出目录直接找到 DLL
 add_custom_command(TARGET espgpu-panel POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -73,3 +79,6 @@ add_custom_command(TARGET espgpu-panel POST_BUILD
 add_custom_command(TARGET espgpu-bench POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-bench>)
+add_custom_command(TARGET espgpu-demo POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-demo>)

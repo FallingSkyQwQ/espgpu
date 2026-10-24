@@ -4,6 +4,7 @@ idf_component_register(
         "usb_descriptors.c"
         "usb_device.c"
         "framebuffer.c"
+        "raster.c"
         "gpu.c"
     INCLUDE_DIRS "."
     REQUIRES espgpu_proto esp_driver_tsens esp_psram esp_timer nvs_flash esp_tinyusb

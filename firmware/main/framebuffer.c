@@ -180,32 +180,30 @@ static size_t rle_u16(const uint8_t *curb, const uint8_t *refb, uint8_t *out, si
 #undef LOAD
 }
 
-esp_err_t espgpu_fb_encode(espgpu_fb_t *fb, uint8_t codec, uint8_t *out, size_t out_cap,
-                           espgpu_fb_encode_result_t *result)
+esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes, unsigned bpp,
+                            uint8_t codec, uint8_t *out, size_t cap,
+                            espgpu_fb_encode_result_t *result)
 {
-    if (fb == NULL || out == NULL) {
+    if (cur == NULL || out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    const uint8_t *cur = espgpu_fb_draw(fb);
-    const uint8_t *ref = (codec == ESPGPU_CODEC_DELTA_RLE) ? espgpu_fb_ref(fb) : NULL;
 
     size_t encoded = 0;
     switch (codec) {
     case ESPGPU_CODEC_RAW:
-        if (out_cap < fb->size) {
+        if (cap < bytes) {
             return ESP_ERR_INVALID_SIZE;
         }
-        memcpy(out, cur, fb->size);
-        encoded = fb->size;
+        memcpy(out, cur, bytes);
+        encoded = bytes;
         break;
 
     case ESPGPU_CODEC_RLE:
     case ESPGPU_CODEC_DELTA_RLE:
-        if (fb->bpp == 1) {
-            encoded = rle_u8(cur, ref, out, out_cap, fb->size);
+        if (bpp == 1) {
+            encoded = rle_u8(cur, ref, out, cap, bytes);
         } else {
-            encoded = rle_u16(cur, ref, out, out_cap, fb->size / 2);
+            encoded = rle_u16(cur, ref, out, cap, bytes / 2);
         }
         if (encoded == 0) {
             return ESP_ERR_INVALID_SIZE;
@@ -217,10 +215,23 @@ esp_err_t espgpu_fb_encode(espgpu_fb_t *fb, uint8_t codec, uint8_t *out, size_t 
     }
 
     if (result) {
-        result->raw_bytes = (uint32_t)fb->size;
+        result->raw_bytes = (uint32_t)bytes;
         result->enc_bytes = (uint32_t)encoded;
     }
     return ESP_OK;
+}
+
+esp_err_t espgpu_fb_encode(espgpu_fb_t *fb, uint8_t codec, uint8_t *out, size_t out_cap,
+                           espgpu_fb_encode_result_t *result)
+{
+    if (fb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t *cur = espgpu_fb_draw(fb);
+    const uint8_t *ref = (codec == ESPGPU_CODEC_DELTA_RLE) ? espgpu_fb_ref(fb) : NULL;
+
+    return espgpu_encode_raw(cur, ref, fb->size, fb->bpp, codec, out, out_cap, result);
 }
 
 /* ── 测试图案 ─────────────────────────────────────────────────────── */

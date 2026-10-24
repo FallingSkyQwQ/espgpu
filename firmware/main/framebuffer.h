@@ -75,6 +75,19 @@ typedef struct {
 esp_err_t espgpu_fb_encode(espgpu_fb_t *fb, uint8_t codec, uint8_t *out, size_t out_cap,
                            espgpu_fb_encode_result_t *result);
 
+/**
+ * 对任意裸缓冲编码。M2 的光栅器把结果画在内部 SRAM 的 surface 上，
+ * 不需要经过 espgpu_fb_t，所以把编码器拆出来单独可用。
+ *
+ * @param cur   当前帧
+ * @param ref   差分参考帧，可为 NULL
+ * @param bytes 帧字节数
+ * @param bpp   每像素字节数（1 或 2）
+ */
+esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes, unsigned bpp,
+                            uint8_t codec, uint8_t *out, size_t cap,
+                            espgpu_fb_encode_result_t *result);
+
 /** 编码后最坏情况的上界，用于分配输出缓冲。 */
 size_t espgpu_fb_max_encoded(const espgpu_fb_t *fb);
 

@@ -62,12 +62,20 @@ void on_frame_chunk(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uin
     dev->cur_frag_expect = static_cast<uint8_t>(fh.frag_index + 1);
 
     if (fh.flags & ESPGPU_FF_LAST) {
-        if (!dev->cur_broken && dev->cur_frag_expect == dev->cur_frag_count) {
-            frame_decode(dev, dev->enc.data(), dev->enc.size(), fh.raw_len, fh.width, fh.height,
-                         fh.format, fh.codec);
+        const bool complete = !dev->cur_broken && dev->cur_frag_expect == dev->cur_frag_count &&
+                             dev->enc.size() == fh.total_enc;
+        if (complete) {
+            if (frame_decode(dev, dev->enc.data(), dev->enc.size(), fh.raw_len, fh.width,
+                             fh.height, fh.format, fh.codec) != 0) {
+                /* 解码失败 = 参考帧已经和设备的 shadow 错位，必须重新对齐，
+                 * 否则后续所有差分帧都会带残影 */
+                dev->need_keyframe = true;
+            }
         } else {
             std::lock_guard<std::mutex> lk(dev->stats_mu);
             dev->stats.frames_dropped++;
+            dev->stats.fragments_lost++;
+            dev->need_keyframe = true;
         }
         dev->enc.clear();
         dev->cur_broken = false;

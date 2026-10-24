@@ -119,6 +119,7 @@ enum {
     ESPGPU_OP_PRESENT = 0x0C,       /**< 呈现当前帧 */
     ESPGPU_OP_QUERY = 0x0D,         /**< 查询统计 */
     ESPGPU_OP_FENCE = 0x0E,         /**< 同步点，设备回 FLUSH 事件 */
+    ESPGPU_OP_PIPELINE2D = 0x10,    /**< M2：2D 管线子集 */
 };
 
 /* ── 像素格式 ─────────────────────────────────────────────────────── */
@@ -320,6 +321,28 @@ enum {
     ESPGPU_VSRC_BUFFER = 1,
 };
 
+/** 混合模式（M2 的简化集合，语义对齐 GL） */
+enum {
+    ESPGPU_BLEND_NONE = 0,   /**< 直接覆盖 */
+    ESPGPU_BLEND_ALPHA = 1,  /**< src*a + dst*(1-a) */
+    ESPGPU_BLEND_ADD = 2,    /**< src + dst */
+    ESPGPU_BLEND_MUL = 3,    /**< src * dst */
+};
+
+/**
+ * M2 的 2D 顶点：屏幕坐标 + 纹理坐标 + 顶点色。
+ *
+ * 坐标为 int16 定点：
+ *   x, y  —— 1/16 像素，范围 ±2048 像素，够 800x600 用
+ *   u, v  —— 1/16 texel
+ * 8 字节/顶点，4 顶点/四边形 = 32 字节/四边形。
+ */
+typedef struct {
+    int16_t x, y;
+    int16_t u, v;
+    uint16_t color; /**< RGB565 顶点色 */
+} espgpu_vertex2d_t;
+
 typedef struct {
     uint8_t prim;      /**< ESPGPU_PRIM_* */
     uint8_t source;    /**< ESPGPU_VSRC_* */
@@ -340,6 +363,42 @@ typedef struct {
     uint16_t color;     /**< RGB565 */
     uint32_t depth;     /**< 深度清除值（16 位有效） */
 } espgpu_clear_t;
+
+/* ── M2：2D 绘制命令 ──────────────────────────────────────────────── */
+
+/** M2 的管线子集。字段是追加式的，后续阶段只会在后面加字段。 */
+typedef struct {
+    uint8_t blend;      /**< ESPGPU_BLEND_* */
+    uint8_t filter;     /**< ESPGPU_FILTER_* */
+    uint8_t wrap;       /**< ESPGPU_WRAP_* */
+    uint8_t alpha_test;
+    uint8_t alpha_ref;
+    uint8_t pad[3];
+} espgpu_pipeline2d_t;
+
+typedef struct {
+    uint16_t unit;
+    uint16_t texture;
+    uint8_t filter;
+    uint8_t wrap;
+    uint16_t pad;
+} espgpu_bind_texture_t;
+
+/**
+ * 纹理上传。一张纹理可拆成多条命令：
+ *   offset == 0 的那条负责分配并按 total_len 校验，后续条按 offset 续写。
+ */
+typedef struct {
+    uint32_t id;
+    uint16_t width;
+    uint16_t height;
+    uint32_t offset;    /**< 本分片在纹理内的字节偏移 */
+    uint32_t total_len; /**< 整张纹理的字节数 */
+    uint8_t format;     /**< ESPGPU_FMT_RGB565 / RGBA4444 */
+    uint8_t filter;
+    uint8_t wrap;
+    uint8_t pad;
+} espgpu_upload_texture_t;
 
 /* ════════════════════════════════════════════════════════════════════
  * 3. Frame 层（D2H）
@@ -375,6 +434,7 @@ typedef struct {
     uint16_t origin_h;
     uint32_t data_len;   /**< 本分片内编码数据字节数 */
     uint32_t raw_len;    /**< 整帧裸数据字节数 */
+    uint32_t total_enc;  /**< 整帧编码后字节数，主机用它校验分片是否有缺失 */
     uint8_t format;      /**< ESPGPU_FMT_* */
     uint8_t codec;       /**< ESPGPU_CODEC_* */
     uint8_t frag_index;
@@ -403,6 +463,7 @@ enum {
     ESPGPU_CTRL_OTA_ABORT = 0x0013,
     ESPGPU_CTRL_LOG_SUBSCRIBE = 0x0020,
     ESPGPU_CTRL_SOFT_RESET = 0x0030,
+    ESPGPU_CTRL_REQUEST_KEYFRAME = 0x0031, /**< 主机解码失败时要求下一帧走非差分 */
 };
 
 /** 状态码 */

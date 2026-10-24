@@ -6,10 +6,23 @@
 #include "freertos/semphr.h"
 #include "espgpu_proto.h"
 #include "framebuffer.h"
+#include "raster.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define ESPGPU_MAX_TEXTURE_SLOTS 32
+
+/** 纹理槽。像素在 PSRAM，alpha 平面可选。 */
+typedef struct {
+    uint32_t id;
+    bool used;
+    espgpu_texture_t tex;
+    uint32_t total_len;
+    uint32_t received;
+    uint8_t format;
+} espgpu_tex_t;
 
 /** 设备全局状态。单实例，由 gpu.c 持有。 */
 typedef struct {
@@ -26,6 +39,17 @@ typedef struct {
     espgpu_mode_t pending_mode;
     uint8_t pending_pattern;
     volatile bool mode_pending;
+
+    /* ── M2：命令驱动渲染 ── */
+    espgpu_surface_t surface;      /**< 内部 SRAM 工作缓冲，RGB565 */
+    uint8_t *shadow;               /**< PSRAM，上一帧已发送内容（差分参考） */
+    size_t shadow_bytes;
+    espgpu_tex_t textures[ESPGPU_MAX_TEXTURE_SLOTS];
+    espgpu_tex_t *bound_texture[ESPGPU_MAX_TEXTURE_UNITS];
+    espgpu_draw_state_t draw_state;
+    bool command_mode;             /**< true = 由命令流驱动，停掉测试图案 */
+    uint8_t frame_codec;           /**< PRESENT 时使用的编码 */
+    uint32_t frames_since_key;     /**< 距上一个关键帧的帧数，用于兜底重建参考帧 */
 
     uint32_t frame_id;
     uint32_t present_period_us;

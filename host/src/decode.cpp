@@ -49,9 +49,13 @@ bool rle_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len
         if (c & 0x80) {
             const size_t run = static_cast<size_t>(c & 0x7F) + 2;
             if (si + bpp > src_len) {
+                log_msg(LOG_WARN, "rle: truncated run at si=%zu/%zu di=%zu/%zu", si, src_len,
+                        di, dst_len);
                 return false;
             }
             if (di + run * bpp > dst_len) {
+                log_msg(LOG_WARN, "rle: run overflow si=%zu di=%zu run=%zu dst=%zu", si, di,
+                        run, dst_len);
                 return false;
             }
             if (bpp == 1) {
@@ -70,6 +74,8 @@ bool rle_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len
             const size_t n = static_cast<size_t>(c) + 1;
             const size_t bytes = n * bpp;
             if (si + bytes > src_len || di + bytes > dst_len) {
+                log_msg(LOG_WARN, "rle: literal overflow si=%zu/%zu di=%zu/%zu n=%zu dst=%zu",
+                        si, src_len, di, dst_len, n, dst_len);
                 return false;
             }
             memcpy(dst + di, src + si, bytes);
@@ -77,15 +83,19 @@ bool rle_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len
             di += bytes;
         }
     }
-    return di == dst_len;
+    if (di != dst_len) {
+        log_msg(LOG_WARN, "rle: length mismatch produced=%zu expected=%zu consumed=%zu/%zu", di,
+                dst_len, si, src_len);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
 
 int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_t raw_len,
                  int w, int h, uint8_t format, uint8_t codec)
-{
-    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+{    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
         log_msg(LOG_WARN, "bad frame size %dx%d", w, h);
         return -1;
     }

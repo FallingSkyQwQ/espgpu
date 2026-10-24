@@ -240,6 +240,13 @@ int espgpu_poll(espgpu_device_t *dev, int timeout_ms)
 
     update_window(dev);
 
+    /* 解码失败后主动要求一帧关键帧，让差分参考帧重新对齐 */
+    if (dev->need_keyframe.load()) {
+        dev->need_keyframe = false;
+        std::vector<uint8_t> resp;
+        link_ctrl(dev, ESPGPU_CTRL_REQUEST_KEYFRAME, 0, 0, nullptr, 0, resp, 500);
+    }
+
     std::lock_guard<std::mutex> lk(dev->frame_mu);
     if (dev->frame_ready && dev->frame_id != dev->last_polled_frame) {
         dev->last_polled_frame = dev->frame_id;

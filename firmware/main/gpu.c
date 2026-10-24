@@ -158,6 +158,25 @@ static esp_err_t apply_mode_locked(const espgpu_mode_t *mode, uint8_t pattern)
         }
     }
 
+    /* 工作表面与差分参考帧也要跟着改尺寸 */
+    if (g_gpu.surface.width != m.width || g_gpu.surface.height != m.height) {
+        raster_surface_deinit(&g_gpu.surface);
+        if (!raster_surface_init(&g_gpu.surface, m.width, m.height)) {
+            return ESP_ERR_NO_MEM;
+        }
+        const size_t bytes = (size_t)m.width * m.height * 2;
+        if (g_gpu.shadow_bytes < bytes) {
+            if (g_gpu.shadow) {
+                heap_caps_free(g_gpu.shadow);
+            }
+            g_gpu.shadow = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+            g_gpu.shadow_bytes = (g_gpu.shadow != NULL) ? bytes : 0;
+        }
+        if (g_gpu.shadow) {
+            memset(g_gpu.shadow, 0, bytes);
+        }
+    }
+
     g_gpu.mode = m;
     g_gpu.pattern = pattern < ESPGPU_PATTERN_COUNT ? pattern : ESPGPU_PATTERN_DOOMISH;
     g_gpu.present_period_us = 1000000u / m.max_fps;
@@ -213,7 +232,7 @@ void espgpu_gpu_set_clut(const uint16_t *clut)
 /* ── 帧发送 ───────────────────────────────────────────────────────── */
 
 static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_len,
-                            uint8_t codec)
+                            uint8_t codec, uint16_t w, uint16_t h, uint8_t format)
 {
     const uint32_t hdr_sz = (uint32_t)sizeof(espgpu_frame_hdr_t);
     const uint32_t frag_cap = ESPGPU_CHUNK_MAX_PAYLOAD - hdr_sz;
@@ -243,15 +262,16 @@ static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_l
 
         espgpu_frame_hdr_t fh = {
             .frame_id = g_gpu.frame_id,
-            .width = g_gpu.fb.width,
-            .height = g_gpu.fb.height,
+            .width = w,
+            .height = h,
             .origin_x = 0,
             .origin_y = 0,
-            .origin_w = g_gpu.fb.width,
-            .origin_h = g_gpu.fb.height,
+            .origin_w = w,
+            .origin_h = h,
             .data_len = n,
             .raw_len = raw_len,
-            .format = g_gpu.fb.format,
+            .total_enc = enc_len,
+            .format = format,
             .codec = codec,
             .frag_index = (uint8_t)i,
             .frag_count = (uint8_t)frag_count,
@@ -287,7 +307,8 @@ void espgpu_gpu_present_task(void *arg)
             g_gpu.mode_pending = false;
         }
 
-        if (!g_gpu.streaming || !espgpu_usb_ready() || g_gpu.enc_buf == NULL) {
+        if (!g_gpu.streaming || g_gpu.command_mode || !espgpu_usb_ready() ||
+            g_gpu.enc_buf == NULL) {
             xSemaphoreGive(g_gpu.lock);
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -316,7 +337,8 @@ void espgpu_gpu_present_task(void *arg)
         }
 
         /* 3. 发送 */
-        err = send_frame(g_gpu.enc_buf, res.enc_bytes, res.raw_bytes, codec);
+        err = send_frame(g_gpu.enc_buf, res.enc_bytes, res.raw_bytes, codec, g_gpu.fb.width,
+                         g_gpu.fb.height, g_gpu.fb.format);
         int64_t t3 = esp_timer_get_time();
 
         if (err == ESP_OK) {
@@ -397,6 +419,11 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         s_boot_us = esp_timer_get_time();
         break;
 
+    case ESPGPU_CTRL_REQUEST_KEYFRAME:
+        /* 主机解码失败时用这个把两边重新对齐 */
+        g_gpu.force_keyframe = true;
+        break;
+
     default:
         status = ESPGPU_ERR_UNSUPPORTED;
         break;
@@ -406,9 +433,302 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
     espgpu_usb_send_ctrl_resp(req->op, req->seq, status, NULL, 0, 500);
 }
 
+/* ── 纹理管理 ─────────────────────────────────────────────────────── */
+
+static void tex_free_pixels(espgpu_tex_t *t)
+{
+    if (t->tex.pixels) {
+        heap_caps_free(t->tex.pixels);
+        t->tex.pixels = NULL;
+    }
+    if (t->tex.alpha) {
+        heap_caps_free(t->tex.alpha);
+        t->tex.alpha = NULL;
+    }
+    t->tex.width = 0;
+    t->tex.height = 0;
+}
+
+static espgpu_tex_t *tex_find(uint32_t id)
+{
+    for (int i = 0; i < ESPGPU_MAX_TEXTURE_SLOTS; i++) {
+        if (g_gpu.textures[i].used && g_gpu.textures[i].id == id) {
+            return &g_gpu.textures[i];
+        }
+    }
+    return NULL;
+}
+
+static espgpu_tex_t *tex_get_slot(uint32_t id)
+{
+    espgpu_tex_t *t = tex_find(id);
+    if (t) {
+        return t;
+    }
+    for (int i = 0; i < ESPGPU_MAX_TEXTURE_SLOTS; i++) {
+        if (!g_gpu.textures[i].used) {
+            t = &g_gpu.textures[i];
+            memset(t, 0, sizeof(*t));
+            t->id = id;
+            t->used = true;
+            return t;
+        }
+    }
+    /* 槽位耗尽：回收 0 号。M2 的 demo 不会超过 32 张纹理，M3 再上 LRU。 */
+    t = &g_gpu.textures[0];
+    tex_free_pixels(t);
+    memset(t, 0, sizeof(*t));
+    t->id = id;
+    t->used = true;
+    return t;
+}
+
+static esp_err_t cmd_upload_texture(const espgpu_upload_texture_t *u, const uint8_t *data,
+                                    uint32_t len)
+{
+    if (u->width == 0 || u->height == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint32_t pixels = (uint32_t)u->width * u->height;
+    const uint32_t expected = pixels * 2; /* 源格式统一 16 位/像素：RGB565 或 RGBA4444 */
+    if (u->total_len != expected) {
+        ESP_LOGW(TAG, "texture %u: total_len %u != %u", u->id, u->total_len, expected);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if ((u->offset & 1u) || u->offset + len > expected) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    espgpu_tex_t *t = tex_get_slot(u->id);
+
+    if (u->offset == 0) {
+        tex_free_pixels(t);
+        t->tex.width = u->width;
+        t->tex.height = u->height;
+        t->format = u->format;
+        t->total_len = expected;
+        t->received = 0;
+
+        t->tex.pixels = heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM);
+        if (t->tex.pixels == NULL) {
+            ESP_LOGE(TAG, "texture %u: pixel alloc failed (%u bytes)", u->id,
+                     (unsigned)(pixels * 2));
+            return ESP_ERR_NO_MEM;
+        }
+        if (u->format == ESPGPU_FMT_RGBA4444) {
+            t->tex.alpha = heap_caps_malloc(pixels, MALLOC_CAP_SPIRAM);
+            if (t->tex.alpha == NULL) {
+                tex_free_pixels(t);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+    } else if (t->total_len != expected || t->tex.width != u->width ||
+               t->tex.height != u->height) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 上传时就展开成 RGB565 + alpha 平面，光栅器内层循环只管取 16 位 */
+    const uint32_t first = u->offset / 2;
+    const uint32_t n = len / 2;
+    for (uint32_t i = 0; i < n; i++) {
+        uint16_t s;
+        memcpy(&s, data + i * 2, 2);
+        const uint32_t idx = first + i;
+        if (u->format == ESPGPU_FMT_RGBA4444) {
+            const uint32_t r = (s >> 12) & 0xF;
+            const uint32_t g = (s >> 8) & 0xF;
+            const uint32_t b = (s >> 4) & 0xF;
+            const uint32_t a = s & 0xF;
+            t->tex.pixels[idx] =
+                (uint16_t)(((r * 31 / 15) << 11) | ((g * 63 / 15) << 5) | (b * 31 / 15));
+            t->tex.alpha[idx] = (uint8_t)(a * 17);
+        } else {
+            t->tex.pixels[idx] = s;
+        }
+    }
+    t->received += len;
+    return ESP_OK;
+}
+
+/* ── PRESENT ──────────────────────────────────────────────────────── */
+
+static esp_err_t cmd_present(void)
+{
+    const uint16_t w = g_gpu.surface.width;
+    const uint16_t h = g_gpu.surface.height;
+    const size_t bytes = (size_t)w * h * 2;
+
+    if (g_gpu.enc_buf == NULL || g_gpu.shadow == NULL || bytes == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* enc_buf 是命令任务和呈现任务共用的。测试图案那一侧持有 g_gpu.lock，
+     * 这里也必须持有，否则两边会交错写同一块缓冲，解出来是垃圾流。 */
+    xSemaphoreTake(g_gpu.lock, portMAX_DELAY);
+
+    uint8_t codec = g_gpu.frame_codec;
+    if (codec == ESPGPU_CODEC_DELTA_RLE && g_gpu.force_keyframe) {
+        codec = ESPGPU_CODEC_RLE;
+    }
+    /* 周期性关键帧：主机解码一旦失败，它的参考帧就和设备的 shadow 永久错位，
+     * 表现为残影。每隔一段时间强制发一帧非差分，把两边重新对齐。 */
+    if (codec == ESPGPU_CODEC_DELTA_RLE && g_gpu.frames_since_key >= 60) {
+        codec = ESPGPU_CODEC_RLE;
+    }
+
+    espgpu_fb_encode_result_t res;
+    /* 关键：只有 DELTA_RLE 才传参考帧。关键帧（RLE）如果也传了 shadow，
+     * 编码端做了异或而解码端没有，解出来必然是垃圾（表现为残影和流长度越界）。 */
+    const uint8_t *ref = (codec == ESPGPU_CODEC_DELTA_RLE) ? g_gpu.shadow : NULL;
+    esp_err_t err = espgpu_encode_raw((const uint8_t *)g_gpu.surface.pixels, ref, bytes, 2,
+                                      codec, g_gpu.enc_buf, g_gpu.enc_cap, &res);
+    if (err != ESP_OK) {
+        g_gpu.stats.frames_dropped++;
+        return err;
+    }
+
+    err = send_frame(g_gpu.enc_buf, res.enc_bytes, res.raw_bytes, codec, w, h,
+                     ESPGPU_FMT_RGB565);
+    if (err == ESP_OK) {
+        memcpy(g_gpu.shadow, g_gpu.surface.pixels, bytes);
+        g_gpu.force_keyframe = false;
+        if (codec == ESPGPU_CODEC_RLE) {
+            g_gpu.frames_since_key = 0;
+        } else {
+            g_gpu.frames_since_key++;
+        }
+        g_gpu.frame_id++;
+        g_gpu.stats.frames_presented++;
+    } else {
+        g_gpu.stats.frames_dropped++;
+    }
+
+    g_gpu.stats.frame_raw_bytes = res.raw_bytes;
+    g_gpu.stats.frame_enc_bytes = res.enc_bytes;
+
+    xSemaphoreGive(g_gpu.lock);
+    return err;
+}
+
+/* ── 命令执行 ─────────────────────────────────────────────────────── */
+
+static void exec_cmd(const espgpu_cmd_t *cmd, const uint8_t *body)
+{
+    switch (cmd->op) {
+    case ESPGPU_OP_NOP:
+        break;
+
+    case ESPGPU_OP_CLEAR: {
+        if (cmd->size < sizeof(espgpu_clear_t)) {
+            break;
+        }
+        espgpu_clear_t c;
+        memcpy(&c, body, sizeof(c));
+        raster_clear(&g_gpu.surface, c.color);
+        break;
+    }
+
+    case ESPGPU_OP_PIPELINE2D: {
+        if (cmd->size < sizeof(espgpu_pipeline2d_t)) {
+            break;
+        }
+        espgpu_pipeline2d_t p;
+        memcpy(&p, body, sizeof(p));
+        g_gpu.draw_state.blend = p.blend;
+        g_gpu.draw_state.filter = p.filter;
+        g_gpu.draw_state.wrap = p.wrap;
+        g_gpu.draw_state.alpha_test = p.alpha_test;
+        g_gpu.draw_state.alpha_ref = p.alpha_ref;
+        break;
+    }
+
+    case ESPGPU_OP_BIND_TEXTURE: {
+        if (cmd->size < sizeof(espgpu_bind_texture_t)) {
+            break;
+        }
+        espgpu_bind_texture_t b;
+        memcpy(&b, body, sizeof(b));
+        if (b.unit < ESPGPU_MAX_TEXTURE_UNITS) {
+            g_gpu.bound_texture[b.unit] = b.texture ? tex_find(b.texture) : NULL;
+            if (g_gpu.bound_texture[b.unit]) {
+                g_gpu.draw_state.filter = b.filter;
+                g_gpu.draw_state.wrap = b.wrap;
+            }
+        }
+        break;
+    }
+
+    case ESPGPU_OP_UPLOAD_TEXTURE: {
+        if (cmd->size < sizeof(espgpu_upload_texture_t)) {
+            break;
+        }
+        espgpu_upload_texture_t u;
+        memcpy(&u, body, sizeof(u));
+        esp_err_t err = cmd_upload_texture(&u, body + sizeof(u), cmd->size - sizeof(u));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "upload_texture %u failed: %s", u.id, esp_err_to_name(err));
+        }
+        break;
+    }
+
+    case ESPGPU_OP_DRAW: {
+        if (cmd->size < sizeof(espgpu_draw_t)) {
+            break;
+        }
+        espgpu_draw_t d;
+        memcpy(&d, body, sizeof(d));
+        const uint32_t avail = cmd->size - sizeof(d);
+        const uint32_t stride = sizeof(espgpu_vertex2d_t);
+        const uint32_t count = avail / stride;
+        const uint8_t *verts = body + sizeof(d);
+        espgpu_texture_t *tex =
+            g_gpu.bound_texture[0] ? &g_gpu.bound_texture[0]->tex : NULL;
+
+        if (d.prim == ESPGPU_PRIM_QUADS) {
+            for (uint32_t i = 0; i + 3 < count; i += 4) {
+                espgpu_vertex2d_t v[4];
+                memcpy(v, verts + (size_t)i * stride, sizeof(v));
+                raster_draw_quad(&g_gpu.surface, tex, v, &g_gpu.draw_state);
+                g_gpu.stats.primitives++;
+            }
+            g_gpu.stats.draw_calls++;
+            g_gpu.stats.vertices += count;
+        }
+        break;
+    }
+
+    case ESPGPU_OP_SCISSOR: {
+        if (cmd->size < sizeof(espgpu_rect_t)) {
+            break;
+        }
+        espgpu_rect_t r;
+        memcpy(&r, body, sizeof(r));
+        raster_set_scissor(&g_gpu.surface, (int16_t)r.x, (int16_t)r.y, (int16_t)r.w,
+                           (int16_t)r.h);
+        break;
+    }
+
+    case ESPGPU_OP_PRESENT:
+        g_gpu.command_mode = true;
+        cmd_present();
+        break;
+
+    default:
+        g_gpu.stats.host_errors++;
+        break;
+    }
+}
+
 static void handle_cmd_chunk(const uint8_t *data, uint32_t len)
 {
-    /* M1 还没有光栅器，命令流只做计数与识别，真正的执行在 M2 接入。 */
+    /* 收到任何 GPU 命令就认为主机接管了渲染，停掉 M1 的测试图案自动出帧。
+     * 切换瞬间必须强制关键帧：设备的 shadow 还是全零，而主机的参考帧里
+     * 是测试图案的内容，不重置就必然错位。 */
+    if (!g_gpu.command_mode) {
+        g_gpu.force_keyframe = true;
+    }
+    g_gpu.command_mode = true;
+
     uint32_t off = 0;
     while (off + sizeof(espgpu_cmd_t) <= len) {
         espgpu_cmd_t cmd;
@@ -417,17 +737,8 @@ static void handle_cmd_chunk(const uint8_t *data, uint32_t len)
             g_gpu.stats.host_errors++;
             return;
         }
-
-        switch (cmd.op) {
-        case ESPGPU_OP_PRESENT:
-            /* 由呈现任务自行驱动，这里显式请求一次不额外处理 */
-            break;
-        case ESPGPU_OP_NOP:
-            break;
-        default:
-            g_gpu.stats.cmd_count++;
-            break;
-        }
+        g_gpu.stats.cmd_count++;
+        exec_cmd(&cmd, data + off + sizeof(cmd));
         off += sizeof(cmd) + cmd.size;
     }
 }
@@ -505,6 +816,26 @@ esp_err_t espgpu_gpu_init(void)
     if (err != ESP_OK) {
         return err;
     }
+
+    /* M2：命令驱动渲染用的工作表面与差分参考帧 */
+    if (!raster_surface_init(&g_gpu.surface, 320, 200)) {
+        return ESP_ERR_NO_MEM;
+    }
+    g_gpu.shadow_bytes = (size_t)320 * 200 * 2;
+    g_gpu.shadow = heap_caps_malloc(g_gpu.shadow_bytes, MALLOC_CAP_SPIRAM);
+    if (g_gpu.shadow == NULL) {
+        ESP_LOGE(TAG, "shadow buffer alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    memset(g_gpu.shadow, 0, g_gpu.shadow_bytes);
+
+    g_gpu.draw_state.blend = ESPGPU_BLEND_NONE;
+    g_gpu.draw_state.filter = ESPGPU_FILTER_NEAREST;
+    g_gpu.draw_state.wrap = ESPGPU_WRAP_CLAMP;
+    g_gpu.draw_state.alpha_test = 0;
+    g_gpu.draw_state.alpha_ref = 0;
+    g_gpu.frame_codec = ESPGPU_CODEC_DELTA_RLE;
+    g_gpu.command_mode = false;
 
     g_gpu.mode.width = g_gpu.fb.width;
     g_gpu.mode.height = g_gpu.fb.height;

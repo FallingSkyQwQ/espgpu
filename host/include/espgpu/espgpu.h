@@ -111,6 +111,43 @@ ESPGPU_API uint32_t espgpu_frame_id(espgpu_device_t *dev);
 
 ESPGPU_API const espgpu_link_stats_t *espgpu_link_stats(espgpu_device_t *dev);
 
+/* ── M2：绘制命令 ─────────────────────────────────────────────────── */
+
+/**
+ * 命令是批量提交的：下面这些函数把命令追加进主机侧缓冲，
+ * 缓冲满或调用 espgpu_cmd_present() 时才真正发出去。
+ * 这样一帧通常只占一个 USB Chunk。
+ */
+
+ESPGPU_API int espgpu_cmd_clear(espgpu_device_t *dev, uint16_t color);
+
+ESPGPU_API int espgpu_cmd_set_pipeline(espgpu_device_t *dev, uint8_t blend, uint8_t filter,
+                                       uint8_t wrap, uint8_t alpha_test, uint8_t alpha_ref);
+
+/**
+ * 上传纹理。format 支持 ESPGPU_FMT_RGB565 与 ESPGPU_FMT_RGBA4444。
+ * 超过单个 Chunk 会自动分片。
+ */
+ESPGPU_API int espgpu_cmd_upload_texture(espgpu_device_t *dev, uint32_t id, uint16_t width,
+                                         uint16_t height, uint8_t format, const void *pixels);
+
+/** 绑定纹理到纹理单元 0。id 传 0 表示解绑。 */
+ESPGPU_API int espgpu_cmd_bind_texture(espgpu_device_t *dev, uint32_t id, uint8_t filter,
+                                       uint8_t wrap);
+
+/** 提交四边形。顶点为屏幕坐标（1/16 像素）+ 纹理坐标（1/16 texel）。 */
+ESPGPU_API int espgpu_cmd_draw_quads(espgpu_device_t *dev, const espgpu_vertex2d_t *verts,
+                                     uint32_t quad_count);
+
+ESPGPU_API int espgpu_cmd_scissor(espgpu_device_t *dev, int16_t x, int16_t y, int16_t w,
+                                  int16_t h);
+
+/** 结束一帧：补上 PRESENT，把整批命令发出去。 */
+ESPGPU_API int espgpu_cmd_present(espgpu_device_t *dev, int timeout_ms);
+
+/** 丢弃尚未发送的命令。 */
+ESPGPU_API void espgpu_cmd_discard(espgpu_device_t *dev);
+
 /* ── 诊断 ─────────────────────────────────────────────────────────── */
 
 /** 打开日志输出（level: 0=off 1=error 2=warn 3=info 4=debug）。 */
