@@ -174,9 +174,14 @@ int main(int argc, char **argv)
     espgpu_set_log_level(2);
 
     long max_frames = 0;
+    bool stress_scroll = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             max_frames = atol(argv[++i]);
+        } else if (strcmp(argv[i], "--stress") == 0) {
+            /* 全屏滚动：每帧每个像素都变，差分压缩完全失效，
+             * 用来测链路上限，不代表真实负载。 */
+            stress_scroll = true;
         }
     }
 
@@ -225,10 +230,13 @@ int main(int argc, char **argv)
          * 否则上一帧的进度条裁剪区会把整帧都裁掉。 */
         espgpu_cmd_scissor(dev, 0, 0, kWidth, kHeight);
 
-        /* 1. 背景：2x2 个四边形铺满，UV 滚动 + REPEAT 环绕 */
+        /* 1. 背景：2x2 个四边形铺满。
+         * 默认是静态的（GPU 的典型负载：大部分像素不变，只有局部在动），
+         * 这样 delta+RLE 才能把整帧压到几 KB。--stress 打开滚动，
+         * 用于测链路上限。 */
         {
-            const float uv0 = scroll;
-            const float uv1 = scroll + 2.0f * 64.0f;
+            const float uv0 = stress_scroll ? scroll : 0.0f;
+            const float uv1 = uv0 + 2.0f * 64.0f;
             for (int gy = 0; gy < 2; gy++) {
                 for (int gx = 0; gx < 2; gx++) {
                     float x[4] = {gx * 160.0f, (gx + 1) * 160.0f, (gx + 1) * 160.0f,
@@ -292,7 +300,9 @@ int main(int argc, char **argv)
 
         /* 4. 推进动画并提交 */
         angle += 0.035f;
-        scroll += 0.6f;
+        if (stress_scroll) {
+            scroll += 0.6f;
+        }
         espgpu_cmd_present(dev, 1000);
         frames++;
 
@@ -303,13 +313,21 @@ int main(int argc, char **argv)
             std::this_thread::sleep_for(period - elapsed);
         }
 
+        if (!espgpu_is_connected(dev)) {
+            printf("device lost\n");
+            break;
+        }
+        espgpu_poll(dev, 0);
+
         if (frames % (kTargetFps * 4) == 0) {
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             const espgpu_link_stats_t *ls = espgpu_link_stats(dev);
-            printf("frames %llu  %.1f fps  %.0f KB/s  decode %.2f ms\n",
+            /* 统计窗口在 espgpu_poll 里滚动，所以打印必须放在 poll 之后，
+             * 否则读到的是刚被清零的窗口。 */
+            printf("frames %llu  %.1f fps  %.0f KB/s (bytes_in %u)  decode %.2f ms | resync %u lost %u\n",
                    static_cast<unsigned long long>(frames), frames / secs, ls->in_kbps,
-                   ls->decode_ms);
+                   ls->bytes_in, ls->decode_ms, ls->resyncs, ls->fragments_lost);
             fflush(stdout);
         }
 
@@ -317,12 +335,6 @@ int main(int argc, char **argv)
         if (frames == 96) {
             dump_bmp(dev, "demo-frame.bmp");
         }
-
-        if (!espgpu_is_connected(dev)) {
-            printf("device lost\n");
-            break;
-        }
-        espgpu_poll(dev, 0);
 
         if (max_frames > 0 && static_cast<long>(frames) >= max_frames) {
             printf("done: %ld frames\n", max_frames);

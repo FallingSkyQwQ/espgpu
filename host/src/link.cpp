@@ -39,6 +39,7 @@ void on_frame_chunk(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uin
 
     espgpu_frame_hdr_t fh;
     memcpy(&fh, payload, sizeof(fh));
+
     const uint8_t *data = payload + sizeof(fh);
     const uint32_t data_len = hdr.length - static_cast<uint32_t>(sizeof(fh));
 
@@ -93,6 +94,7 @@ void on_ctrl_resp(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8
     std::lock_guard<std::mutex> lk(dev->ctrl_mu);
     auto it = dev->pending.find(r.seq);
     if (it == dev->pending.end()) {
+        log_msg(LOG_DEBUG, "ctrl resp for unknown seq=%u op=0x%04X", r.seq, r.op);
         return;
     }
     it->second.done = true;
@@ -143,6 +145,11 @@ void dispatch(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8_t *
 
 void parse_rx(espgpu_device *dev)
 {
+    /* 重同步计数先在局部累加，最后一次性写回。
+     * 之前每跳一个字节就 lock 一次 stats_mu，80 万次加锁直接把接收线程拖垮，
+     * 表现为「丢数据 -> 更严重失步 -> 加锁更多」的死循环。 */
+    uint32_t resyncs = 0;
+
     for (;;) {
         const size_t avail = dev->rx.size() - dev->rx_off;
         if (avail < 4) {
@@ -153,8 +160,7 @@ void parse_rx(espgpu_device *dev)
         memcpy(&magic, dev->rx.data() + dev->rx_off, 4);
         if (magic != ESPGPU_MAGIC_D2H) {
             dev->rx_off++;
-            std::lock_guard<std::mutex> lk(dev->stats_mu);
-            dev->stats.resyncs++;
+            resyncs++;
             continue;
         }
 
@@ -168,8 +174,7 @@ void parse_rx(espgpu_device *dev)
         if (hdr.length > ESPGPU_CHUNK_MAX_PAYLOAD || hdr.version != ESPGPU_PROTO_VERSION) {
             /* 头部不可信，滑动一字节重新找 */
             dev->rx_off++;
-            std::lock_guard<std::mutex> lk(dev->stats_mu);
-            dev->stats.resyncs++;
+            resyncs++;
             continue;
         }
 
@@ -195,6 +200,11 @@ void parse_rx(espgpu_device *dev)
 
         dispatch(dev, hdr, payload);
         dev->rx_off += need;
+    }
+
+    if (resyncs) {
+        std::lock_guard<std::mutex> lk(dev->stats_mu);
+        dev->stats.resyncs += resyncs;
     }
 
     if (dev->rx_off > 0) {
@@ -223,6 +233,7 @@ void reader_main(espgpu_device *dev)
         if (got == 0) {
             continue;
         }
+
 
         dev->rx.insert(dev->rx.end(), buf.data(), buf.data() + got);
         parse_rx(dev);

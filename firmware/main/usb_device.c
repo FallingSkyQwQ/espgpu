@@ -243,9 +243,14 @@ esp_err_t espgpu_usb_send_chunk_iov(uint8_t type, uint8_t flags, const void *p0,
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* 整包拼进一块缓冲再一次性写出。
+     * 之前是「头 / p0 / p1 各写一次」，每次都 flush，导致一个 32KB 的帧分片
+     * 被拆成几百个十几字节的 USB 传输 —— Full-Speed bulk 每包约 13 字节开销，
+     * 小包效率不到 50%，实测上行只剩 1/3。 */
+    static uint8_t s_batch[ESPGPU_CHUNK_HDR_SIZE + ESPGPU_CHUNK_MAX_PAYLOAD];
+
     xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
 
-    /* seq 必须在锁内自增：命令任务和呈现任务都会发 Chunk */
     static uint16_t s_seq;
 
     espgpu_chunk_hdr_t hdr = {
@@ -257,26 +262,22 @@ esp_err_t espgpu_usb_send_chunk_iov(uint8_t type, uint8_t flags, const void *p0,
         .flags = (uint8_t)(flags & ~ESPGPU_F_CRC),
     };
 
-    size_t got = write_locked(&hdr, sizeof(hdr), timeout_ms);
-    if (got != sizeof(hdr)) {
-        /* 头都没写完：丢掉 FIFO 里残留，让主机靠魔数重同步 */
-        tud_vendor_write_clear();
-        xSemaphoreGive(s_tx_mutex);
-        return ESP_ERR_TIMEOUT;
+    memcpy(s_batch, &hdr, sizeof(hdr));
+    if (n0) {
+        memcpy(s_batch + sizeof(hdr), p0, n0);
+    }
+    if (n1) {
+        memcpy(s_batch + sizeof(hdr) + n0, p1, n1);
     }
 
-    if (n0 && write_locked(p0, n0, timeout_ms) != n0) {
-        tud_vendor_write_clear();
-        xSemaphoreGive(s_tx_mutex);
-        return ESP_ERR_TIMEOUT;
-    }
-    if (n1 && write_locked(p1, n1, timeout_ms) != n1) {
-        tud_vendor_write_clear();
-        xSemaphoreGive(s_tx_mutex);
-        return ESP_ERR_TIMEOUT;
-    }
-
+    const size_t total = sizeof(hdr) + len;
+    const size_t sent = write_locked(s_batch, total, timeout_ms);
     xSemaphoreGive(s_tx_mutex);
+
+    if (sent != total) {
+        tud_vendor_write_clear();
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
 }
 
@@ -296,8 +297,13 @@ esp_err_t espgpu_usb_send_ctrl_resp(uint16_t op, uint16_t seq, uint16_t status,
     if (len) {
         memcpy(buf + sizeof(*resp), data, len);
     }
-    return espgpu_usb_send_chunk(ESPGPU_CHUNK_CTRL_RESP, 0, buf,
-                                 (uint32_t)(sizeof(*resp) + len), timeout_ms);
+    esp_err_t err = espgpu_usb_send_chunk(ESPGPU_CHUNK_CTRL_RESP, 0, buf,
+                                          (uint32_t)(sizeof(*resp) + len), timeout_ms);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ctrl resp op=0x%04X seq=%u send failed: %s", op, seq,
+                 esp_err_to_name(err));
+    }
+    return err;
 }
 
 esp_err_t espgpu_usb_send_event(uint8_t kind, uint8_t code, uint16_t value, uint32_t arg,
@@ -351,6 +357,9 @@ static void on_usb_event(tinyusb_event_t *event, void *arg)
     if (event->id == TINYUSB_EVENT_ATTACHED) {
         s_mounted = true;
         s_stage_head = s_stage_tail = 0;
+        /* 清空发送 FIFO：上一轮会话的残留会在主机侧被当成垃圾字节，
+         * 白白消耗解析器的重同步。 */
+        tud_vendor_write_clear();
         ESP_LOGI(TAG, "attached (enumerated)");
     } else if (event->id == TINYUSB_EVENT_DETACHED) {
         s_mounted = false;

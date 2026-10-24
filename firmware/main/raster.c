@@ -13,6 +13,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_memory_utils.h"
 
 #include "raster.h"
@@ -78,7 +79,7 @@ void raster_set_scissor(espgpu_surface_t *s, int16_t x, int16_t y, int16_t w, in
     s->scissor_h = h;
 }
 
-void raster_clear(espgpu_surface_t *s, uint16_t color)
+IRAM_ATTR void raster_clear(espgpu_surface_t *s, uint16_t color)
 {
     for (int16_t y = 0; y < s->scissor_h; y++) {
         uint16_t *row = s->pixels + (size_t)(s->scissor_y + y) * s->width + s->scissor_x;
@@ -102,7 +103,7 @@ static inline uint16_t pack565(uint32_t r, uint32_t g, uint32_t b)
     return (uint16_t)(((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F));
 }
 
-uint16_t raster_blend_rgb565(uint16_t src, uint16_t dst, uint8_t alpha, uint8_t mode)
+IRAM_ATTR uint16_t raster_blend_rgb565(uint16_t src, uint16_t dst, uint8_t alpha, uint8_t mode)
 {
     if (mode == ESPGPU_BLEND_NONE || alpha == 255) {
         return src;
@@ -144,6 +145,16 @@ static inline int32_t wrap_coord(int32_t v, int32_t n, uint8_t wrap)
     if (n <= 0) {
         return 0;
     }
+    if (wrap == ESPGPU_WRAP_CLAMP) {
+        if (v < 0) return 0;
+        if (v >= n) return n - 1;
+        return v;
+    }
+    /* 快速路径：内层循环会把 REPEAT 的坐标维持在 [0,n)，
+     * 这里直接返回，避免每像素两次软件除法。 */
+    if (v >= 0 && v < n) {
+        return v;
+    }
     if (wrap == ESPGPU_WRAP_REPEAT) {
         v %= n;
         if (v < 0) {
@@ -151,16 +162,12 @@ static inline int32_t wrap_coord(int32_t v, int32_t n, uint8_t wrap)
         }
         return v;
     }
-    if (wrap == ESPGPU_WRAP_MIRROR) {
-        v %= (n * 2);
-        if (v < 0) {
-            v += n * 2;
-        }
-        return (v < n) ? v : (n * 2 - 1 - v);
+    /* MIRROR */
+    v %= (n * 2);
+    if (v < 0) {
+        v += n * 2;
     }
-    if (v < 0) return 0;
-    if (v >= n) return n - 1;
-    return v;
+    return (v < n) ? v : (n * 2 - 1 - v);
 }
 
 static inline uint8_t tex_alpha(const espgpu_texture_t *t, int32_t x, int32_t y)
@@ -171,6 +178,7 @@ static inline uint8_t tex_alpha(const espgpu_texture_t *t, int32_t x, int32_t y)
     return t->alpha[(size_t)y * t->width + x];
 }
 
+/* 不加 IRAM_ATTR：加了之后编译器往往拒绝内联，而它是每像素都要调的 */
 static inline uint16_t tex_sample(const espgpu_texture_t *t, float u, float v, uint8_t filter,
                                   uint8_t wrap, uint8_t *alpha_out)
 {
@@ -227,7 +235,7 @@ static inline uint16_t tex_sample(const espgpu_texture_t *t, float u, float v, u
 
 /* ── 三角形光栅化 ─────────────────────────────────────────────────── */
 
-static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
+IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
                      espgpu_vertex2d_t a, espgpu_vertex2d_t b, espgpu_vertex2d_t c,
                      const espgpu_draw_state_t *st, uint16_t flat_color)
 {
@@ -297,6 +305,25 @@ static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
     float u_row = (ua * (float)w0_row + ub * (float)w1_row + uc * (float)w2_row) * inv_area;
     float v_row = (va * (float)w0_row + vb * (float)w1_row + vc * (float)w2_row) * inv_area;
 
+    /* 顶点色调制是常量：把解包提到循环外。
+     * 之前每个像素都做一遍 unpack565×2 + pack565，实测这是内层循环的大头。 */
+    const bool modulate = (flat_color != 0xFFFFu);
+    uint32_t tr = 31, tg = 63, tb = 31;
+    if (modulate) {
+        unpack565(flat_color, &tr, &tg, &tb);
+    }
+
+    /* 把状态和纹理字段提到局部变量。
+     * 内层循环里有 row[x] = src 这样的写入，编译器无法证明 st/tex 不被别名，
+     * 于是每个像素都要重新加载 filter/wrap/blend/width/height —— 这是主要的
+     * 隐藏开销。 */
+    const uint8_t blend = st->blend;
+    const uint8_t filter = st->filter;
+    const uint8_t wrap = st->wrap;
+    const uint8_t alpha_test = st->alpha_test;
+    const uint8_t alpha_ref = st->alpha_ref;
+    const uint16_t *restrict tpx = tex ? tex->pixels : NULL;
+
     for (int32_t y = y0; y <= y1; y++) {
         int32_t w0 = w0_row;
         int32_t w1 = w1_row;
@@ -310,24 +337,24 @@ static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
             if ((w0 | w1 | w2) >= 0) {
                 uint8_t alpha = 255;
                 uint16_t src;
-                if (tex != NULL) {
-                    src = tex_sample(tex, u, v, st->filter, st->wrap, &alpha);
-                    /* 顶点色调制（平面着色） */
-                    uint32_t sr, sg, sb, tr, tg, tb;
-                    unpack565(src, &sr, &sg, &sb);
-                    unpack565(flat_color, &tr, &tg, &tb);
-                    src = pack565(sr * tr / 31, sg * tg / 63, sb * tb / 31);
+                if (tpx != NULL) {
+                    src = tex_sample(tex, u, v, filter, wrap, &alpha);
+                    if (modulate) {
+                        uint32_t sr, sg, sb;
+                        unpack565(src, &sr, &sg, &sb);
+                        src = pack565(sr * tr / 31, sg * tg / 63, sb * tb / 31);
+                    }
                 } else {
                     src = flat_color;
                     alpha = 255;
                 }
 
-                if (st->alpha_test && alpha < st->alpha_ref) {
+                if (alpha_test && alpha < alpha_ref) {
                     /* 丢弃 */
-                } else if (st->blend == ESPGPU_BLEND_NONE) {
+                } else if (blend == ESPGPU_BLEND_NONE || alpha == 255) {
                     row[x] = src;
                 } else {
-                    row[x] = raster_blend_rgb565(src, row[x], alpha, st->blend);
+                    row[x] = raster_blend_rgb565(src, row[x], alpha, blend);
                 }
             }
             w0 += dw0dx;
@@ -345,7 +372,7 @@ static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
     }
 }
 
-void raster_draw_quad(espgpu_surface_t *s, const espgpu_texture_t *tex,
+IRAM_ATTR void raster_draw_quad(espgpu_surface_t *s, const espgpu_texture_t *tex,
                       const espgpu_vertex2d_t v[4], const espgpu_draw_state_t *st)
 {
     const uint16_t flat = v[0].color;

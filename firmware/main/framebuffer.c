@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 
 #include "espgpu_proto.h"
@@ -90,7 +91,7 @@ size_t espgpu_fb_max_encoded(const espgpu_fb_t *fb)
  * ref 非空时对参考帧做异或（差分模式）。
  */
 
-static size_t rle_u8(const uint8_t *cur, const uint8_t *ref, uint8_t *out, size_t cap,
+IRAM_ATTR static size_t rle_u8(const uint8_t *cur, const uint8_t *ref, uint8_t *out, size_t cap,
                      size_t count)
 {
 #define LOAD(i) (ref ? (uint8_t)(cur[i] ^ ref[i]) : cur[i])
@@ -132,7 +133,7 @@ static size_t rle_u8(const uint8_t *cur, const uint8_t *ref, uint8_t *out, size_
 #undef LOAD
 }
 
-static size_t rle_u16(const uint8_t *curb, const uint8_t *refb, uint8_t *out, size_t cap,
+IRAM_ATTR static size_t rle_u16(const uint8_t *curb, const uint8_t *refb, uint8_t *out, size_t cap,
                       size_t total_pixels)
 {
     const uint16_t *cur = (const uint16_t *)curb;
@@ -180,7 +181,7 @@ static size_t rle_u16(const uint8_t *curb, const uint8_t *refb, uint8_t *out, si
 #undef LOAD
 }
 
-esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes, unsigned bpp,
+IRAM_ATTR esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes, unsigned bpp,
                             uint8_t codec, uint8_t *out, size_t cap,
                             espgpu_fb_encode_result_t *result)
 {

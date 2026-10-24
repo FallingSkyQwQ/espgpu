@@ -279,8 +279,11 @@ static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_l
             .palette_dirty = 0,
         };
 
+        /* 超时给足：这里一旦超时就会 clear FIFO，把半截 Chunk 留在总线上，
+         * 主机必然失步，然后变得更慢、更容易超时 —— 自我强化的死亡螺旋。
+         * 32KB 在 1.2MB/s 下约 26ms，500ms 足够容忍主机的抖动。 */
         esp_err_t err = espgpu_usb_send_chunk_iov(ESPGPU_CHUNK_FRAME, 0, &fh, hdr_sz, enc + off,
-                                                  n, 50);
+                                                  n, 500);
         if (err != ESP_OK) {
             return err;
         }
@@ -580,15 +583,21 @@ static esp_err_t cmd_present(void)
     /* 关键：只有 DELTA_RLE 才传参考帧。关键帧（RLE）如果也传了 shadow，
      * 编码端做了异或而解码端没有，解出来必然是垃圾（表现为残影和流长度越界）。 */
     const uint8_t *ref = (codec == ESPGPU_CODEC_DELTA_RLE) ? g_gpu.shadow : NULL;
+    const int64_t t_enc0 = esp_timer_get_time();
     esp_err_t err = espgpu_encode_raw((const uint8_t *)g_gpu.surface.pixels, ref, bytes, 2,
                                       codec, g_gpu.enc_buf, g_gpu.enc_cap, &res);
+    const int64_t t_enc1 = esp_timer_get_time();
+    g_gpu.stats.t_encode_us = (uint32_t)(t_enc1 - t_enc0);
+
     if (err != ESP_OK) {
         g_gpu.stats.frames_dropped++;
+        xSemaphoreGive(g_gpu.lock);
         return err;
     }
 
     err = send_frame(g_gpu.enc_buf, res.enc_bytes, res.raw_bytes, codec, w, h,
                      ESPGPU_FMT_RGB565);
+    g_gpu.stats.t_usb_us = (uint32_t)(esp_timer_get_time() - t_enc1);
     if (err == ESP_OK) {
         memcpy(g_gpu.shadow, g_gpu.surface.pixels, bytes);
         g_gpu.force_keyframe = false;
@@ -605,6 +614,16 @@ static esp_err_t cmd_present(void)
 
     g_gpu.stats.frame_raw_bytes = res.raw_bytes;
     g_gpu.stats.frame_enc_bytes = res.enc_bytes;
+
+    /* 每 30 帧打一次分段耗时。走 UART 而不是 GET_STATS：命令模式下
+     * 控制请求要等整帧发送完才能被处理，容易超时。 */
+    static uint32_t s_dbg_frames;
+    if (++s_dbg_frames % 30 == 0) {
+        ESP_LOGI(TAG, "frame %u: raster %u us  encode %u us  usb %u us  enc %u/%u B",
+                 (unsigned)s_dbg_frames, (unsigned)g_gpu.stats.t_raster_us,
+                 (unsigned)g_gpu.stats.t_encode_us, (unsigned)g_gpu.stats.t_usb_us,
+                 (unsigned)res.enc_bytes, (unsigned)res.raw_bytes);
+    }
 
     xSemaphoreGive(g_gpu.lock);
     return err;
@@ -624,7 +643,9 @@ static void exec_cmd(const espgpu_cmd_t *cmd, const uint8_t *body)
         }
         espgpu_clear_t c;
         memcpy(&c, body, sizeof(c));
+        const int64_t t0 = esp_timer_get_time();
         raster_clear(&g_gpu.surface, c.color);
+        g_gpu.stats.t_raster_us += (uint32_t)(esp_timer_get_time() - t0);
         break;
     }
 
@@ -685,12 +706,14 @@ static void exec_cmd(const espgpu_cmd_t *cmd, const uint8_t *body)
             g_gpu.bound_texture[0] ? &g_gpu.bound_texture[0]->tex : NULL;
 
         if (d.prim == ESPGPU_PRIM_QUADS) {
+            const int64_t t0 = esp_timer_get_time();
             for (uint32_t i = 0; i + 3 < count; i += 4) {
                 espgpu_vertex2d_t v[4];
                 memcpy(v, verts + (size_t)i * stride, sizeof(v));
                 raster_draw_quad(&g_gpu.surface, tex, v, &g_gpu.draw_state);
                 g_gpu.stats.primitives++;
             }
+            g_gpu.stats.t_raster_us += (uint32_t)(esp_timer_get_time() - t0);
             g_gpu.stats.draw_calls++;
             g_gpu.stats.vertices += count;
         }
@@ -720,8 +743,7 @@ static void exec_cmd(const espgpu_cmd_t *cmd, const uint8_t *body)
 }
 
 static void handle_cmd_chunk(const uint8_t *data, uint32_t len)
-{
-    /* 收到任何 GPU 命令就认为主机接管了渲染，停掉 M1 的测试图案自动出帧。
+{    /* 收到任何 GPU 命令就认为主机接管了渲染，停掉 M1 的测试图案自动出帧。
      * 切换瞬间必须强制关键帧：设备的 shadow 还是全零，而主机的参考帧里
      * 是测试图案的内容，不重置就必然错位。 */
     if (!g_gpu.command_mode) {
@@ -730,6 +752,7 @@ static void handle_cmd_chunk(const uint8_t *data, uint32_t len)
     g_gpu.command_mode = true;
 
     uint32_t off = 0;
+    g_gpu.stats.t_raster_us = 0;
     while (off + sizeof(espgpu_cmd_t) <= len) {
         espgpu_cmd_t cmd;
         memcpy(&cmd, data + off, sizeof(cmd));
