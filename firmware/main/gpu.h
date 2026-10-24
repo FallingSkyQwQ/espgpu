@@ -21,6 +21,12 @@ typedef struct {
     bool streaming;       /* 是否在持续出帧 */
     bool force_keyframe;  /* 模式变更后强制出一帧非差分，让主机重建参考帧 */
 
+    /* 模式变更走「挂待办 + 帧边界应用」，避免控制任务和呈现任务抢同一把锁。
+     * 呈现任务整帧持有 lock，控制任务如果直接 take 会被饿死（实测 15 秒）。 */
+    espgpu_mode_t pending_mode;
+    uint8_t pending_pattern;
+    volatile bool mode_pending;
+
     uint32_t frame_id;
     uint32_t present_period_us;
 
@@ -36,7 +42,7 @@ extern espgpu_gpu_t g_gpu;
 
 esp_err_t espgpu_gpu_init(void);
 
-/** 修改显示模式。尺寸或格式变化时重建帧缓冲。 */
+/** 修改显示模式。请求会被挂起，由呈现任务在下一个帧边界应用。 */
 esp_err_t espgpu_gpu_set_mode(const espgpu_mode_t *mode, uint8_t pattern);
 
 /** 覆盖调色板。 */

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * framebuffer.c — 双缓冲 + 测试图案 + 帧编码
  *
  * 编码格式（RLE 部分，host 端解码需与此严格一致）：
@@ -257,6 +257,16 @@ void espgpu_fb_default_clut(uint16_t out[256])
     }
 }
 
+/*
+ * 图案生成里的坐标数学必须全部用有符号运算并显式夹取：
+ * 分辨率是可变的，一旦某个减法的被除数/模数变成 0 或下溢，
+ * 轻则除零 panic，重则越界写破坏内存（曾经在 160x120 上触发过）。
+ */
+static inline uint32_t wrap_u32(uint32_t v, uint32_t span)
+{
+    return span ? (v % span) : 0;
+}
+
 void espgpu_fb_test_pattern(espgpu_fb_t *fb, uint32_t frame, uint8_t pattern)
 {
     uint8_t *base = espgpu_fb_draw(fb);
@@ -269,12 +279,12 @@ void espgpu_fb_test_pattern(espgpu_fb_t *fb, uint32_t frame, uint8_t pattern)
     switch (pattern) {
     case ESPGPU_PATTERN_BARS: {
         const uint32_t bar_w = 16;
-        const uint32_t shift = (frame * 3) % (w + bar_w);
+        const uint32_t shift = wrap_u32(frame * 3, w + bar_w);
         for (uint32_t y = 0; y < h; y++) {
             uint8_t *row = base + (size_t)y * w * fb->bpp;
             for (uint32_t x = 0; x < w; x++) {
-                uint16_t bx = (uint16_t)((x + shift) / bar_w);
-                uint16_t shade = (y < h / 2) ? 255 : 160;
+                uint32_t bx = (x + shift) / bar_w;
+                uint32_t shade = (y < h / 2) ? 255u : 160u;
                 uint8_t r = (uint8_t)((bx * 37u) & 0xFF);
                 uint8_t g = (uint8_t)((((bx * 73u) & 0xFF) * shade) / 255);
                 uint8_t b = (uint8_t)((((bx * 149u) & 0xFF) * shade) / 255);
@@ -291,9 +301,9 @@ void espgpu_fb_test_pattern(espgpu_fb_t *fb, uint32_t frame, uint8_t pattern)
                 uint16_t c;
                 if (x % 32 == 0 || y % 32 == 0) {
                     c = rgb565(0x30, 0x38, 0x48); /* 网格 */
-                } else if (y < 24) {
+                } else if (y < h / 8) {
                     c = rgb565(0x20, 0x28, 0x38); /* 标题栏 */
-                } else if (x > 8 && x < 120 && y > 32 && y < 96) {
+                } else if (x > w / 3 && x < w / 3 * 2 && y > h / 4 && y < h / 2) {
                     c = rgb565(0x54, 0x5c, 0x70); /* 面板 */
                 } else {
                     c = rgb565(0x14, 0x18, 0x20); /* 背景 */
@@ -301,13 +311,19 @@ void espgpu_fb_test_pattern(espgpu_fb_t *fb, uint32_t frame, uint8_t pattern)
                 put_px(fb, row, x, c);
             }
         }
+
         /* 移动方块，带边框与内部噪声 —— 拉低压缩率，模拟精灵 */
-        uint32_t bx = (frame * 7) % (w - 48);
-        uint32_t by = 40 + ((frame * 5) % (h - 120));
-        for (uint32_t y = by; y < by + 48; y++) {
+        const uint32_t sprite = 48;
+        const uint32_t max_bx = (w > sprite) ? (w - sprite) : 0;
+        const uint32_t max_by = (h > sprite) ? (h - sprite) : 0;
+        const uint32_t bx = wrap_u32(frame * 7, max_bx + 1);
+        const uint32_t by = wrap_u32(frame * 5, max_by + 1);
+
+        for (uint32_t y = by; y < by + sprite && y < h; y++) {
             uint8_t *row = base + (size_t)y * w * fb->bpp;
-            for (uint32_t x = bx; x < bx + 48; x++) {
-                bool edge = (x == bx || x == bx + 47 || y == by || y == by + 47);
+            for (uint32_t x = bx; x < bx + sprite && x < w; x++) {
+                const bool edge = (x == bx || x == bx + sprite - 1 || y == by ||
+                                   y == by + sprite - 1);
                 rng = rng * 1664525u + 1013904223u;
                 uint16_t c = edge ? rgb565(0xF0, 0xC0, 0x40)
                                   : (uint16_t)(0x8000u | ((rng >> 19) & 0x1F) |
@@ -320,23 +336,30 @@ void espgpu_fb_test_pattern(espgpu_fb_t *fb, uint32_t frame, uint8_t pattern)
 
     case ESPGPU_PATTERN_DOOMISH: {
         /* 近似 Doom 的视野结构：上方天花板、下方地板、中间竖条墙面。
-         * 这个图案的压缩率最接近真实目标场景。 */
+         * 这组图案的压缩率最接近真实目标场景。 */
         const uint32_t horizon = h * 45 / 100;
-        const uint32_t shift = (frame * 2) % w;
+        const uint32_t floor_y = h * 62 / 100;
+        const uint32_t floor_span = (h > floor_y) ? (h - floor_y) : 1;
+        const uint32_t shift = wrap_u32(frame * 2, w ? w : 1);
+
         for (uint32_t y = 0; y < h; y++) {
             uint8_t *row = base + (size_t)y * w * fb->bpp;
             for (uint32_t x = 0; x < w; x++) {
                 uint16_t c;
                 if (y < horizon) {
-                    uint8_t v = (uint8_t)(20 + y * 60 / (horizon ? horizon : 1));
-                    c = rgb565(v / 2, v / 2, v);
-                } else if (y > h * 62 / 100) {
-                    uint8_t v = (uint8_t)(90 - (y - h * 62 / 100) * 50 / (h / 3));
-                    c = rgb565(v, (uint8_t)(v * 3 / 4), (uint8_t)(v / 3));
+                    uint8_t v = (uint8_t)(20 + (horizon ? y * 60 / horizon : 0));
+                    c = rgb565((uint8_t)(v / 2), (uint8_t)(v / 2), v);
+                } else if (y > floor_y) {
+                    int32_t d = (int32_t)y - (int32_t)floor_y;
+                    int32_t v = 90 - d * 50 / (int32_t)floor_span;
+                    if (v < 0) {
+                        v = 0;
+                    }
+                    c = rgb565((uint8_t)v, (uint8_t)(v * 3 / 4), (uint8_t)(v / 3));
                 } else {
                     uint32_t band = ((x + shift) / 24) & 3;
                     uint8_t v = (uint8_t)(60 + band * 40);
-                    if ((x + shift) % 24 < 2) {
+                    if (wrap_u32(x + shift, 24) < 2) {
                         v = 24; /* 墙面分隔线 */
                     }
                     c = rgb565(v, v, (uint8_t)(v * 4 / 5));
@@ -344,12 +367,17 @@ void espgpu_fb_test_pattern(espgpu_fb_t *fb, uint32_t frame, uint8_t pattern)
                 put_px(fb, row, x, c);
             }
         }
+
         /* 一个移动的敌人精灵 */
-        uint32_t sx = (frame * 4) % (w - 32);
-        uint32_t sy = horizon - 16;
-        for (uint32_t y = sy; y < sy + 40 && y < h; y++) {
+        const uint32_t sprite_w = 32;
+        const uint32_t sprite_h = 40;
+        const uint32_t max_sx = (w > sprite_w) ? (w - sprite_w) : 0;
+        const uint32_t sx = wrap_u32(frame * 4, max_sx + 1);
+        const uint32_t sy = (horizon > sprite_h / 2) ? (horizon - sprite_h / 2) : 0;
+
+        for (uint32_t y = sy; y < sy + sprite_h && y < h; y++) {
             uint8_t *row = base + (size_t)y * w * fb->bpp;
-            for (uint32_t x = sx; x < sx + 32 && x < w; x++) {
+            for (uint32_t x = sx; x < sx + sprite_w && x < w; x++) {
                 rng = rng * 1664525u + 1013904223u;
                 if ((rng & 3) == 0) {
                     continue; /* 留出透明感 */

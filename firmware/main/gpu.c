@@ -70,7 +70,8 @@ static void fill_device_info(espgpu_device_info_t *di)
 
     esp_chip_info_t ci;
     esp_chip_info(&ci);
-    snprintf(di->chip_model, sizeof(di->chip_model), "ESP32-S3 r%d", ci.revision / 100);
+    snprintf(di->chip_model, sizeof(di->chip_model), "ESP32-S3 r%u.%u", ci.revision / 100,
+             ci.revision % 100);
 
     /* 上限按 PSRAM 与带宽共同决定：800x600 是"能分配"的上限，
      * 实际可用分辨率受 USB 上行带宽约束，见 PLAN.md 的带宽账本。 */
@@ -121,14 +122,9 @@ static esp_err_t realloc_encode_buffer(void)
     return ESP_OK;
 }
 
-esp_err_t espgpu_gpu_set_mode(const espgpu_mode_t *mode, uint8_t pattern)
+/* 调用者必须持有 g_gpu.lock。 */
+static esp_err_t apply_mode_locked(const espgpu_mode_t *mode, uint8_t pattern)
 {
-    if (mode == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    xSemaphoreTake(g_gpu.lock, portMAX_DELAY);
-
     espgpu_mode_t m = *mode;
     if (m.width < 32) m.width = 32;
     if (m.height < 32) m.height = 32;
@@ -170,11 +166,31 @@ esp_err_t espgpu_gpu_set_mode(const espgpu_mode_t *mode, uint8_t pattern)
      * 强制下一帧走非差分编码，让主机重建参考帧，否则会解出花屏。 */
     g_gpu.force_keyframe = true;
 
-    xSemaphoreGive(g_gpu.lock);
-
     ESP_LOGI(TAG, "mode %ux%u fmt=%u codec=%u fps=%u pattern=%u", m.width, m.height,
              m.format, m.codec, m.max_fps, g_gpu.pattern);
     return err;
+}
+
+esp_err_t espgpu_gpu_set_mode(const espgpu_mode_t *mode, uint8_t pattern)
+{
+    if (mode == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 呈现任务整帧持有 g_gpu.lock，控制任务直接去 take 会被饿死
+     * （实测 SET_MODE 阻塞 15 秒，主机侧 800ms 就超时了）。
+     * 所以这里只挂一个待办，由呈现任务在下一个帧边界自己应用。 */
+    g_gpu.pending_mode = *mode;
+    g_gpu.pending_pattern = pattern;
+    g_gpu.mode_pending = true;
+
+    for (int i = 0; i < 500; i++) {
+        if (!g_gpu.mode_pending) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return ESP_ERR_TIMEOUT;
 }
 
 void espgpu_gpu_set_clut(const uint16_t *clut)
@@ -244,7 +260,7 @@ static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_l
         };
 
         esp_err_t err = espgpu_usb_send_chunk_iov(ESPGPU_CHUNK_FRAME, 0, &fh, hdr_sz, enc + off,
-                                                  n, 250);
+                                                  n, 50);
         if (err != ESP_OK) {
             return err;
         }
@@ -263,6 +279,13 @@ void espgpu_gpu_present_task(void *arg)
         int64_t t0 = esp_timer_get_time();
 
         xSemaphoreTake(g_gpu.lock, portMAX_DELAY);
+
+        /* 控制任务挂上来的模式变更在这里落地 —— 只有呈现任务改 fb/mode，
+         * 不会和发送路径抢锁。 */
+        if (g_gpu.mode_pending) {
+            apply_mode_locked(&g_gpu.pending_mode, g_gpu.pending_pattern);
+            g_gpu.mode_pending = false;
+        }
 
         if (!g_gpu.streaming || !espgpu_usb_ready() || g_gpu.enc_buf == NULL) {
             xSemaphoreGive(g_gpu.lock);
@@ -313,13 +336,15 @@ void espgpu_gpu_present_task(void *arg)
 
         xSemaphoreGive(g_gpu.lock);
 
-        /* 4. 帧率控制：按剩余预算休眠 */
+        /* 4. 帧率控制：按剩余预算休眠。
+         * 即使落后于目标帧率也要让出至少 1ms —— 呈现任务整帧持有 g_gpu.lock，
+         * 如果释放后立刻重新抢占，其他核上的控制任务会长时间拿不到锁。 */
         int64_t elapsed = esp_timer_get_time() - t0;
         int64_t remain = (int64_t)g_gpu.present_period_us - elapsed;
         if (remain > 2000) {
             vTaskDelay(pdMS_TO_TICKS((uint32_t)(remain / 1000)));
-        } else if (remain > 0) {
-            taskYIELD();
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 }
@@ -329,6 +354,7 @@ void espgpu_gpu_present_task(void *arg)
 static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint32_t extra_len)
 {
     uint16_t status = ESPGPU_OK;
+    ESP_LOGD(TAG, "ctrl op=0x%04X seq=%u arg0=%u len=%u", req->op, req->seq, req->arg0, extra_len);
 
     switch (req->op) {
     case ESPGPU_CTRL_PING:
@@ -356,8 +382,7 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         }
         esp_err_t err = espgpu_gpu_set_mode(&m, (uint8_t)req->arg0);
         status = (err == ESP_OK) ? ESPGPU_OK : ESPGPU_ERR_NO_MEM;
-        break;
-    }
+        break;    }
 
     case ESPGPU_CTRL_SET_CLUT:
         if (extra_len >= ESPGPU_CLUT_ENTRIES * sizeof(uint16_t)) {
@@ -377,6 +402,7 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         break;
     }
 
+    ESP_LOGD(TAG, "ctrl op=0x%04X -> status=%u", req->op, status);
     espgpu_usb_send_ctrl_resp(req->op, req->seq, status, NULL, 0, 500);
 }
 

@@ -1,0 +1,24 @@
+menu "ESP32-S3 GPU"
+
+    config ESPGPU_FLASH_WINDOW_MS
+        int "Boot window before claiming USB pins (ms)"
+        range 0 20000
+        default 0
+        help
+            The ESP32-S3 routes both USB-Serial-JTAG and USB-OTG through the
+            same GPIO19/20 pins. Once the GPU claims OTG, the CDC port used by
+            esptool disappears and re-flashing requires holding BOOT + tapping
+            RST.
+
+            Set this to a non-zero value (e.g. 8000) only when the board's
+            separate UART port is not connected: it keeps the ROM's
+            USB-Serial-JTAG alive for a short window after boot so
+            `idf.py flash` can still reset the chip on its own.
+
+            0 = production behaviour.
+
+    config ESPGPU_USB_ENABLE
+        bool "Bring up USB OTG (disable only for USB debugging)"
+        default y
+
+endmenu

@@ -481,7 +481,7 @@ typedef struct {
     uint16_t proto_version;
     uint8_t fw_major, fw_minor, fw_patch;
     uint32_t fw_git;
-    char chip_model[16];
+    char chip_model[24];
     uint16_t max_width, max_height;
     uint16_t min_width, min_height;
     uint8_t psram_mb, flash_mb;

@@ -21,12 +21,15 @@ enum {
 #define ESPGPU_MSOS_VENDOR_CODE 0x01u
 #define ESPGPU_MSOS_DESC_INDEX 0x0007u
 
-extern const tusb_desc_device_t espgpu_device_desc;
+extern tusb_desc_device_t espgpu_device_desc;
 extern const uint8_t espgpu_config_desc[];
 extern const uint8_t espgpu_bos_desc[];
 extern const uint8_t espgpu_msos_desc_set[];
 extern const uint16_t espgpu_msos_desc_set_len;
 extern const char *espgpu_string_desc[ESPGPU_STRING_DESC_COUNT];
+
+/** 置位设备描述符里的诊断位（见 usb_descriptors.c 的说明）。 */
+void espgpu_desc_diag(uint16_t bits);
 
 /** 用芯片 MAC 生成序列号，必须在 tinyusb_driver_install() 之前调用。 */
 void espgpu_descriptors_init(void);

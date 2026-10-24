@@ -6,17 +6,24 @@
 
 ## 当前状态
 
-**M1 — 链路打通**
+**M1 — 链路打通（完成，已在真实硬件上验证）**
 
 | 项 | 状态 |
 |---|---|
-| 固件：TinyUSB vendor class + WCID 免驱 | 完成 |
-| 固件：Chunk 分帧、控制通道、测试图案、RLE / 差分编码 | 完成 |
-| 固件：PSRAM 双缓冲、温度/内存统计 | 完成 |
-| 主机：`espgpu.dll` 设备层（WinUSB + 后台接收线程 + 帧解码） | 完成 |
-| 主机：`espgpu-panel.exe` 控制面板 / 帧查看器（Win32 + DX11 + ImGui） | 完成 |
-| 主机：`espgpu-bench.exe` 带宽与压缩率实测 | 完成 |
-| 硬件实测 | 待验证 |
+| 固件：TinyUSB vendor class + WCID 免驱 | ✅ 已验证 |
+| 固件：Chunk 分帧、控制通道、测试图案、RLE / 差分编码 | ✅ 已验证 |
+| 固件：PSRAM 双缓冲、温度/内存统计 | ✅ 已验证 |
+| 主机：`espgpu.dll` 设备层（WinUSB + 后台接收线程 + 帧解码） | ✅ 已验证 |
+| 主机：`espgpu-panel.exe` 控制面板 / 帧查看器（Win32 + DX11 + ImGui） | ✅ 已验证 |
+| 主机：`espgpu-bench.exe` 带宽与压缩率实测 | ✅ 已验证 |
+
+实测摘要（完整数据见 [docs/bench-results.md](docs/bench-results.md)）：
+
+- USB 上行峰值 **768 KB/s**
+- 320×200 INDEX8 + DELTA_RLE + Doom 近似内容：**43.7 fps / 214 KB/s / 12.8x**
+- 320×200 RGB565 + DELTA_RLE + 同内容：**29.9 fps / 241 KB/s / 15.3x**
+
+结论：24fps 目标有约 45% 带宽余量，瓶颈将从帧回传转移到 M2 的下行命令流。
 
 后面的里程碑（2D 光栅器、GL 1.2 前端、Doom、3D、GLES 3.0）见 PLAN.md。
 

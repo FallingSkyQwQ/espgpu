@@ -30,7 +30,15 @@
 
 /* ── 设备描述符 ───────────────────────────────────────────────────── */
 
-const tusb_desc_device_t espgpu_device_desc = {
+/* 非 const：bcdDevice 的低字节被用作启动诊断位，见 espgpu_desc_diag()。
+ * 枚举期间 Windows 会重新读取设备描述符，所以把这些位改掉之后
+ * 只要重新扫描一次设备就能从 REV_xxxx 里读出来。
+ *
+ *   bit4 (0x10)  Windows 请求了 BOS 描述符
+ *   bit0 (0x01)  收到了匹配的 MS OS 2.0 vendor 请求并已应答
+ *   bit1 (0x02)  收到了 vendor 请求但参数不匹配（被 STALL）
+ */
+tusb_desc_device_t espgpu_device_desc = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
     .bcdUSB = 0x0210, /* USB 2.1：BOS 描述符要求 bcdUSB >= 2.01 */
@@ -47,6 +55,11 @@ const tusb_desc_device_t espgpu_device_desc = {
     .iSerialNumber = ESPGPU_STRID_SERIAL,
     .bNumConfigurations = 0x01,
 };
+
+void espgpu_desc_diag(uint16_t bits)
+{
+    espgpu_device_desc.bcdDevice |= bits;
+}
 
 /* ── 配置描述符 ───────────────────────────────────────────────────── */
 
@@ -109,39 +122,43 @@ const uint8_t espgpu_bos_desc[] = {
     0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A, 0x9F,
 
     0x00, 0x00, 0x03, 0x06,                         /* dwWindowsVersion = 0x06030000 */
-    0x26, 0x00,                                     /* wMSOSDescriptorSetTotalLength = 38 */
+    0x1E, 0x00,                                     /* wMSOSDescriptorSetTotalLength = 30 */
     ESPGPU_MSOS_VENDOR_CODE,                        /* bMS_VendorCode = 0x01 */
     0x00,                                           /* bAltEnumCode */
 };
 
 /* ── MS OS 2.0 descriptor set ─────────────────────────────────────── */
-
+/*
+ * 本设备是「非复合设备」：bDeviceClass = 0x00、单接口、不使用 Usbccgp.sys。
+ *
+ * 微软 MS OS 2.0 规范明确规定：
+ *   - configuration subset header 只用于加载 Usbccgp.sys 的复合设备
+ *   - function subset header 只用于复合设备，或使用 Usbccgp.sys 的单功能设备
+ *
+ * "非复合设备 + 单个 feature descriptor" 的标准形态就是
+ * 「set header + compatible ID」的扁平结构，不能再套 subset header。
+ *
+ * 踩过的坑：套了 configuration subset 之后，Windows 会**静默忽略**其中的
+ * compatible ID —— MS OS 2.0 请求照常应答（日志正常），但设备永远拿不到
+ * USB\MS_COMP_WINUSB，最终表现为设备管理器 Code 28。
+ */
 enum {
     ESPGPU_MSOS_HEADER_LEN = 10,
-    ESPGPU_MSOS_CONFIG_SUBSET_LEN = 8,
     ESPGPU_MSOS_COMPAT_ID_LEN = 20,
-    ESPGPU_MSOS_TOTAL_LEN = ESPGPU_MSOS_HEADER_LEN + ESPGPU_MSOS_CONFIG_SUBSET_LEN +
-                            ESPGPU_MSOS_COMPAT_ID_LEN,
+    ESPGPU_MSOS_TOTAL_LEN = ESPGPU_MSOS_HEADER_LEN + ESPGPU_MSOS_COMPAT_ID_LEN, /* 30 */
 };
 
 const uint8_t espgpu_msos_desc_set[] = {
     /* Set header */
     0x0A, 0x00,                                     /* wLength = 10 */
     0x00, 0x00,                                     /* MS_OS_20_SET_HEADER_DESCRIPTOR */
-    0x00, 0x00, 0x03, 0x06,                         /* dwWindowsVersion */
+    0x00, 0x00, 0x03, 0x06,                         /* dwWindowsVersion = 0x06030000 */
     ESPGPU_MSOS_TOTAL_LEN & 0xFF,
-    ESPGPU_MSOS_TOTAL_LEN >> 8,                     /* wTotalLength = 38 */
+    ESPGPU_MSOS_TOTAL_LEN >> 8,                     /* wTotalLength = 30 */
 
-    /* Configuration subset header */
-    0x08, 0x00,                                     /* wLength = 8 */
-    0x01, 0x00,                                     /* MS_OS_20_SUBSET_HEADER_CONFIGURATION */
-    0x01,                                           /* bConfigurationValue = 1 */
-    0x00,                                           /* bReserved */
-    0x1C, 0x00,                                     /* wTotalLength = 28 */
-
-    /* Compatible ID feature（20 字节，无 bFirstInterfaceNumber —— 那个字段只属于 function subset） */
+    /* Compatible ID（20 字节，规范规定无 bFirstInterfaceNumber 字段） */
     0x14, 0x00,                                     /* wLength = 20 */
-    0x03, 0x00,                                     /* MS_OS_20_FEATURE_COMPATBLE_ID */
+    0x03, 0x00,                                     /* MS_OS_FEATURE_COMPATIBLE_ID */
     'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,       /* CompatibleID[8] = "WINUSB" */
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* SubCompatibleID[8] */
 };

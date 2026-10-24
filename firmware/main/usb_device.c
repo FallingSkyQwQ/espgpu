@@ -385,6 +385,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
         return tud_control_xfer(rhport, request, (void *)espgpu_msos_desc_set, len);
     }
 
+    if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR) {
+        ESP_LOGW(TAG, "unhandled vendor request: bRequest=0x%02X wIndex=0x%04X wLength=%u",
+                 request->bRequest, request->wIndex, request->wLength);
+    }
+
     return false;
 }
 

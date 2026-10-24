@@ -36,6 +36,10 @@ void app_main(void)
     ESP_LOGI(TAG, "chip: %d core(s), rev %d.%d", chip.cores, chip.revision / 100,
              chip.revision % 100);
 
+    /* 调试期可用：把这两个 tag 放开到 DEBUG 可以看到每条控制请求 */
+    esp_log_level_set("gpu", ESP_LOG_INFO);
+    esp_log_level_set("usb", ESP_LOG_INFO);
+
     /* ── NVS ── */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -57,20 +61,42 @@ void app_main(void)
     /* ── GPU ── */
     ESP_ERROR_CHECK(espgpu_gpu_init());
 
+#if CONFIG_ESPGPU_FLASH_WINDOW_MS > 0
+    /* 关键：ESP32-S3 的 USB-Serial-JTAG 和 USB-OTG 共用 GPIO19/20。
+     * 一旦下面 tinyusb_driver_install() 接管 OTG，esptool 用的 CDC 口就消失了，
+     * 再烧录只能按住 BOOT 点 RST。
+     *
+     * 这段窗口让 ROM 的 Serial-JTAG 继续活着，idf.py flash 可以自行复位芯片。
+     * 量产版本把它设成 0。 */
+    ESP_LOGI(TAG, "flash window: %d ms before claiming USB pins",
+             CONFIG_ESPGPU_FLASH_WINDOW_MS);
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_ESPGPU_FLASH_WINDOW_MS));
+#endif
+
     /* ── USB ── */
     espgpu_descriptors_init();
+#if CONFIG_ESPGPU_USB_ENABLE
     ESP_ERROR_CHECK(espgpu_usb_init());
+#else
+    ESP_LOGW(TAG, "USB OTG disabled by config, Serial-JTAG stays active");
+#endif
 
     /* ── 任务 ──
-     * core0：命令收发 + 统计采样（与 TinyUSB 任务同核，避免跨核同步开销）
+     * core0：命令收发 + 统计采样（与 TinyUSB 任务同核）
      * core1：内容生成 + 编码 + 呈现（M2 起换成光栅器）
+     *
+     * 命令任务的优先级必须高于 TinyUSB 任务（5）：esp_tinyusb 的任务是
+     * `while(1) tud_task();`，持续出帧时它几乎一直就绪，同核上优先级更低的
+     * 任务会被饿死，表现为 SET_MODE / GET_STATS 全部超时。
      */
     BaseType_t ok;
-    ok = xTaskCreatePinnedToCore(espgpu_gpu_command_task, "gpu_cmd", 6144, NULL, 4, NULL, 0);
+    ok = xTaskCreatePinnedToCore(espgpu_gpu_command_task, "gpu_cmd", 6144, NULL, 7, NULL, 0);
     configASSERT(ok == pdPASS);
+    (void)ok;
 
     ok = xTaskCreatePinnedToCore(espgpu_gpu_present_task, "gpu_present", 6144, NULL, 6, NULL, 1);
     configASSERT(ok == pdPASS);
+    (void)ok;
 
     ESP_LOGI(TAG, "boot complete, waiting for host enumeration");
 }
