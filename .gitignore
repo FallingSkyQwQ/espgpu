@@ -1,0 +1,32 @@
+# ---- ESP-IDF ----
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+*.bin
+*.elf
+*.map
+
+# ---- CMake / C++ ----
+out/
+build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# ---- 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.user
+compile_commands.json
+
+# ---- 工具产物 ----
+*.log
+/tmp/
