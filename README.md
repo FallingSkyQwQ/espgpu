@@ -84,6 +84,24 @@ ImGui 由 CMake 的 FetchContent 拉取（v1.91.9）。离线环境可以用
 设备免驱：Windows 10/11 会自动通过 MS OS 2.0 描述符绑定 `winusb.sys`，
 不需要安装任何驱动，也不需要签名。设备管理器里会显示为 `ESP32-S3 GPU`。
 
+## M1 硬件验证清单
+
+按顺序检查，任何一步失败都能定位到具体层：
+
+1. **枚举**：设备管理器出现 `ESP32-S3 GPU`（通用串行总线设备下），
+   硬件 ID 为 `USB\VID_303A&PID_8201`，驱动是 WinUSB。
+   - 若显示为未知设备 → MS OS 2.0 描述符没生效，看串口日志里有没有
+     `MS OS 2.0 descriptor requested`
+2. **握手**：`espgpu-bench -i` 能打印出设备信息（固件版本、PSRAM、能力位）。
+3. **吞吐**：`espgpu-bench` 跑完，看 `bars` / `ui` 图案在 320x200 INDEX8 +
+   DELTA_RLE 下能否达到 ≥24fps 且 ≤850 KB/s。这组数据决定 M2 的性能预算。
+4. **画质**：`espgpu-panel.exe` 的 Viewer 页面能看到测试图案，切换图案/格式/
+   编码应立即生效，不应出现花屏（花屏说明差分参考帧失配）。
+5. **温度**：Overview 页面能读到芯片温度，Performance 页面的曲线随负载变化。
+
+实测数据出来后，把 `espgpu-bench` 的输出贴到 issue 或直接更新本文件，
+M2 的光栅器性能预算以它为准。
+
 ## 设计要点
 
 1. **两端 GL 共用一个设备核心**。GL 1.2 和 GLES 3.0 只是两个前端，
