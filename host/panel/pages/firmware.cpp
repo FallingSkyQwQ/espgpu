@@ -23,13 +23,15 @@ bool ota_progress(uint32_t done, uint32_t total, void *user)
 
 bool pick_file(std::wstring &out)
 {
-    wchar_t path[MAX_PATH] = L"";
+    /* MAX_PATH 放不下深目录里的路径（对话框会直接以 FNERR_BUFFERTOOSMALL 失败） */
+    static wchar_t path[4096];
+    path[0] = L'\0';
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_app.hwnd;
     ofn.lpstrFilter = L"Firmware image (*.bin)\0*.bin\0All files (*.*)\0*.*\0";
     ofn.lpstrFile = path;
-    ofn.nMaxFile = MAX_PATH;
+    ofn.nMaxFile = static_cast<DWORD>(sizeof(path) / sizeof(path[0]));
     ofn.lpstrTitle = L"Select espgpu firmware image";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) {
@@ -54,13 +56,6 @@ bool load_file(const std::wstring &path, std::vector<uint8_t> &data)
     const size_t got = fread(data.data(), 1, data.size(), f);
     fclose(f);
     return got == data.size();
-}
-
-std::string narrow(const std::wstring &w)
-{
-    char buf[MAX_PATH * 3];
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, buf, sizeof(buf), nullptr, nullptr);
-    return buf;
 }
 
 char g_version[64] = "";
@@ -185,20 +180,36 @@ void page_firmware()
         o.total = static_cast<uint32_t>(o.image.size());
         o.result = 0;
         o.version = g_version;
-        enqueue("Firmware update", [](espgpu_device_t *dev) {
+        /* 直接投递：未连接时也必须清掉 running，否则界面永远停在 "Writing…"，
+         * 取消也要和失败区分开（原来取消会弹 "device error" 的报错） */
+        enqueue_raw([](espgpu_device_t *dev) {
             OtaState &os = g_app.ota;
+            if (dev == nullptr) {
+                os.result = -1;
+                os.running = false;
+                ui::snackbar(ui::SnackKind::Error, "Firmware update: device not connected");
+                return;
+            }
+            log_line(3, false, "firmware update: %zu bytes", os.image.size());
             const int rc = espgpu_ota_flash(dev, os.image.data(), os.image.size(),
                                             os.version.c_str(), ota_progress, &os);
             if (rc == 0) {
-                os.result = 1;
                 os.needs_reboot = true;
                 os.done = os.total.load();
+                os.result = 1;
+                ui::snackbar(ui::SnackKind::Success, "Firmware written - reboot to apply");
+                log_line(3, false, "firmware update: ok");
+            } else if (os.cancel.load()) {
+                os.result = -2;
+                ui::snackbar(ui::SnackKind::Info, "Firmware update cancelled");
+                log_line(2, false, "firmware update cancelled");
             } else {
-                os.result = os.cancel.load() ? -2 : -1;
+                os.result = -1;
+                ui::snackbar(ui::SnackKind::Error, "Firmware update failed (status %d)", rc);
+                log_line(1, false, "firmware update failed: status %d", rc);
             }
             os.running = false;
-            return rc;
-        }, "Firmware written - reboot to apply");
+        });
     }
 }
 

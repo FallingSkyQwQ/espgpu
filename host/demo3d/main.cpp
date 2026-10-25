@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <timeapi.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -164,7 +165,16 @@ float height_at(float x, float z)
 /* ── 窗口 ─────────────────────────────────────────────────────────── */
 
 HWND g_hwnd = nullptr;
-bool g_quit = false;
+std::atomic<bool> g_quit{false}; /* 控制台 Ctrl+C 处理函数跑在另一个线程 */
+
+BOOL WINAPI on_console_ctrl(DWORD type)
+{
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+        g_quit = true;
+        return TRUE;
+    }
+    return FALSE;
+}
 
 LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -206,6 +216,14 @@ int main(int argc, char **argv)
         }
     }
     if (fps < 1) fps = 24;
+    if (fps > 120) fps = 120; /* mode.max_fps 是 u8 */
+    /* 0 或负数会让 aspect 除零、窗口尺寸为负；上限按协议的 max_width/height 量级 */
+    if (W < 16 || H < 16 || W > 1024 || H > 1024) {
+        printf("bad --res %dx%d, using 320x200\n", W, H);
+        W = 320;
+        H = 200;
+    }
+    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 
     char err[256] = {0};
     espgpu_device_t *dev = espgpu_open(0, err, sizeof(err));
@@ -334,17 +352,25 @@ int main(int argc, char **argv)
     printf("espgpu-demo3d: %dx%d @ %d fps%s, Esc to quit\n", W, H, fps,
            espgpu_is_emulator(dev) ? " (software emulator)" : "");
 
+    /* 跨帧不变的状态只发一次（设备端状态跨 PRESENT 保持，与 GL 一致），每帧省 ~100 B 下行 */
+    espgpu_cmd_viewport(dev, 0, 0, static_cast<int16_t>(W), static_cast<int16_t>(H));
+    espgpu_cmd_scissor(dev, 0, 0, static_cast<int16_t>(W), static_cast<int16_t>(H));
+    espgpu_cmd_vertex_layout(dev, &layout);
+
     const auto t_start = std::chrono::steady_clock::now();
     uint64_t frames = 0;
     uint32_t last_id = espgpu_frame_id(dev);
+    /* 绝对截止时间的帧节奏（见 demo/main.cpp）：sleep 超调不再逐帧累积 */
+    const auto period = std::chrono::microseconds(1000000 / fps);
+    auto deadline = t_start + period;
 
-    while (!g_quit) {
+    while (!g_quit.load()) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if (g_quit) {
+        if (g_quit.load()) {
             break;
         }
         const auto f0 = std::chrono::steady_clock::now();
@@ -354,8 +380,6 @@ int main(int argc, char **argv)
         const float ca = t * 0.25f;
         const Mat4 view = look_at(std::cos(ca) * 7.0f, 3.2f, std::sin(ca) * 7.0f, 0, 0, 0);
 
-        espgpu_cmd_viewport(dev, 0, 0, static_cast<int16_t>(W), static_cast<int16_t>(H));
-        espgpu_cmd_scissor(dev, 0, 0, static_cast<int16_t>(W), static_cast<int16_t>(H));
         espgpu_cmd_clear_ex(dev, 3, rgb565(120, 150, 200), 0xFFFF);
 
         /* 方向光：世界空间里从右上方照来，变换到眼空间 */
@@ -391,7 +415,6 @@ int main(int argc, char **argv)
         ext.color_write = 1;
         ext.lighting = 1;
         espgpu_cmd_pipeline(dev, &p, &fog, &ext);
-        espgpu_cmd_vertex_layout(dev, &layout);
 
         /* 地形（设备端缓冲） */
         {
@@ -484,10 +507,14 @@ int main(int argc, char **argv)
             printf("\n");
         }
 
-        const auto el = std::chrono::steady_clock::now() - f0;
-        const auto period = std::chrono::microseconds(1000000 / fps);
-        if (el < period) {
-            std::this_thread::sleep_for(period - el);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < deadline) {
+            std::this_thread::sleep_until(deadline);
+            deadline += period;
+        } else if (now - deadline > period) {
+            deadline = now + period; /* 落后超过一帧：不追帧 */
+        } else {
+            deadline += period;
         }
         if (!espgpu_is_connected(dev)) {
             printf("device lost\n");

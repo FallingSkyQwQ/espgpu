@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "../app.h"
 #include "../theme.h"
@@ -59,6 +60,19 @@ inline void fmt_bytes(char *buf, size_t cap, double bytes)
     } else {
         snprintf(buf, cap, "%.0f B", bytes);
     }
+}
+
+/** UTF-16 → UTF-8（任意长度；失败返回空串） */
+inline std::string narrow(const std::wstring &w)
+{
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr,
+                                      0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), n, nullptr,
+                        nullptr);
+    return out;
 }
 
 /** 历史曲线的线程安全拷贝 */

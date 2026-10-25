@@ -30,7 +30,7 @@ void page_overview()
                     i.fw_minor, i.fw_patch, i.proto_version, i.max_width, i.max_height);
     }
     ImGui::PushStyleColor(ImGuiCol_Text, theme::with_alpha(s.on_primary_container, 0.75f));
-    ImGui::TextWrapped("%s", g_app.device_path.c_str());
+    ImGui::TextWrapped("%s", device_path().c_str());
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, px(4)));
 
@@ -40,7 +40,9 @@ void page_overview()
     float x = 0.0f;
     for (int k = 0; k < n; k++) {
         if (!(i.capabilities & caps[k].bit)) continue;
-        const float cw = ImGui::CalcTextSize(caps[k].name).x + px(24);
+        /* 与 ui::chip 的宽度一致：label 字体 + 左右各 12px（无图标） */
+        ImFont *lf = theme::fonts().label;
+        const float cw = lf->CalcTextSizeA(lf->FontSize, FLT_MAX, 0, caps[k].name).x + px(24);
         if (x > 0.0f && x + cw < row_w) {
             ImGui::SameLine(0, px(8));
         } else {
@@ -94,7 +96,7 @@ void page_overview()
         char a[32], b[32];
         ui::kv_row("Chip", "%s", i.chip_model);
         ui::kv_row("CPU", "%u MHz", sn.valid && sn.s.cpu_freq_mhz ? sn.s.cpu_freq_mhz : i.cpu_freq_mhz);
-        fmt_bytes(a, sizeof(a), i.psram_free);
+        fmt_bytes(a, sizeof(a), sn.valid ? sn.s.free_psram : i.psram_free); /* 实时值优先 */
         ui::kv_row("PSRAM", "%u MB @ %u MHz  (%s free)", i.psram_mb, i.psram_freq_mhz, a);
         fmt_bytes(a, sizeof(a), i.sram_total);
         fmt_bytes(b, sizeof(b), i.sram_free);

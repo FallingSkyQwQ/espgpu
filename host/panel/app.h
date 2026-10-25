@@ -69,6 +69,8 @@ struct LogLine {
 
 /* ── 历史曲线（环形缓冲） ─────────────────────────────────────────── */
 
+constexpr size_t kLogMax = 5000; /* 日志行数上限（超出丢最旧） */
+
 constexpr int kHistLen = 240; /* 200ms 一个点 = 48 秒 */
 
 struct History {
@@ -135,10 +137,14 @@ struct App {
     std::atomic<Conn> conn{Conn::Searching};
     std::mutex status_mu;
     std::string status_text = "Searching for device…";
-    std::string device_path;
+    std::string device_path_;    /* 受 status_mu 保护，用 device_path() 读 */
     std::atomic<bool> emulator{false};
     std::atomic<bool> new_frame{false};
     std::atomic<double> last_frame_time{-100.0};
+    std::atomic<uint32_t> conn_gen{0};   /* 每次连上 +1，页面据此丢弃上一连接的缓存状态 */
+    std::atomic<bool> want_device_log{false}; /* settings.device_log 的线程安全镜像 */
+    std::atomic<bool> viewer_visible{false};  /* Viewer 页 / 全屏可见：只有这时新帧才唤醒 UI */
+    HANDLE wake = nullptr;                     /* worker → UI 的唤醒事件（自动复位） */
 
     /* 设备信息（连接时读一次） */
     std::mutex info_mu;
@@ -160,9 +166,11 @@ struct App {
     /* worker */
     std::atomic<bool> running{true};
 
-    /* 日志 */
+    /* 日志（最多 kLogMax 行；log_seq = 累计写入行数，log[0] 的序号 = log_seq - log.size()） */
     std::mutex log_mu;
     std::deque<LogLine> log;
+    uint64_t log_seq = 0;
+    uint64_t log_clear_gen = 0; /* Clear 之后 +1，日志页据此重建过滤缓存 */
 
     /* UI 状态 */
     Settings settings;
@@ -188,11 +196,16 @@ void log_line(int level, bool device, const char *fmt, ...);
 void enqueue(const char *what, std::function<int(espgpu_device_t *)> fn,
              const char *ok_msg = nullptr);
 
+/** 底层投递：fn 在设备线程上执行，未连接时 dev == nullptr（fn 自己负责收尾）。 */
+void enqueue_raw(std::function<void(espgpu_device_t *)> fn);
+
 /** 设备是否可用（UI 侧判断用） */
 bool connected();
 
 /** 状态文本（线程安全拷贝） */
 std::string status_text();
+/** 当前设备路径（线程安全拷贝） */
+std::string device_path();
 
 void save_settings();
 void apply_theme_settings();

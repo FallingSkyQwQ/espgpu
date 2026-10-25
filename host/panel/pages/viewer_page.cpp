@@ -32,9 +32,7 @@ void page_viewer()
         if (path.empty()) {
             ui::snackbar(ui::SnackKind::Error, "Could not save screenshot");
         } else {
-            char u8[MAX_PATH * 3];
-            WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, u8, sizeof(u8), nullptr, nullptr);
-            ui::snackbar(ui::SnackKind::Success, "Saved %s", u8);
+            ui::snackbar(ui::SnackKind::Success, "Saved %s", narrow(path).c_str());
         }
     }
     ImGui::SameLine(0, px(8));

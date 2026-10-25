@@ -33,6 +33,10 @@ namespace {
 IDXGISwapChain *g_swap = nullptr;
 ID3D11RenderTargetView *g_rtv = nullptr;
 bool g_swap_occluded = false;
+bool g_d3d_lost = false;      /* 设备移除 / 重置后等待重建 */
+bool g_dx_backend = false;    /* ImGui DX11 后端是否已 Init（Shutdown 两次会空指针崩溃） */
+UINT g_resize_w = 0, g_resize_h = 0; /* WM_SIZE 记下，主循环里统一 ResizeBuffers */
+double g_last_activity = 0.0; /* 最近一次窗口消息（输入、尺寸、焦点…）的时间 */
 std::thread g_worker;
 
 using clock_t_ = std::chrono::steady_clock;
@@ -50,9 +54,19 @@ double now_s()
 
 static void push_log(int level, bool device, const char *text)
 {
+    /* 换行 / 控制字符会让一行变成多行高，破坏日志页 ImGuiListClipper 的等高假设 */
+    std::string t(text ? text : "");
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r' || t.back() == ' ')) {
+        t.pop_back();
+    }
+    for (char &ch : t) {
+        if (static_cast<unsigned char>(ch) < 0x20) ch = ' ';
+    }
+    const double ts = now_s();
     std::lock_guard<std::mutex> lk(g_app.log_mu);
-    g_app.log.push_back(LogLine{level, device, now_s(), text});
-    while (g_app.log.size() > 5000) {
+    g_app.log.push_back(LogLine{level, device, ts, std::move(t)});
+    g_app.log_seq++;
+    while (g_app.log.size() > kLogMax) {
         g_app.log.pop_front();
     }
 }
@@ -93,11 +107,39 @@ static void dll_log_cb(int level, const char *msg, void *)
  * 设置
  * ════════════════════════════════════════════════════════════════════ */
 
-static const char *kSettingsFile = "espgpu-panel.cfg";
+/* 设置放在 %LOCALAPPDATA%\espgpu\ 下：以前写在当前目录，从快捷方式 / Program Files
+ * 启动时当前目录可能不可写或每次不同，设置就悄悄丢了。取不到时退回 exe 所在目录。 */
+static std::wstring settings_path()
+{
+    static std::wstring cached;
+    if (!cached.empty()) {
+        return cached;
+    }
+    wchar_t buf[MAX_PATH * 2];
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH * 2);
+    if (n > 0 && n < MAX_PATH * 2) {
+        const std::wstring dir = std::wstring(buf) + L"\\espgpu";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const DWORD a = GetFileAttributesW(dir.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+            cached = dir + L"\\espgpu-panel.cfg";
+            return cached;
+        }
+    }
+    const DWORD m = GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
+    std::wstring exe = (m > 0 && m < MAX_PATH * 2) ? std::wstring(buf, m) : std::wstring();
+    const size_t slash = exe.find_last_of(L"\\/");
+    cached = (slash == std::wstring::npos ? std::wstring() : exe.substr(0, slash + 1)) +
+             L"espgpu-panel.cfg";
+    return cached;
+}
 
 static void load_settings()
 {
-    FILE *f = fopen(kSettingsFile, "r");
+    FILE *f = _wfopen(settings_path().c_str(), L"r");
+    if (!f) {
+        f = _wfopen(L"espgpu-panel.cfg", L"r"); /* 旧版本写在当前目录 */
+    }
     if (!f) {
         return;
     }
@@ -120,16 +162,24 @@ static void load_settings()
 
 void save_settings()
 {
-    FILE *f = fopen(kSettingsFile, "w");
+    g_app.want_device_log = g_app.settings.device_log;
+    /* 先写临时文件再替换，写到一半崩溃 / 磁盘满时不会留下截断的配置 */
+    const std::wstring path = settings_path();
+    const std::wstring tmp = path + L".tmp";
+    FILE *f = _wfopen(tmp.c_str(), L"w");
     if (!f) {
         return;
     }
     const Settings &s = g_app.settings;
-    fprintf(f, "theme=%d\nreduce_motion=%d\nviewer_integer=%d\nviewer_hud=%d\n", s.theme_mode,
-            s.reduce_motion ? 1 : 0, s.viewer_integer ? 1 : 0, s.viewer_hud ? 1 : 0);
-    fprintf(f, "device_log=%d\nlog_mask=%d\npage=%d\n", s.device_log ? 1 : 0, s.log_level_mask,
-            g_app.page);
-    fclose(f);
+    int ok = fprintf(f, "theme=%d\nreduce_motion=%d\nviewer_integer=%d\nviewer_hud=%d\n",
+                     s.theme_mode, s.reduce_motion ? 1 : 0, s.viewer_integer ? 1 : 0,
+                     s.viewer_hud ? 1 : 0) > 0;
+    ok &= fprintf(f, "device_log=%d\nlog_mask=%d\npage=%d\n", s.device_log ? 1 : 0,
+                  s.log_level_mask, g_app.page) > 0;
+    ok &= fclose(f) == 0;
+    if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+    }
 }
 
 /* DWM 属性（数值写死，旧 SDK 头里可能没有这些枚举） */
@@ -178,6 +228,23 @@ std::string status_text()
 {
     std::lock_guard<std::mutex> lk(g_app.status_mu);
     return g_app.status_text;
+}
+
+std::string device_path()
+{
+    std::lock_guard<std::mutex> lk(g_app.status_mu);
+    return g_app.device_path_;
+}
+
+static void wake_ui()
+{
+    if (g_app.wake) SetEvent(g_app.wake);
+}
+
+void enqueue_raw(std::function<void(espgpu_device_t *)> fn)
+{
+    std::lock_guard<std::mutex> lk(g_app.job_mu);
+    g_app.jobs.push_back(std::move(fn));
 }
 
 bool connected()
@@ -249,6 +316,7 @@ static void worker_disconnect(const char *why)
     g_app.conn = Conn::Searching;
     g_app.emulator = false;
     set_status("Searching for device…");
+    wake_ui();
 }
 
 static void worker_try_connect()
@@ -285,18 +353,25 @@ static void worker_try_connect()
         g_app.have_info = have;
     }
     g_app.emulator = espgpu_is_emulator(dev);
-    g_app.device_path = espgpu_device_path(dev) ? espgpu_device_path(dev) : "";
+    const std::string path = espgpu_device_path(dev) ? espgpu_device_path(dev) : "";
+    {
+        std::lock_guard<std::mutex> lk(g_app.status_mu);
+        g_app.device_path_ = path;
+    }
     {
         std::lock_guard<std::mutex> lk(g_app.dev_mu);
         g_app.dev = dev;
     }
+    g_app.conn_gen++;
     g_app.conn = Conn::Connected;
     set_status(g_app.emulator ? "Connected to software emulator" : "Connected over USB");
-    log_line(3, false, "connected to %s", g_app.device_path.c_str());
+    log_line(3, false, "connected to %s", path.c_str());
     ui::snackbar(ui::SnackKind::Success, "%s",
                  g_app.emulator ? "Connected to the software emulator" : "ESP32-S3 GPU connected");
+    wake_ui();
 
-    if (g_app.settings.device_log && (info.capabilities & ESPGPU_CAP_LOG)) {
+    /* settings 只属于 UI 线程，这里读它的原子镜像 */
+    if (g_app.want_device_log.load() && (info.capabilities & ESPGPU_CAP_LOG)) {
         espgpu_log_subscribe(dev, 3, 500);
     }
 }
@@ -361,6 +436,7 @@ static void worker_main()
         if (got > 0) {
             g_app.new_frame = true;
             g_app.last_frame_time = now;
+            if (g_app.viewer_visible.load()) wake_ui(); /* 空闲节流时让 Viewer 跟上帧率 */
         } else if (got < 0) {
             worker_disconnect("poll failed");
             continue;
@@ -446,7 +522,7 @@ static bool init_d3d(HWND hwnd)
     sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.Flags = 0; /* 全屏由 F11 的无边框窗口实现，不用 DXGI 独占全屏 */
 
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL got{};
@@ -461,16 +537,77 @@ static bool init_d3d(HWND hwnd)
     if (FAILED(hr)) {
         return false;
     }
+    /* 关掉 DXGI 默认的 Alt+Enter 独占全屏：它绕过 F11 的状态机，
+     * 退出时还要求先 SetFullscreenState(FALSE) 才能释放交换链。 */
+    IDXGIFactory *factory = nullptr;
+    if (SUCCEEDED(g_swap->GetParent(IID_PPV_ARGS(&factory))) && factory) {
+        factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        factory->Release();
+    }
     create_rtv();
-    return true;
+    return g_rtv != nullptr;
 }
 
 static void cleanup_d3d()
 {
     release_rtv();
+    if (g_app.ctx) { g_app.ctx->ClearState(); g_app.ctx->Flush(); }
     if (g_swap) { g_swap->Release(); g_swap = nullptr; }
     if (g_app.ctx) { g_app.ctx->Release(); g_app.ctx = nullptr; }
     if (g_app.d3d) { g_app.d3d->Release(); g_app.d3d = nullptr; }
+}
+
+static bool hr_device_lost(HRESULT hr)
+{
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+           hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
+/** 驱动更新 / TDR / 拔显卡后整套重建：设备、交换链、ImGui 后端对象、帧纹理。 */
+static void on_device_lost(HRESULT hr)
+{
+    if (!g_d3d_lost) {
+        const HRESULT why = g_app.d3d ? g_app.d3d->GetDeviceRemovedReason() : hr;
+        log_line(1, false, "Direct3D device lost (0x%08lX, reason 0x%08lX), recreating",
+                 static_cast<unsigned long>(hr), static_cast<unsigned long>(why));
+    }
+    g_d3d_lost = true;
+}
+
+static bool try_recover_d3d()
+{
+    viewer_shutdown();
+    if (g_dx_backend) {
+        ImGui_ImplDX11_Shutdown();
+        g_dx_backend = false;
+    }
+    cleanup_d3d();
+    if (!init_d3d(g_app.hwnd)) {
+        cleanup_d3d();
+        return false;
+    }
+    g_dx_backend = ImGui_ImplDX11_Init(g_app.d3d, g_app.ctx); /* 字体纹理在下一次 NewFrame 里重建 */
+    viewer_init();
+    g_app.new_frame = true; /* 帧纹理随旧设备一起没了，下一帧重新上传 */
+    g_d3d_lost = false;
+    g_resize_w = g_resize_h = 0;
+    log_line(3, false, "Direct3D device recreated");
+    return true;
+}
+
+static void apply_pending_resize()
+{
+    if (g_resize_w == 0 || g_resize_h == 0 || g_swap == nullptr) {
+        return;
+    }
+    release_rtv();
+    const HRESULT hr = g_swap->ResizeBuffers(0, g_resize_w, g_resize_h, DXGI_FORMAT_UNKNOWN, 0);
+    g_resize_w = g_resize_h = 0;
+    if (hr_device_lost(hr)) {
+        on_device_lost(hr);
+        return;
+    }
+    create_rtv();
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -854,17 +991,21 @@ using namespace panel;
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* 任何窗口消息（输入、尺寸、焦点、主题…）都让主循环恢复全速一小段时间 */
+    if (msg != WM_PAINT && msg != WM_TIMER) {
+        g_last_activity = now_s();
+    }
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) {
         return 1;
     }
 
     switch (msg) {
     case WM_SIZE:
-        if (g_app.d3d != nullptr && wp != SIZE_MINIMIZED) {
-            release_rtv();
-            g_swap->ResizeBuffers(0, static_cast<UINT>(LOWORD(lp)), static_cast<UINT>(HIWORD(lp)),
-                                  DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
-            create_rtv();
+        /* 最小化 / 0 尺寸时不动交换链（ResizeBuffers(0,0) 会失败，RTV 变空）；
+         * 实际的 ResizeBuffers 推迟到主循环，拖动边框时不会每条消息都重建一次 */
+        if (wp != SIZE_MINIMIZED && LOWORD(lp) > 0 && HIWORD(lp) > 0) {
+            g_resize_w = static_cast<UINT>(LOWORD(lp));
+            g_resize_h = static_cast<UINT>(HIWORD(lp));
         }
         return 0;
     case WM_DPICHANGED: {
@@ -920,7 +1061,16 @@ static void rebuild_fonts(float scale)
     theme::set_dpi(scale);
     theme::load_fonts(scale);
     theme::apply_style_sizes(scale);
-    ImGui_ImplDX11_InvalidateDeviceObjects(); /* NewFrame 里会重建字体纹理 */
+    if (g_dx_backend) {
+        ImGui_ImplDX11_InvalidateDeviceObjects(); /* NewFrame 里会重建字体纹理 */
+    }
+}
+
+/** 等待下一次需要绘制：窗口消息、worker 的唤醒（新帧 / 连接变化）或超时。 */
+static void wait_for_work(DWORD timeout_ms)
+{
+    MsgWaitForMultipleObjectsEx(g_app.wake ? 1 : 0, g_app.wake ? &g_app.wake : nullptr,
+                                timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 }
 
 int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
@@ -929,6 +1079,8 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
 
     load_settings();
     g_app.page = g_app.settings.page;
+    g_app.want_device_log = g_app.settings.device_log;
+    g_app.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     espgpu_set_log_callback(dll_log_cb, nullptr);
     espgpu_set_log_level(3);
@@ -967,10 +1119,12 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.IniFilename = "espgpu-panel.ini";
+    /* 所有窗口都是 NoSavedSettings / 每帧定位，ini 里没有有用的东西；
+     * 以前写进当前目录，从别处启动时会到处留文件 */
+    io.IniFilename = nullptr;
 
     ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_app.d3d, g_app.ctx);
+    g_dx_backend = ImGui_ImplDX11_Init(g_app.d3d, g_app.ctx);
 
     const float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
     g_app.dpi_scale = scale;
@@ -999,7 +1153,16 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
 
     ImVec4 last_caption{};
     bool running = true;
+    bool idle_ok = false;  /* 上一帧之后是否允许空闲等待 */
+    double last_recover = -10.0;
     while (running) {
+        /* 空闲节流：最近 0.75 s 内没有任何窗口消息、没有 snackbar 时，不再每个 vsync
+         * 都重画（144/240 Hz 屏上能省下整颗核），而是等消息 / 新帧 / 100 ms 超时。
+         * 0.75 s 覆盖了所有过渡动画（≤0.25 s）与 tooltip 延迟（0.4 s）。 */
+        if (idle_ok) {
+            wait_for_work(100);
+        }
+
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -1012,18 +1175,46 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
             break;
         }
 
-        if (g_swap_occluded && g_swap->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
-            Sleep(10);
+        if (g_d3d_lost) {
+            const double t = now_s();
+            bool ok = false;
+            if (t - last_recover >= 1.0) { /* 每秒重试一次 */
+                last_recover = t;
+                ok = try_recover_d3d();
+            }
+            if (!ok) {
+                wait_for_work(100);
+                idle_ok = false;
+                continue;
+            }
+        }
+
+        /* 最小化 / 被完全遮挡：不画，等消息 */
+        if (IsIconic(hwnd) ||
+            (g_swap_occluded && g_swap->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED)) {
+            wait_for_work(100);
+            idle_ok = false;
             continue;
         }
         g_swap_occluded = false;
+
+        apply_pending_resize();
+        if (g_d3d_lost || g_rtv == nullptr) {
+            if (!g_d3d_lost) on_device_lost(S_OK); /* RTV 建不出来：整套重建 */
+            wait_for_work(100);
+            idle_ok = false;
+            continue;
+        }
 
         if (g_app.pending_dpi > 0.0f) {
             rebuild_fonts(g_app.pending_dpi);
             g_app.pending_dpi = 0.0f;
         }
 
-        if (g_app.new_frame.exchange(false)) {
+        /* 只在画面可见时上传：不可见时新帧标志一直保留，切到 Viewer 的那一帧立即补传 */
+        const bool viewer_vis = g_app.fullscreen || g_app.page == PAGE_VIEWER;
+        g_app.viewer_visible = viewer_vis;
+        if (viewer_vis && g_app.new_frame.exchange(false)) {
             viewer_upload();
         }
 
@@ -1049,23 +1240,34 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
 
         const HRESULT hr = g_swap->Present(1, 0);
         g_swap_occluded = (hr == DXGI_STATUS_OCCLUDED);
+        if (hr_device_lost(hr)) {
+            on_device_lost(hr);
+        }
+
+        idle_ok = now_s() - g_last_activity > 0.75 && !ui::snackbar_active() &&
+                  !io.WantTextInput && g_app.pending_dpi <= 0.0f;
     }
 
     save_settings();
 
+    /* 窗口此时已经销毁（WM_DESTROY），等 worker 收尾时不会显示成“未响应”。
+     * OTA 在每个 8 KB 块之后检查取消；其余控制请求最长 1.5 s 超时。 */
     g_app.ota.cancel = true;
     g_app.running = false;
     if (g_worker.joinable()) {
         g_worker.join();
     }
+    /* 设备已关闭，之后 DLL 不会再回调；解除回调，避免静态析构后的悬空 g_app */
+    espgpu_set_log_callback(nullptr, nullptr);
 
     viewer_shutdown();
-    ImGui_ImplDX11_Shutdown();
+    if (g_dx_backend) ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
     cleanup_d3d();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, hinst);
+    if (g_app.wake) CloseHandle(g_app.wake);
     return 0;
 }

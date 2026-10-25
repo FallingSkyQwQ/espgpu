@@ -26,6 +26,7 @@ int g_w = 0;
 int g_h = 0;
 uint32_t g_frame_id = 0;
 std::vector<uint8_t> g_rgba; /* 最近一帧，截图用 */
+int g_rgba_w = 0, g_rgba_h = 0; /* g_rgba 的实际尺寸（纹理重建失败时可能与 g_w/g_h 不同） */
 
 void set_point_sampler(const ImDrawList *, const ImDrawCmd *)
 {
@@ -38,6 +39,7 @@ void set_point_sampler(const ImDrawList *, const ImDrawCmd *)
 
 bool viewer_init()
 {
+    if (g_app.d3d == nullptr) return false;
     D3D11_SAMPLER_DESC sd{};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -52,6 +54,7 @@ void viewer_shutdown()
 {
     if (g_srv) { g_srv->Release(); g_srv = nullptr; }
     if (g_point) { g_point->Release(); g_point = nullptr; }
+    g_w = g_h = 0; /* 下次上传时按新设备重建纹理 */
 }
 
 bool viewer_has_frame() { return g_srv != nullptr; }
@@ -60,6 +63,7 @@ int viewer_height() { return g_h; }
 
 void viewer_upload()
 {
+    if (g_app.d3d == nullptr || g_app.ctx == nullptr) return;
     int w = 0, h = 0;
     uint32_t id = 0;
     {
@@ -77,6 +81,8 @@ void viewer_upload()
         }
     }
     if (w <= 0 || h <= 0) return;
+    g_rgba_w = w;
+    g_rgba_h = h;
 
     if (g_srv == nullptr || g_w != w || g_h != h) {
         if (g_srv) { g_srv->Release(); g_srv = nullptr; }
@@ -201,9 +207,32 @@ void viewer_draw(ImVec2 avail, bool hud)
     }
 }
 
+/** 截图目录：%USERPROFILE%\Pictures（存在时），否则 exe 所在目录。
+ *  以前写进当前目录，从快捷方式启动时可能是 System32 之类不可写的位置。 */
+static std::wstring shot_dir()
+{
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH * 2);
+    if (n > 0 && n < MAX_PATH * 2) {
+        const std::wstring d = std::wstring(buf) + L"\\Pictures";
+        const DWORD a = GetFileAttributesW(d.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+            return d + L"\\";
+        }
+    }
+    n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 2);
+    if (n > 0 && n < MAX_PATH * 2) {
+        std::wstring exe(buf, n);
+        const size_t slash = exe.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) return exe.substr(0, slash + 1);
+    }
+    return {};
+}
+
 std::wstring viewer_screenshot()
 {
-    if (g_w <= 0 || g_h <= 0 || g_rgba.size() < static_cast<size_t>(g_w) * g_h * 4) {
+    const int w = g_rgba_w, h = g_rgba_h;
+    if (w <= 0 || h <= 0 || g_rgba.size() < static_cast<size_t>(w) * h * 4) {
         return {};
     }
     wchar_t name[96];
@@ -211,43 +240,48 @@ std::wstring viewer_screenshot()
     std::tm tmv{};
     localtime_s(&tmv, &t);
     wcsftime(name, 96, L"espgpu-shot-%Y%m%d-%H%M%S.bmp", &tmv);
+    const std::wstring path = shot_dir() + name;
 
-    const int row = (g_w * 3 + 3) & ~3;
-    const uint32_t img = static_cast<uint32_t>(row) * g_h;
+    const int row = (w * 3 + 3) & ~3;
+    const uint32_t img = static_cast<uint32_t>(row) * h;
     BITMAPFILEHEADER fh{};
     BITMAPINFOHEADER ih{};
     fh.bfType = 0x4D42;
     fh.bfOffBits = sizeof(fh) + sizeof(ih);
     fh.bfSize = fh.bfOffBits + img;
     ih.biSize = sizeof(ih);
-    ih.biWidth = g_w;
-    ih.biHeight = g_h; /* 正值 = 自底向上 */
+    ih.biWidth = w;
+    ih.biHeight = h; /* 正值 = 自底向上 */
     ih.biPlanes = 1;
     ih.biBitCount = 24;
     ih.biCompression = BI_RGB;
     ih.biSizeImage = img;
 
-    FILE *f = _wfopen(name, L"wb");
+    FILE *f = _wfopen(path.c_str(), L"wb");
     if (!f) return {};
-    fwrite(&fh, sizeof(fh), 1, f);
-    fwrite(&ih, sizeof(ih), 1, f);
+    bool ok = fwrite(&fh, sizeof(fh), 1, f) == 1 && fwrite(&ih, sizeof(ih), 1, f) == 1;
     std::vector<uint8_t> line(static_cast<size_t>(row), 0);
-    for (int y = g_h - 1; y >= 0; y--) {
-        const uint8_t *src = g_rgba.data() + static_cast<size_t>(y) * g_w * 4;
-        for (int x = 0; x < g_w; x++) {
+    for (int y = h - 1; y >= 0 && ok; y--) {
+        const uint8_t *src = g_rgba.data() + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; x++) {
             line[static_cast<size_t>(x) * 3 + 0] = src[x * 4 + 2];
             line[static_cast<size_t>(x) * 3 + 1] = src[x * 4 + 1];
             line[static_cast<size_t>(x) * 3 + 2] = src[x * 4 + 0];
         }
-        fwrite(line.data(), 1, line.size(), f);
+        ok = fwrite(line.data(), 1, line.size(), f) == line.size();
     }
-    fclose(f);
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) {
+        DeleteFileW(path.c_str()); /* 磁盘满等：不留半截文件 */
+        return {};
+    }
 
-    wchar_t full[MAX_PATH];
-    if (GetFullPathNameW(name, MAX_PATH, full, nullptr)) {
+    wchar_t full[MAX_PATH * 2];
+    const DWORD n = GetFullPathNameW(path.c_str(), MAX_PATH * 2, full, nullptr);
+    if (n > 0 && n < MAX_PATH * 2) { /* n >= 容量时 full 未写入 */
         return full;
     }
-    return name;
+    return path;
 }
 
 } // namespace panel

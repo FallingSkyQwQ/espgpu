@@ -33,6 +33,51 @@ bool contains_ci(const std::string &hay, const char *needle)
     return false;
 }
 
+/* 过滤结果缓存：保存行的绝对序号（log_seq 计），只在过滤条件变化 / Clear 时全量重建，
+ * 平时只追加新行、裁掉已被挤出队列的旧行 —— 5000 行 × 每帧子串搜索不再出现在热路径上。 */
+struct FilterCache {
+    std::vector<uint64_t> ids;
+    uint64_t scanned = 0; /* 已检查到的序号（不含） */
+    uint64_t clear_gen = ~0ull;
+    int mask = -1;
+    bool host = true, device = true;
+    std::string search;
+};
+FilterCache g_fc;
+
+bool line_passes(const LogLine &l, int mask)
+{
+    const int lv = l.level < 1 ? 1 : (l.level > 4 ? 4 : l.level);
+    if (!((mask >> (lv - 1)) & 1)) return false;
+    if (l.device ? !g_show_device : !g_show_host) return false;
+    return contains_ci(l.text, g_search);
+}
+
+/** 必须持有 g_app.log_mu 调用 */
+void update_filter(int mask)
+{
+    const uint64_t first = g_app.log_seq - g_app.log.size();
+    if (g_fc.clear_gen != g_app.log_clear_gen || g_fc.mask != mask || g_fc.host != g_show_host ||
+        g_fc.device != g_show_device || g_fc.search != g_search) {
+        g_fc.ids.clear();
+        g_fc.scanned = first;
+        g_fc.clear_gen = g_app.log_clear_gen;
+        g_fc.mask = mask;
+        g_fc.host = g_show_host;
+        g_fc.device = g_show_device;
+        g_fc.search = g_search;
+    }
+    if (g_fc.scanned < first) g_fc.scanned = first;
+    for (uint64_t q = g_fc.scanned; q < g_app.log_seq; q++) {
+        if (line_passes(g_app.log[static_cast<size_t>(q - first)], mask)) g_fc.ids.push_back(q);
+    }
+    g_fc.scanned = g_app.log_seq;
+    /* 裁掉已经出队的行（ids 升序） */
+    size_t drop = 0;
+    while (drop < g_fc.ids.size() && g_fc.ids[drop] < first) drop++;
+    if (drop) g_fc.ids.erase(g_fc.ids.begin(), g_fc.ids.begin() + static_cast<ptrdiff_t>(drop));
+}
+
 } // namespace
 
 void page_log()
@@ -80,23 +125,17 @@ void page_log()
     ui::toggle("Auto-scroll", &g_autoscroll);
     ImGui::SameLine(0, px(24));
 
-    /* 收集过滤后的行（持锁期间只做索引，渲染也在锁内，避免拷贝 5000 个字符串） */
+    /* 持锁期间只做增量过滤和可见行渲染（ImGuiListClipper），锁占用是微秒级，
+     * 不会卡住在 DLL 接收线程里回调 push_log 的一方 */
     std::lock_guard<std::mutex> lk(g_app.log_mu);
-    std::vector<int> idx;
-    idx.reserve(g_app.log.size());
-    for (int k = 0; k < static_cast<int>(g_app.log.size()); k++) {
-        const LogLine &l = g_app.log[static_cast<size_t>(k)];
-        const int lv = l.level < 1 ? 1 : (l.level > 4 ? 4 : l.level);
-        if (!((st.log_level_mask >> (lv - 1)) & 1)) continue;
-        if (l.device ? !g_show_device : !g_show_host) continue;
-        if (!contains_ci(l.text, g_search)) continue;
-        idx.push_back(k);
-    }
+    update_filter(st.log_level_mask);
+    const uint64_t first = g_app.log_seq - g_app.log.size();
+    const std::vector<uint64_t> &idx = g_fc.ids;
 
     if (ui::button("Copy", ui::ButtonKind::Tonal, theme::icon::copy)) {
         std::string all;
-        for (int k : idx) {
-            const LogLine &l = g_app.log[static_cast<size_t>(k)];
+        for (uint64_t q : idx) {
+            const LogLine &l = g_app.log[static_cast<size_t>(q - first)];
             char head[48];
             snprintf(head, sizeof(head), "[%9.3f] %s ", l.time, l.device ? "DEV " : "HOST");
             all += head;
@@ -136,7 +175,7 @@ void page_log()
     ImFont *mono = theme::fonts().label;
     while (clip.Step()) {
         for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
-            const LogLine &l = g_app.log[static_cast<size_t>(idx[static_cast<size_t>(r)])];
+            const LogLine &l = g_app.log[static_cast<size_t>(idx[static_cast<size_t>(r)] - first)];
             ImVec4 col;
             const char *tag;
             switch (l.level) {
@@ -166,6 +205,7 @@ void page_log()
 
     if (clear) {
         g_app.log.clear();
+        g_app.log_clear_gen++;
     }
 }
 

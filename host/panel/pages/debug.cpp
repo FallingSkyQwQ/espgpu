@@ -21,6 +21,7 @@ const char *const kViewDesc[] = {
 };
 
 int g_view = -1;
+uint32_t g_view_gen = 0; /* g_view 属于哪一次连接（重启 / 重连后设备回到 Normal） */
 
 void heat_legend(const char *lo, const char *hi)
 {
@@ -54,10 +55,18 @@ void page_debug()
         return;
     }
     const Snapshot sn = snapshot();
-    if (g_view < 0 && sn.valid) {
-        g_view = sn.s.debug_view < ESPGPU_DEBUG_VIEW_COUNT ? sn.s.debug_view : 0;
+    if (g_view_gen != g_app.conn_gen.load()) {
+        g_view_gen = g_app.conn_gen.load();
+        g_view = -1;
     }
-    if (g_view < 0) g_view = 0;
+    /* 首次拿到有效统计时与设备同步（统计未到之前先显示 Normal，但不算已同步） */
+    static bool s_synced = false;
+    if (g_view < 0) s_synced = false;
+    if (!s_synced && sn.valid) {
+        g_view = sn.s.debug_view < ESPGPU_DEBUG_VIEW_COUNT ? sn.s.debug_view : 0;
+        s_synced = true;
+    }
+    if (g_view < 0 || g_view >= ESPGPU_DEBUG_VIEW_COUNT) g_view = 0;
 
     if (require_cap(sn.info, ESPGPU_CAP_DEBUG_VIEW, "debug views")) {
         ui::card_begin("views", 0);
@@ -65,6 +74,7 @@ void page_debug()
                    "Replaces what the device sends back at PRESENT. Rendering itself is not "
                    "affected; switch back to Normal when done.");
         if (ui::segmented("dv", kViews, ESPGPU_DEBUG_VIEW_COUNT, &g_view)) {
+            s_synced = true;
             const int v = g_view;
             enqueue("Set debug view", [v](espgpu_device_t *dev) {
                 return espgpu_set_debug_view(dev, v, 800);

@@ -491,19 +491,49 @@ void load_fonts(float scale)
         return std::string();
     }();
 
-    static const ImWchar kIconRanges[] = {0xE700, 0xF8FF, 0};
+    /* 图标只烘焙实际用到的码位。整段 E700–F8FF 在 Segoe Fluent Icons 里有上千个字形，
+     * 乘以 8 个字号后图集在 100% DPI 就有 ~10M 像素，200%/300% DPI 时高度超过 D3D 的
+     * 纹理上限（8192 / 16384），CreateTexture2D 失败后后端直接空指针崩溃。
+     * 新增 theme::icon 常量时把它加进这张表。 */
+    static ImWchar kIconRanges[80] = {0};
+    if (kIconRanges[0] == 0) {
+        const char *const used[] = {
+            icon::home, icon::info, icon::display, icon::speed, icon::eye, icon::bug,
+            icon::memory, icon::clock, icon::download, icon::log, icon::palette, icon::refresh,
+            icon::save, icon::fullscreen, icon::camera, icon::warning, icon::error, icon::check,
+            icon::cancel, icon::power, icon::usb, icon::chip, icon::brightness, icon::moon,
+            icon::search, icon::copy, icon::del, icon::folder, icon::heat, icon::link,
+        };
+        int n = 0;
+        for (const char *u : used) {
+            /* 图标都在 BMP 私用区：3 字节 UTF-8 */
+            const auto *b = reinterpret_cast<const unsigned char *>(u);
+            const unsigned int cp = ((b[0] & 0x0Fu) << 12) | ((b[1] & 0x3Fu) << 6) | (b[2] & 0x3Fu);
+            if ((b[0] & 0xF0u) == 0xE0u && n + 2 < static_cast<int>(IM_ARRAYSIZE(kIconRanges))) {
+                kIconRanges[n++] = static_cast<ImWchar>(cp);
+                kIconRanges[n++] = static_cast<ImWchar>(cp);
+            }
+        }
+        kIconRanges[n] = 0;
+    }
     static const ImWchar kExtraRanges[] = {0x0020, 0x00FF, 0x2010, 0x205E, 0x2190, 0x21FF,
-                                           0x2200, 0x22FF, 0x25A0, 0x25FF, 0x00B0, 0x00B0, 0};
+                                           0x2200, 0x22FF, 0x25A0, 0x25FF, 0};
 
-    auto add = [&](const std::string &path, float size, bool merge_cjk) -> ImFont * {
+    static const ImWchar kAsciiRanges[] = {0x0020, 0x007E, 0};
+
+    auto add = [&](const std::string &path, float size, bool merge_cjk,
+                   bool ascii_only = false) -> ImFont * {
         ImFont *f = nullptr;
         const float px_size = std::floor(size * scale + 0.5f);
         if (!path.empty()) {
             ImFontConfig cfg;
-            cfg.OversampleH = 2;
-            cfg.OversampleV = 2;
+            /* 水平 2x 过采样足够做亚像素定位；垂直过采样对 y 对齐的文字没有收益，
+             * 却让图集面积翻倍。大字号（>36px）不需要过采样。 */
+            cfg.OversampleH = px_size > 36.0f ? 1 : 2;
+            cfg.OversampleV = 1;
             cfg.PixelSnapH = false;
-            f = io.Fonts->AddFontFromFileTTF(path.c_str(), px_size, &cfg, kExtraRanges);
+            f = io.Fonts->AddFontFromFileTTF(path.c_str(), px_size, &cfg,
+                                             ascii_only ? kAsciiRanges : kExtraRanges);
         }
         if (f == nullptr) {
             ImFontConfig cfg;
@@ -519,7 +549,7 @@ void load_fonts(float scale)
                                          io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
         }
         /* 正文字体里也合并图标，按钮里可以图标 + 文字混排 */
-        if (!icon_font.empty()) {
+        if (!icon_font.empty() && !ascii_only) {
             ImFontConfig cfg;
             cfg.MergeMode = true;
             cfg.GlyphMinAdvanceX = px_size;
@@ -529,12 +559,14 @@ void load_fonts(float scale)
         return f;
     };
 
+    /* CJK（约 2500 字）只合并进正文字体：只有日志、文件路径、输入框可能出现中文，
+     * 其余字体都是固定的英文 UI 文案，合并进去只会让图集膨胀 4 倍。 */
     g_fonts.body = add(text_font, 15.0f, true); /* 第一个即默认字体 */
-    g_fonts.body_strong = add(strong_font, 15.0f, true);
-    g_fonts.label = add(strong_font, 12.5f, true);
-    g_fonts.title = add(strong_font, 20.0f, true);
+    g_fonts.body_strong = add(strong_font, 15.0f, false);
+    g_fonts.label = add(strong_font, 12.5f, false);
+    g_fonts.title = add(strong_font, 20.0f, false);
     g_fonts.headline = add(text_font, 28.0f, false);
-    g_fonts.display = add(text_font, 40.0f, false);
+    g_fonts.display = add(text_font, 40.0f, false, true); /* 只用于大数字：ASCII 足够 */
 
     if (!icon_font.empty()) {
         ImFontConfig cfg;

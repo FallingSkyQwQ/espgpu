@@ -134,6 +134,8 @@ enum class SnackKind { Info, Success, Error };
 void snackbar(SnackKind kind, const char *fmt, ...);
 /** 每帧在根窗口末尾调用 */
 void snackbar_draw();
+/** 是否有 snackbar 在显示或排队（主循环据此决定是否保持全速刷新） */
+bool snackbar_active();
 
 /**
  * 确认对话框。调用 open_dialog(id) 打开；每帧调用 dialog() 渲染，

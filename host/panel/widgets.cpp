@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <mutex>
 #include <set>
 #include <string>
@@ -743,6 +744,22 @@ void line_chart(const char *id, const Series *series, int series_count, float vm
         for (int i = 0; i < series[k].count; i++) top = std::max(top, series[k].data[i] * 1.1f);
     }
     if (top <= vmin) top = vmin + 1.0f;
+    /* 刻度取整：4 格、每格是 {1,1.5,2,2.5,3,4,5,6,8}×10^n，避免 "22 / 15 / 8" 这种标签 */
+    float step = (top - vmin) / 4.0f;
+    {
+        const float p10 = std::pow(10.0f, std::floor(std::log10(step)));
+        const float f = step / p10;
+        float nf = 10.0f;
+        for (float c : {1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f, 6.0f, 8.0f}) {
+            if (f <= c * 1.0001f) {
+                nf = c;
+                break;
+            }
+        }
+        step = nf * p10;
+        top = vmin + step * 4.0f;
+    }
+    const bool int_ticks = std::fabs(step - std::round(step)) < 1e-3f;
 
     ImFont *lf = theme::fonts().label;
     const float label_w = px(44);
@@ -755,13 +772,18 @@ void line_chart(const char *id, const Series *series, int series_count, float vm
         dl->AddLine(ImVec2(a.x, y), ImVec2(b.x, y), u32(s.outline_variant, g == 4 ? 0.9f : 0.45f),
                     px(1));
         char buf[32];
-        snprintf(buf, sizeof(buf), "%.0f", top - (top - vmin) * g / 4.0f);
+        snprintf(buf, sizeof(buf), int_ticks ? "%.0f" : "%.1f", top - step * g);
         const ImVec2 ts = text_size(lf, buf);
         draw_text(dl, lf, ImVec2(a.x - px(8) - ts.x, y - ts.y * 0.5f), s.on_surface_variant, buf);
     }
 
+    if (gw <= 1.0f || gh <= 1.0f) {
+        ImGui::PopID();
+        return;
+    }
+
     const ImVec2 white = ImGui::GetFontTexUvWhitePixel();
-    std::vector<ImVec2> pts;
+    static std::vector<ImVec2> pts; /* 只在 UI 线程用；复用避免每帧分配 */
 
     for (int k = 0; k < series_count; k++) {
         const Series &sr = series[k];
@@ -1010,6 +1032,12 @@ void snackbar(SnackKind kind, const char *fmt, ...)
     std::lock_guard<std::mutex> lk(g_snack_mu);
     g_snacks.push_back({kind, buf});
     while (g_snacks.size() > 8) g_snacks.pop_front();
+}
+
+bool snackbar_active()
+{
+    std::lock_guard<std::mutex> lk(g_snack_mu);
+    return !g_snacks.empty();
 }
 
 void snackbar_draw()
