@@ -6,10 +6,16 @@
  *   2. GPU 状态与帧缓冲（PSRAM 分配，越早越好，避免碎片）
  *   3. USB 描述符（序列号依赖 eFuse MAC）
  *   4. TinyUSB 安装
- *   5. 起任务：命令处理固定在 core0，呈现固定在 core1
+ *   5. 起任务：命令处理固定在 core0，呈现 / 发送 / TinyUSB 在 core1
+ *
+ * OTA 回滚确认不在这里做：要等主机通过 USB 发来第一个控制请求（gpu.c
+ * confirm_running_app_once），USB 起不来的新固件下次复位会自动回滚。
  */
 
+#include <stdlib.h>
+
 #include "esp_chip_info.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_system.h"
@@ -59,6 +65,7 @@ void app_main(void)
     }
 
     /* ── GPU ── */
+    espgpu_log_forward_init();
     ESP_ERROR_CHECK(espgpu_gpu_init());
 
 #if CONFIG_ESPGPU_FLASH_WINDOW_MS > 0
@@ -82,21 +89,38 @@ void app_main(void)
 #endif
 
     /* ── 任务 ──
-     * core0：命令收发 + 统计采样（与 TinyUSB 任务同核）
-     * core1：内容生成 + 编码 + 呈现（M2 起换成光栅器）
+     * core0：命令收发 + T&L / 光栅（worker 0）/ 编码 + 统计采样
+     * core1：TinyUSB（9）/ 第二个光栅 worker（8）/ 帧发送（7）/ 测试图案呈现（6）
      *
-     * 命令任务的优先级必须高于 TinyUSB 任务（5）：esp_tinyusb 的任务是
-     * `while(1) tud_task();`，持续出帧时它几乎一直就绪，同核上优先级更低的
-     * 任务会被饿死，表现为 SET_MODE / GET_STATS 全部超时。
-     */
-    BaseType_t ok;
-    ok = xTaskCreatePinnedToCore(espgpu_gpu_command_task, "gpu_cmd", 6144, NULL, 7, NULL, 0);
-    configASSERT(ok == pdPASS);
-    (void)ok;
-
-    ok = xTaskCreatePinnedToCore(espgpu_gpu_present_task, "gpu_present", 6144, NULL, 6, NULL, 1);
-    configASSERT(ok == pdPASS);
-    (void)ok;
+     * 命令任务的栈：gpu_core_exec → gp_draw3d → draw_triangle（gp_cvtx_t va[]+vb[] 和
+     * gp_wvtx_t w[] 共约 4.8 KB 的局部数组）→ emit_tri → 分箱，主机上实测最深 6.8 KB
+     * （fuzz），再加 PRESENT 回调里的编码、链路上任何一处 ESP_LOG（经 vprintf 钩子再
+     * 格式化一次）和 Xtensa 窗口寄存器溢出区。原来的 6144 在 3D + 裁剪时必然溢出。
+     *
+     * 注意 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE 会让 configASSERT 失效，
+     * 所以创建失败要显式检查（栈加大之后内部 SRAM 不够是现实的失败方式）。 */
+    static const struct {
+        TaskFunction_t fn;
+        const char *name;
+        uint32_t stack;
+        UBaseType_t prio;
+        BaseType_t core;
+    } tasks[] = {
+        {espgpu_gpu_command_task, "gpu_cmd", 16384, 7, 0},
+        {espgpu_gpu_present_task, "gpu_present", 6144, 6, 1},
+        /* 命令模式的帧发送：与下一帧的命令执行重叠。放 core1，
+         * 命令模式下那里的测试图案任务是空闲的。 */
+        {espgpu_gpu_sender_task, "gpu_send", 4096, 7, 1},
+    };
+    for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+        if (xTaskCreatePinnedToCore(tasks[i].fn, tasks[i].name, tasks[i].stack, NULL,
+                                    tasks[i].prio, NULL, tasks[i].core) != pdPASS) {
+            ESP_LOGE(TAG, "task %s create failed (stack %u, free internal %u)", tasks[i].name,
+                     (unsigned)tasks[i].stack,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            abort();
+        }
+    }
 
     ESP_LOGI(TAG, "boot complete, waiting for host enumeration");
 }

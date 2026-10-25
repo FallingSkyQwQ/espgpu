@@ -21,13 +21,19 @@ bool espgpu_usb_ready(void);
  * @param[out] hdr      收到的头
  * @param[out] payload  载荷缓冲区
  * @param[in]  cap      payload 容量
- * @param[in]  timeout_ms 超时
+ * @param[in]  timeout_ms 等待 Chunk 开始的超时；头到了之后载荷至少再等 1 秒
  * @return ESP_OK / ESP_ERR_TIMEOUT / ESP_ERR_INVALID_SIZE
  */
 esp_err_t espgpu_usb_read_chunk(espgpu_chunk_hdr_t *hdr, void *payload, size_t cap,
                                 uint32_t timeout_ms);
 
-/** 阻塞发送一个完整 Chunk（自动加头与可选 CRC）。 */
+/**
+ * 阻塞发送一个完整 Chunk（自动加头）。
+ *
+ * 超时返回 ESP_ERR_TIMEOUT 时这个 Chunk 可能已经发出一部分：剩余字节会在下一次
+ * 发送之前补完（主机侧分帧不乱，只是晚到），所以调用者应当把它视为「没送达」，
+ * 但不必担心链路失步。
+ */
 esp_err_t espgpu_usb_send_chunk(uint8_t type, uint8_t flags, const void *payload,
                                 uint32_t len, uint32_t timeout_ms);
 
@@ -37,9 +43,6 @@ esp_err_t espgpu_usb_send_chunk(uint8_t type, uint8_t flags, const void *payload
  */
 esp_err_t espgpu_usb_send_chunk_iov(uint8_t type, uint8_t flags, const void *p0, uint32_t n0,
                                     const void *p1, uint32_t n1, uint32_t timeout_ms);
-
-/** 直接写入原始字节（发送大块载荷时避免再拷一层）。 */
-size_t espgpu_usb_write(const void *data, size_t len, uint32_t timeout_ms);
 
 /** 发送一个控制响应。 */
 esp_err_t espgpu_usb_send_ctrl_resp(uint16_t op, uint16_t seq, uint16_t status,

@@ -6,7 +6,9 @@
 
 #include "internal.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -120,6 +122,10 @@ espgpu_device_t *espgpu_open(int index, char *err, size_t err_cap)
         log_msg(LOG_INFO, "device info: fw %u.%u.%u, %ux%u max, psram %uMB, caps 0x%04X",
                 info.fw_major, info.fw_minor, info.fw_patch, info.max_width, info.max_height,
                 info.psram_mb, info.capabilities);
+        dev->info = info;
+        dev->have_info = true;
+        /* 设备声明能解 LZ 才压缩下行，老固件照旧发原文 */
+        dev->compress = (info.capabilities & ESPGPU_CAP_LZ) != 0;
     }
 
     return dev;
@@ -130,7 +136,17 @@ void espgpu_close(espgpu_device_t *dev)
     if (dev == nullptr) {
         return;
     }
+    /* 其他线程可能正阻塞在 link_ctrl / wait_fence / wait_frame / usb_write 里：
+     * link_stop 置 running=false、取消管道并唤醒所有条件变量，这里再等它们全部退出，
+     * 否则 delete 之后它们醒来就是 use-after-free。 */
     link_stop(dev);
+    while (dev->users.load() != 0) {
+        usb_abort(dev);
+        { std::lock_guard<std::mutex> lk(dev->ctrl_mu); dev->ctrl_cv.notify_all(); }
+        { std::lock_guard<std::mutex> lk(dev->frame_mu); dev->frame_cv.notify_all(); }
+        { std::lock_guard<std::mutex> lk(dev->evt_mu); dev->evt_cv.notify_all(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     usb_close(dev);
     delete dev;
 }
@@ -168,6 +184,8 @@ int espgpu_get_info(espgpu_device_t *dev, espgpu_device_info_t *info, int timeou
         return st != ESPGPU_OK ? st : -1;
     }
     memcpy(info, resp.data(), sizeof(*info));
+    dev->info = *info;
+    dev->have_info = true;
     return 0;
 }
 
@@ -179,10 +197,13 @@ int espgpu_get_stats(espgpu_device_t *dev, espgpu_stats_t *stats, int timeout_ms
     std::vector<uint8_t> resp;
     const int st = link_ctrl(dev, ESPGPU_CTRL_GET_STATS, 0, 0, nullptr, 0, resp,
                              static_cast<DWORD>(timeout_ms));
-    if (st != ESPGPU_OK || resp.size() < sizeof(*stats)) {
+    /* 老固件的 stats 只到 seq_gaps：缺的追加字段按 0 处理 */
+    constexpr size_t kLegacySize = offsetof(espgpu_stats_t, tex_resident);
+    if (st != ESPGPU_OK || resp.size() < kLegacySize) {
         return st != ESPGPU_OK ? st : -1;
     }
-    memcpy(stats, resp.data(), sizeof(*stats));
+    memset(stats, 0, sizeof(*stats));
+    memcpy(stats, resp.data(), std::min(resp.size(), sizeof(*stats)));
     return 0;
 }
 
@@ -206,6 +227,7 @@ int espgpu_set_clut(espgpu_device_t *dev, const uint16_t *clut, int timeout_ms)
     {
         std::lock_guard<std::mutex> lk(dev->frame_mu);
         memcpy(dev->clut, clut, sizeof(dev->clut));
+        dev->clut_dirty = true;
     }
     std::vector<uint8_t> resp;
     return link_ctrl(dev, ESPGPU_CTRL_SET_CLUT, 0, 0, clut, 256 * sizeof(uint16_t), resp,
@@ -240,12 +262,8 @@ int espgpu_poll(espgpu_device_t *dev, int timeout_ms)
 
     update_window(dev);
 
-    /* 解码失败后主动要求一帧关键帧，让差分参考帧重新对齐 */
-    if (dev->need_keyframe.load()) {
-        dev->need_keyframe = false;
-        std::vector<uint8_t> resp;
-        link_ctrl(dev, ESPGPU_CTRL_REQUEST_KEYFRAME, 0, 0, nullptr, 0, resp, 500);
-    }
+    /* 解码失败后主动要求一帧关键帧，让差分参考帧重新对齐（不等响应，不卡 UI 线程） */
+    link_service_keyframe(dev);
 
     std::lock_guard<std::mutex> lk(dev->frame_mu);
     if (dev->frame_ready && dev->frame_id != dev->last_polled_frame) {
@@ -308,7 +326,23 @@ uint32_t espgpu_frame_id(espgpu_device_t *dev)
 
 const espgpu_link_stats_t *espgpu_link_stats(espgpu_device_t *dev)
 {
-    return dev ? &dev->stats : nullptr;
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    /* 接收线程在 stats_mu 下改 dev->stats：返回加锁拷贝出的快照，避免撕裂读 */
+    std::lock_guard<std::mutex> lk(dev->stats_mu);
+    dev->stats_snapshot = dev->stats;
+    return &dev->stats_snapshot;
+}
+
+int espgpu_get_link_stats(espgpu_device_t *dev, espgpu_link_stats_t *out)
+{
+    if (dev == nullptr || out == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(dev->stats_mu);
+    *out = dev->stats;
+    return 0;
 }
 
 /* ── 诊断 ─────────────────────────────────────────────────────────── */

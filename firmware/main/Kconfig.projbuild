@@ -17,6 +17,14 @@ menu "ESP32-S3 GPU"
 
             0 = production behaviour.
 
+    config ESPGPU_RASTER_DUAL_CORE
+        bool "Rasterize tiles on both cores"
+        default y
+        help
+            At PRESENT the command task (core 0) and a helper task pinned to
+            core 1 pull 64x64 tiles from a shared counter. Disable to keep
+            core 1 free (single-core rasterization).
+
     config ESPGPU_USB_ENABLE
         bool "Bring up USB OTG (disable only for USB debugging)"
         default y

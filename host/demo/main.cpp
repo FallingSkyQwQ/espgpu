@@ -8,12 +8,14 @@
  *   - 无纹理纯色四边形
  *   - scissor 裁剪
  *
- * 画面通过 espgpu-panel 的 Viewer 页观看（没有物理屏幕）。
+ * 画面画在自己的窗口里（WinUSB 独占：demo 运行时 espgpu-panel 连不上设备，
+ * 以前提示"去面板的 Viewer 页看"其实看不到）。Esc / 关窗口 / Ctrl+C 退出。
  */
 
 #include <windows.h>
 #include <timeapi.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -23,9 +25,72 @@
 
 #include "espgpu/espgpu.h"
 
-#pragma comment(lib, "winmm.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "winmm.lib") /* MinGW 由 CMake 链接 winmm */
+#endif
 
 namespace {
+
+/* Ctrl+C：让主循环正常退出（关设备、恢复计时器精度），而不是被直接杀掉 */
+std::atomic<bool> g_stop{false};
+
+BOOL WINAPI on_console_ctrl(DWORD type)
+{
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+        g_stop = true;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* ── 窗口：只用来显示设备回传的帧 ─────────────────────────────────── */
+
+HWND g_hwnd = nullptr;
+bool g_repaint = false; /* WM_PAINT / 尺寸变化后补画一次，不等下一帧 */
+
+LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_DESTROY:
+        g_stop = true;
+        PostQuitMessage(0);
+        return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) DestroyWindow(h);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(h, &ps);
+        EndPaint(h, &ps);
+        g_repaint = true;
+        return 0;
+    }
+    default:
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+}
+
+void pump_messages()
+{
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+void blit(espgpu_device_t *dev)
+{
+    if (!g_hwnd) return;
+    RECT cr;
+    GetClientRect(g_hwnd, &cr);
+    if (cr.right <= cr.left || cr.bottom <= cr.top) return; /* 最小化 */
+    HDC hdc = GetDC(g_hwnd);
+    espgpu_blit_to_hdc(dev, hdc, cr.right - cr.left, cr.bottom - cr.top);
+    ReleaseDC(g_hwnd, hdc);
+}
 
 constexpr uint16_t kWidth = 320;
 constexpr uint16_t kHeight = 200;
@@ -182,6 +247,7 @@ int main(int argc, char **argv)
 
     long max_frames = 0;
     bool stress_scroll = false;
+    int drawcalls = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             max_frames = atol(argv[++i]);
@@ -189,8 +255,13 @@ int main(int argc, char **argv)
             /* 全屏滚动：每帧每个像素都变，差分压缩完全失效，
              * 用来测链路上限，不代表真实负载。 */
             stress_scroll = true;
+        } else if (strcmp(argv[i], "--drawcalls") == 0 && i + 1 < argc) {
+            /* M2 验收：N 个小精灵，每个一次独立 drawcall（绑定 + 状态 + 绘制） */
+            drawcalls = atoi(argv[++i]);
         }
     }
+
+    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 
     char err[256] = {0};
     espgpu_device_t *dev = espgpu_open(0, err, sizeof(err));
@@ -217,8 +288,21 @@ int main(int argc, char **argv)
     espgpu_cmd_upload_texture(dev, 2, 48, 48, ESPGPU_FMT_RGBA4444, sprite.data());
     espgpu_cmd_present(dev, 1000);
 
-    printf("espgpu-demo: %ux%u @ %d fps, Ctrl+C to stop\n", kWidth, kHeight, kTargetFps);
-    printf("open espgpu-panel.exe and switch to the Viewer page\n");
+    printf("espgpu-demo: %ux%u @ %d fps, %d extra drawcalls, Ctrl+C to stop\n", kWidth, kHeight,
+           kTargetFps, drawcalls);
+
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"espgpu_demo2d";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    RECT wr{0, 0, kWidth * 3, kHeight * 3};
+    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    g_hwnd = CreateWindowW(wc.lpszClassName, L"espgpu-demo (ESP32-S3 GPU, 2D)", WS_OVERLAPPEDWINDOW,
+                           CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+                           nullptr, nullptr, wc.hInstance, nullptr);
+    if (g_hwnd) ShowWindow(g_hwnd, SW_SHOW);
 
     std::vector<espgpu_vertex2d_t> verts;
     verts.reserve(4096);
@@ -227,10 +311,14 @@ int main(int argc, char **argv)
     uint64_t frames = 0;
     float angle = 0.0f;
     float scroll = 0.0f;
-    double t_build = 0.0, t_present = 0.0, t_poll = 0.0, t_sleep = 0.0;
+    double t_present = 0.0, t_sleep = 0.0;
 
-    for (;;) {
-        const auto frame_start = std::chrono::steady_clock::now();
+    /* 帧率控制用绝对截止时间：原来按 1000/24 = 41 ms（整数截断）相对每帧起点睡，
+     * 节奏偏快且 sleep 的超调逐帧累积；这里每帧截止时间 += 1/24 s，落后超过一帧就重新对齐 */
+    const auto period = std::chrono::microseconds(1000000 / kTargetFps);
+    auto deadline = std::chrono::steady_clock::now() + period;
+
+    while (!g_stop.load()) {
 
         verts.clear();
 
@@ -289,6 +377,26 @@ int main(int argc, char **argv)
             verts.clear();
         }
 
+        /* 2b. drawcall 压力：N 个 8x8 精灵绕圈，每个单独设置状态与纹理 */
+        for (int i = 0; i < drawcalls; i++) {
+            const float a = angle * 0.5f + static_cast<float>(i) * 0.0125f * 6.2831853f;
+            const float r = 20.0f + static_cast<float>(i % 50) * 1.6f;
+            const float cx = kWidth * 0.5f + std::cos(a) * r * 1.6f;
+            const float cy = kHeight * 0.5f + std::sin(a) * r;
+            float x[4] = {cx - 4, cx + 4, cx + 4, cx - 4};
+            float y[4] = {cy - 4, cy - 4, cy + 4, cy + 4};
+            const bool spr = (i & 1) != 0;
+            const float tw = spr ? 48.0f : 16.0f;
+            float u[4] = {0, tw, tw, 0};
+            float v[4] = {0, 0, tw, tw};
+            push_quad(verts, x, y, u, v, 0xFFFF);
+            espgpu_cmd_set_pipeline(dev, spr ? ESPGPU_BLEND_ALPHA : ESPGPU_BLEND_NONE,
+                                    ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT, spr ? 1 : 0, 8);
+            espgpu_cmd_bind_texture(dev, spr ? 2 : 1, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT);
+            espgpu_cmd_draw_quads(dev, verts.data(), 1);
+            verts.clear();
+        }
+
         /* 3. 纯色四边形 + scissor：右上角一个进度条 */
         {
             espgpu_cmd_scissor(dev, 200, 10, 110, 12);
@@ -309,7 +417,9 @@ int main(int argc, char **argv)
         /* 4. 推进动画并提交 */
         angle += 0.035f;
         if (stress_scroll) {
-            scroll += 0.6f;
+            /* uv 是 1/16 texel 的 int16（±2048 texel）：不回绕的话约 2 分钟后溢出成乱码。
+             * 纹理 64 texel 且 REPEAT，按 64 取模画面不变 */
+            scroll = std::fmod(scroll + 0.6f, 64.0f);
         }
 
         const auto tp0 = std::chrono::steady_clock::now();
@@ -319,21 +429,30 @@ int main(int argc, char **argv)
         frames++;
 
         /* 帧率控制 */
-        const auto elapsed = std::chrono::steady_clock::now() - frame_start;
-        const auto period = std::chrono::milliseconds(1000 / kTargetFps);
-        if (elapsed < period) {
+        {
             const auto ts0 = std::chrono::steady_clock::now();
-            std::this_thread::sleep_for(period - elapsed);
-            t_sleep +=
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
-                    .count();
+            if (ts0 < deadline) {
+                std::this_thread::sleep_until(deadline);
+                t_sleep += std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - ts0)
+                               .count();
+                deadline += period;
+            } else if (ts0 - deadline > period) {
+                deadline = ts0 + period; /* 落后超过一帧：不追帧，从现在重新计 */
+            } else {
+                deadline += period; /* 略晚：不睡，下一帧补回来 */
+            }
         }
 
         if (!espgpu_is_connected(dev)) {
             printf("device lost\n");
             break;
         }
-        espgpu_poll(dev, 0);
+        pump_messages();
+        if (espgpu_poll(dev, 0) > 0 || g_repaint) {
+            g_repaint = false;
+            blit(dev);
+        }
 
         if (frames % (kTargetFps * 4) == 0) {
             const double secs =
@@ -362,6 +481,7 @@ int main(int argc, char **argv)
         }
     }
 
+    if (g_hwnd && IsWindow(g_hwnd)) DestroyWindow(g_hwnd);
     espgpu_close(dev);
     timeEndPeriod(1);
     return 0;

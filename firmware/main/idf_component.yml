@@ -3,3 +3,7 @@ dependencies:
   idf: ">=6.0"
   espressif/esp_tinyusb:
     version: "^2.0.1~1"
+  # esp_tinyusb 2.x 只要求 tinyusb >= 0.17。usb_device.c 依赖 0.21 的 vendor 行为：
+  # OUT 每次只收一个包（EPSIZE > 64 才安全），tud_vendor_rx_cb 的 bufsize 是 uint32_t。
+  espressif/tinyusb:
+    version: ">=0.21.0~2"

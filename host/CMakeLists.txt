@@ -5,7 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/W4 /permissive- /utf-8 /Zc:__cplusplus /MP)
+    # /permissive- 与 /Zc:__cplusplus 只对 C++ 有意义；firmware/core 的 C 文件也走这里
+    add_compile_options(/W4 /utf-8 /MP
+        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 endif()
 
@@ -42,43 +45,96 @@ if(MSVC)
     target_compile_options(imgui PRIVATE /W3 /wd4996)
 endif()
 
+# ── espgpu_core — 设备核心（与固件同一份 C 代码），供软件模拟器使用 ──
+set(ESPGPU_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../firmware/core")
+add_library(espgpu_core STATIC
+    ${ESPGPU_CORE_DIR}/core.c
+    ${ESPGPU_CORE_DIR}/tnl.c
+    ${ESPGPU_CORE_DIR}/raster3d.c
+    ${ESPGPU_CORE_DIR}/tex.c
+    ${ESPGPU_CORE_DIR}/vm.c
+    ${ESPGPU_CORE_DIR}/raster2d.c
+    ${ESPGPU_CORE_DIR}/port_host.c)
+target_include_directories(espgpu_core PUBLIC ${ESPGPU_CORE_DIR} ${ESPGPU_SHARED_DIR})
+set_target_properties(espgpu_core PROPERTIES POSITION_INDEPENDENT_CODE ON
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
+if(MSVC)
+    # C11 柔性数组成员（core_internal.h）在 MSVC 下仍报 C4200
+    target_compile_options(espgpu_core PRIVATE /wd4200)
+endif()
+
 # ── espgpu.dll — 设备接口层 ─────────────────────────────────────────
 add_library(espgpu SHARED
     src/api.cpp
     src/link.cpp
     src/winusb.cpp
+    src/emulator.cpp
     src/decode.cpp
     src/draw.cpp
+    src/draw3d.cpp
+    src/panel_api.cpp
     src/log.cpp)
 target_include_directories(espgpu
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include ${ESPGPU_SHARED_DIR}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(espgpu PRIVATE ESPGPU_BUILD_DLL)
-target_link_libraries(espgpu PRIVATE winusb setupapi)
+# MinGW 默认会加 lib 前缀；前端和文档都按 espgpu.dll 找它
+set_target_properties(espgpu PROPERTIES PREFIX "")
+target_link_libraries(espgpu PRIVATE espgpu_core winusb setupapi gdi32)
+if(NOT MSVC)
+    target_compile_options(espgpu PRIVATE -Wall -Wextra)
+endif()
 
-# ── espgpu-panel.exe — 控制面板 / 帧查看器 ──────────────────────────
-add_executable(espgpu-panel WIN32
-    panel/main.cpp)
-target_link_libraries(espgpu-panel PRIVATE espgpu imgui d3d11 dxgi)
-target_compile_definitions(espgpu-panel PRIVATE ESPGPU_SHARED_DIR="${ESPGPU_SHARED_DIR}")
+# ── espgpu-panel.exe — 控制面板 / 帧查看器（Material 3 风格） ───────
+add_subdirectory(panel)
 
 # ── espgpu-bench.exe — 带宽 / 压缩率实测 ────────────────────────────
 add_executable(espgpu-bench
     tests/bench.cpp)
 target_link_libraries(espgpu-bench PRIVATE espgpu)
 
+# ── espgpu-core-test.exe — 设备核心的渲染冒烟测试（不需要硬件） ────────
+add_executable(espgpu-core-test tests/core_test.c)
+target_link_libraries(espgpu-core-test PRIVATE espgpu_core)
+if(NOT MSVC)
+    target_link_libraries(espgpu-core-test PRIVATE m)
+endif()
+enable_testing()
+add_test(NAME core COMMAND espgpu-core-test WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+# ── espgpu-emu-test.exe — espgpu.dll 端到端测试（软件模拟器，不需要硬件） ──
+add_executable(espgpu-emu-test tests/emu_test.cpp)
+target_link_libraries(espgpu-emu-test PRIVATE espgpu)
+add_test(NAME emu COMMAND espgpu-emu-test)
+set_tests_properties(emu PROPERTIES ENVIRONMENT "ESPGPU_EMULATOR=1")
+
 # ── espgpu-demo.exe — M2 的 2D 渲染演示 ─────────────────────────────
 add_executable(espgpu-demo
     demo/main.cpp)
 target_link_libraries(espgpu-demo PRIVATE espgpu)
 
+# ── espgpu-demo3d.exe — M5 的 3D 演示（旋转立方体 + 地形 + 光照） ──
+add_executable(espgpu-demo3d
+    demo3d/main.cpp)
+target_link_libraries(espgpu-demo3d PRIVATE espgpu winmm)
+
+target_link_libraries(espgpu-demo PRIVATE winmm)
+
+# ── 前端 ─────────────────────────────────────────────────────────────
+add_subdirectory(gl12)    # opengl32.dll（GL 1.2 固定管线 + trace / 直通）
+add_subdirectory(glsl)    # GLSL ES 3.0 编译器（静态库）
+add_subdirectory(gles3)   # libGLESv2.dll + libEGL.dll + GLES demo
+
 # 让 exe 能从输出目录直接找到 DLL
-add_custom_command(TARGET espgpu-panel POST_BUILD
+add_custom_command(TARGET espgpu-emu-test POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-panel>)
+            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-emu-test>)
 add_custom_command(TARGET espgpu-bench POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-bench>)
 add_custom_command(TARGET espgpu-demo POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-demo>)
+add_custom_command(TARGET espgpu-demo3d POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-demo3d>)

@@ -13,8 +13,10 @@
 #include <cstdio>
 #include <cstring>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "winusb.lib")
 #pragma comment(lib, "setupapi.lib")
+#endif
 
 namespace espgpu {
 
@@ -66,10 +68,17 @@ bool do_io(espgpu_device *dev, UCHAR pipe, void *buf, DWORD len, bool is_read,
         }
         DWORD w = WaitForSingleObject(ctx.ev, timeout_ms);
         if (w != WAIT_OBJECT_0) {
-            /* 超时：必须 abort 才能取消这个 IRP，否则管道会一直挂着 */
+            /* 超时：必须 abort 才能取消这个 IRP，否则管道会一直挂着；
+             * 然后一定要等 IRP 真正结束（bWait=TRUE），ctx / buf 才能释放。 */
             WinUsb_AbortPipe(dev->winusb, pipe);
-            DWORD dummy = 0;
-            WinUsb_GetOverlappedResult(dev->winusb, &ctx.ov, &dummy, TRUE);
+            DWORD n = 0;
+            const BOOL done = WinUsb_GetOverlappedResult(dev->winusb, &ctx.ov, &n, TRUE);
+            /* 超时和完成之间有竞争窗口；被取消的传输也可能已经搬了一部分字节。
+             * 这些字节确实已经在 buf 里 / 已经上了总线，丢掉它们会让字节流错位。 */
+            if (done || n > 0) {
+                *transferred = n;
+                return true;
+            }
             *timed_out = true;
             return false;
         }
@@ -91,11 +100,16 @@ bool usb_enumerate(std::vector<std::string> &paths)
 {
     paths.clear();
 
+    /* ESPGPU_EMULATOR=1：软件模拟器排在第一个，前端不用改代码就能在没有硬件时跑 */
+    if (emulator_enabled()) {
+        paths.push_back(kEmulatorPath);
+    }
+
     HDEVINFO set = SetupDiGetClassDevsW(&kUsbDeviceInterfaceGuid, nullptr, nullptr,
                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (set == INVALID_HANDLE_VALUE) {
         log_msg(LOG_ERROR, "SetupDiGetClassDevs failed: %lu", GetLastError());
-        return false;
+        return !paths.empty();
     }
 
     char want_vidpid[32];
@@ -126,19 +140,19 @@ bool usb_enumerate(std::vector<std::string> &paths)
             continue;
         }
 
-        /* 用硬件 ID 过滤，避免误开别的 USB 设备 */
-        char hwid[512] = {0};
+        /* 用硬件 ID 过滤，避免误开别的 USB 设备。
+         * 少报 4 字节给 API，保证多字符串末尾一定有两个 WCHAR 的 0 结束符。 */
+        WCHAR hwid[256] = {0};
         DWORD type = 0;
         DWORD hwlen = 0;
         if (!SetupDiGetDeviceRegistryPropertyW(set, &devinfo, SPDRP_HARDWAREID, &type,
-                                               reinterpret_cast<PBYTE>(hwid), sizeof(hwid),
-                                               &hwlen)) {
+                                               reinterpret_cast<PBYTE>(hwid),
+                                               sizeof(hwid) - 2 * sizeof(WCHAR), &hwlen)) {
             continue;
         }
 
         /* 多字符串，逐个比较 */
-        for (const WCHAR *p = reinterpret_cast<const WCHAR *>(hwid);
-             *p; p += wcslen(p) + 1) {
+        for (const WCHAR *p = hwid; *p; p += wcslen(p) + 1) {
             char narrow[512] = {0};
             WideCharToMultiByte(CP_ACP, 0, p, -1, narrow, sizeof(narrow), nullptr, nullptr);
             if (strstr(narrow, want_vidpid) != nullptr) {
@@ -160,6 +174,10 @@ bool usb_enumerate(std::vector<std::string> &paths)
 
 bool usb_open(espgpu_device *dev, const std::string &path, std::string &err)
 {
+    if (path == kEmulatorPath) {
+        return emu_open(dev, err);
+    }
+
     /* 路径是 UTF-8，转回宽字符给 CreateFileW */
     WCHAR wpath[1024] = {0};
     MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath, 1024);
@@ -235,6 +253,11 @@ bool usb_open(espgpu_device *dev, const std::string &path, std::string &err)
 
 void usb_close(espgpu_device *dev)
 {
+    if (dev->emu) {
+        emu_close(dev);
+        dev->connected = false;
+        return;
+    }
     if (dev->winusb) {
         WinUsb_AbortPipe(dev->winusb, dev->ep_in);
         WinUsb_AbortPipe(dev->winusb, dev->ep_out);
@@ -250,13 +273,36 @@ void usb_close(espgpu_device *dev)
 
 /* ── 收发 ─────────────────────────────────────────────────────────── */
 
+void usb_abort(espgpu_device *dev)
+{
+    if (dev->emu) {
+        emu_abort(dev);
+        return;
+    }
+    if (dev->winusb) {
+        WinUsb_AbortPipe(dev->winusb, dev->ep_in);
+        WinUsb_AbortPipe(dev->winusb, dev->ep_out);
+    }
+}
+
 bool usb_write(espgpu_device *dev, const void *data, size_t len, DWORD timeout_ms)
 {
+    /* 调用者（link_send_chunk_iov）持有 write_mu */
+    if (dev->emu) {
+        if (!dev->connected) {
+            return false;
+        }
+        if (!emu_write(dev, data, len, timeout_ms)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> slk(dev->stats_mu);
+        dev->stats.bytes_out += static_cast<uint32_t>(len);
+        dev->win_bytes_out += static_cast<uint32_t>(len);
+        return true;
+    }
     if (!dev->connected || dev->winusb == nullptr) {
         return false;
     }
-
-    std::lock_guard<std::mutex> lk(dev->write_mu);
 
     const uint8_t *p = static_cast<const uint8_t *>(data);
     size_t done = 0;
@@ -284,13 +330,23 @@ bool usb_write(espgpu_device *dev, const void *data, size_t len, DWORD timeout_m
 
 int usb_read(espgpu_device *dev, void *buf, DWORD cap, DWORD timeout_ms, DWORD *got)
 {
-    if (!dev->connected || dev->winusb == nullptr) {
-        return -1;
-    }
     DWORD n = 0;
-    bool timed_out = false;
-    if (!do_io(dev, dev->ep_in, buf, cap, true, timeout_ms, &n, &timed_out)) {
-        return timed_out ? 0 : -1;
+    if (dev->emu) {
+        if (!dev->connected) {
+            return -1;
+        }
+        const int rc = emu_read(dev, buf, cap, timeout_ms, &n);
+        if (rc <= 0) {
+            return rc;
+        }
+    } else {
+        if (!dev->connected || dev->winusb == nullptr) {
+            return -1;
+        }
+        bool timed_out = false;
+        if (!do_io(dev, dev->ep_in, buf, cap, true, timeout_ms, &n, &timed_out)) {
+            return timed_out ? 0 : -1;
+        }
     }
     *got = n;
     if (n) {
