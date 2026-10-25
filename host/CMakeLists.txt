@@ -80,6 +80,15 @@ add_executable(espgpu-bench
     tests/bench.cpp)
 target_link_libraries(espgpu-bench PRIVATE espgpu)
 
+# ── espgpu-core-test.exe — 设备核心的渲染冒烟测试（不需要硬件） ────────
+add_executable(espgpu-core-test tests/core_test.c)
+target_link_libraries(espgpu-core-test PRIVATE espgpu_core)
+if(NOT MSVC)
+    target_link_libraries(espgpu-core-test PRIVATE m)
+endif()
+enable_testing()
+add_test(NAME core COMMAND espgpu-core-test WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
 # ── espgpu-demo.exe — M2 的 2D 渲染演示 ─────────────────────────────
 add_executable(espgpu-demo
     demo/main.cpp)

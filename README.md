@@ -6,31 +6,39 @@
 
 ## 当前状态
 
-**M2 — 2D 光栅器 + 命令流（进行中）**
+> M2–M6 的代码已全部写完，交叉编译通过；设备核心在主机上有渲染冒烟测试。
+> **尚未在真实硬件上验证**：性能数字、DSDA-Doom 帧率、OTA / 调频都需要接板子实测。
 
-| 项 | 状态 |
-|---|---|
-| 设备：命令流执行（CLEAR / PIPELINE2D / BIND_TEXTURE / UPLOAD_TEXTURE / DRAW / SCISSOR / PRESENT） | ✅ |
-| 设备：2D 光栅器（边缘函数内测试、最近邻/双线性、alpha 混合、alpha 测试、scissor） | ✅ |
-| 设备：内部 SRAM 工作表面（128 KB，实测确认未退回 PSRAM） | ✅ |
-| 设备：RGB565 / RGBA4444 纹理，16 位像素 + 独立 alpha 平面 | ✅ |
-| 主机：`espgpu_cmd_*` 批量命令 API | ✅ |
-| 主机：`espgpu-demo.exe` 2D 演示（滚动纹理 / 旋转 alpha 精灵 / scissor 进度条） | ✅ |
-| 设备：纹理 LRU 换页 | ⬜ M3 |
-| 性能优化（IRAM 热循环、tile 化） | ⬜ 待做 |
+| 里程碑 | 内容 | 代码 | 硬件验证 |
+|---|---|---|---|
+| M1 | 链路打通 | ✅ | ✅ |
+| M2 | tile 光栅器（透视校正 / 双线性 / alpha / Z）、纹理 LRU、CLEAR/DRAW/SWAP、500 drawcall demo | ✅ | ⬜ |
+| M3 | `opengl32.dll`：GL 1.2 固定管线 + GL trace + Mesa 直通 | ✅ | ⬜ |
+| M4 | DSDA-Doom 接入（`opengl32.dll` 直接替换 + espgpu 呈现后端） | ✅（见 [docs/doom.md](docs/doom.md)） | ⬜ |
+| M5 | T&L、视锥裁剪、背面剔除、高洛德光照、FBO；面板全功能（Material 3 重写） | ✅ | ⬜ |
+| M6 | GLES 3.0：`libGLESv2.dll` + `libEGL.dll` + GLSL ES 编译器 + 片元 VM | ✅（见 [docs/glsl.md](docs/glsl.md)） | ⬜ |
 
-实测：320×200 RGB565，静态棋盘背景 + 旋转 alpha 精灵 + 进度条，
-**23.8 fps**（目标 24fps），每帧编码后约 7 KB。完整优化记录见
-[docs/perf-notes.md](docs/perf-notes.md)。
+### 设备核心（`firmware/core/`）
 
-24fps 锁定下的耗时构成（设备侧实测）：
+固件和主机端软件模拟器编译**同一份**可移植 C 代码：
 
 ```
-光栅化 16.5 ms   编码 6.8 ms   USB 8.9 ms
+命令流 → T&L（MVP / 光照 / 纹理矩阵 / 雾）→ 齐次裁剪（近远 + 保护带）→ 剔除
+      → 三角形建立（边函数 + 属性平面）→ 64×64 tile 分箱
+PRESENT → 逐 tile（双核领取）：按行解析求跨度，每 8 像素一次透视除法
+      → 着色（9 种内置模式或片元 VM）→ 雾 → alpha 测试 → 深度 → GL 混合
+      → 差分 + RLE 编码 → 发送任务（与下一帧的命令执行重叠）
 ```
 
-设备侧合计 32 ms，帧预算 41.7 ms，约 10 ms 余量。带宽已不再是瓶颈。
-病态负载（`--stress`：全屏每帧滚动）的链路上限是 4.6 fps / 465 KB/s。
+- 屏幕目标优先放内部 SRAM，光栅器直写；放不下（大分辨率）就走 tile 拷入拷出
+- 纹理：RGB565 / RGBA4444 / INDEX8（每纹理调色板）/ R8，PSRAM 里 4 MB LRU
+- 设备端缓冲（显示列表 / 静态几何）、下行 LZ 压缩、调试视图（深度 / overdraw / tile / 线框）
+- 管理：OTA（带回滚）、80/160/240 MHz 调频、设备日志转发
+
+### 没有硬件时
+
+设环境变量 `ESPGPU_EMULATOR=1`，`espgpu.dll` 会在进程内跑设备核心，所有前端、demo、
+面板都能端到端运行，渲染结果与设备逐像素一致（同一份光栅代码），只是没有 USB 带宽限制。
 
 **M1 — 链路打通（完成，已在真实硬件上验证）**
 
@@ -57,16 +65,21 @@
 
 ```
 firmware/          ESP-IDF 固件（ESP32-S3）
-  main/            app、USB、GPU 状态、帧缓冲、编码
+  core/            设备核心（可移植 C）：T&L、tile 光栅、纹理 LRU、片元 VM
+  main/            app、USB、命令 / 帧发送任务、OTA、调频、日志
   components/      仅做头文件导出的组件（把 shared/ 接进固件）
-shared/            协议定义，固件与主机端共用同一份头文件
+shared/            协议、片元 VM 指令集、LZ 编解码，固件与主机端共用
 host/              Windows 端
   include/espgpu/  公开 C API
-  src/             espgpu.dll：WinUSB、链路、解码
-  panel/           espgpu-panel.exe：控制面板 + 帧查看器
-  tests/           espgpu-bench.exe
-docs/              协议文档
-tools/             构建脚本
+  src/             espgpu.dll：WinUSB、软件模拟器、链路、解码、命令打包
+  gl12/            opengl32.dll：GL 1.2 前端（含 trace / Mesa 直通）
+  glsl/            GLSL ES 3.00 编译器（静态库）
+  gles3/           libGLESv2.dll + libEGL.dll + GLES demo
+  panel/           espgpu-panel.exe：Material 3 控制面板 + 帧查看器
+  demo/ demo3d/    2D / 3D 演示
+  tests/           espgpu-bench.exe、设备核心渲染测试
+docs/              协议、GL 覆盖面、GLSL、Doom、性能记录
+tools/             构建脚本、GL 入口生成器、Doom 配置
 ```
 
 ## 构建
@@ -96,9 +109,10 @@ idf.py -p COMx flash monitor
 
 产物在 `host\out\build\default\`：
 
-- `espgpu.dll`
-- `espgpu-panel.exe`
-- `espgpu-bench.exe`
+- `espgpu.dll`、`espgpu-panel.exe`、`espgpu-bench.exe`
+- `espgpu-demo.exe`（2D）、`espgpu-demo3d.exe`（3D）、`espgpu-core-test.exe`
+- `gl12\opengl32.dll`（GL 1.2 前端）
+- `gles3\libGLESv2.dll`、`gles3\libEGL.dll`、`gles-triangle.exe`、`gles-shader.exe`
 
 ImGui 由 CMake 的 FetchContent 拉取（v1.91.9）。离线环境可以用
 `-DIMGUI_DIR=<本地路径>` 指定已有副本。
@@ -108,6 +122,18 @@ ImGui 由 CMake 的 FetchContent 拉取（v1.91.9）。离线环境可以用
 ```powershell
 # 控制面板（含帧查看器）
 .\host\out\build\default\espgpu-panel.exe
+
+# M2 验收：500 个独立 drawcall
+.\host\out\build\default\espgpu-demo.exe --drawcalls 500
+
+# M5 验收：3D 场景（自带窗口；面板此时连不上设备，WinUSB 是独占的）
+.\host\out\build\default\espgpu-demo3d.exe
+
+# 没有硬件：用软件模拟器跑任何程序
+$env:ESPGPU_EMULATOR = "1"
+
+# 设备核心渲染测试（输出 core_*.bmp）
+.\host\out\build\default\espgpu-core-test.exe
 
 # 带宽 / 压缩率实测，每种组合默认 3 秒
 .\host\out\build\default\espgpu-bench.exe

@@ -30,10 +30,10 @@ void heat_legend(const char *lo, const char *hi)
     const ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::Dummy(ImVec2(w, h));
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    /* 与固件热力图一致：黑 → 蓝 → 绿 → 黄 → 红 */
-    const ImU32 stops[] = {IM_COL32(0, 0, 0, 255), IM_COL32(0, 64, 255, 255),
-                           IM_COL32(0, 200, 80, 255), IM_COL32(255, 220, 0, 255),
-                           IM_COL32(255, 32, 0, 255)};
+    /* 与固件 raster3d.c 的 heat() 一致：黑 → 蓝 → 青 → 黄 → 红 */
+    const ImU32 stops[] = {IM_COL32(0, 0, 0, 255), IM_COL32(0, 0, 255, 255),
+                           IM_COL32(0, 255, 255, 255), IM_COL32(255, 255, 0, 255),
+                           IM_COL32(255, 0, 0, 255)};
     const int n = 4;
     for (int k = 0; k < n; k++) {
         const float x0 = p.x + w * k / n, x1 = p.x + w * (k + 1) / n;
@@ -107,6 +107,13 @@ void page_debug()
     ImGui::SameLine(0, px(8));
     if (ui::button("Ping", ui::ButtonKind::Outlined, theme::icon::link)) {
         enqueue("Ping", [](espgpu_device_t *dev) { return espgpu_ping(dev, 800); }, "Pong");
+    }
+    ImGui::SameLine(0, px(8));
+    if (ui::button("Request keyframe", ui::ButtonKind::Outlined, theme::icon::refresh)) {
+        /* 画面出现残影 / 花屏时：让设备下一帧发非差分帧，把两边参考帧重新对齐 */
+        enqueue("Request keyframe", [](espgpu_device_t *dev) {
+            return espgpu_request_keyframe(dev, 800);
+        }, "Keyframe requested");
     }
     ui::card_end();
 
