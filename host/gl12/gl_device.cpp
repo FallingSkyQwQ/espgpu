@@ -46,7 +46,8 @@ espgpu_device_t *open_and_setup()
     m.width = static_cast<uint16_t>(g_sh.dev_w);
     m.height = static_cast<uint16_t>(g_sh.dev_h);
     m.format = ESPGPU_FMT_RGB565;
-    m.codec = ESPGPU_CODEC_DELTA_RLE;
+    /* AUTO：静止无损、动起来改发有损块编码（USB FS 装不下整屏变化的无损帧，issue #2） */
+    m.codec = espgpu_preferred_codec(dev);
     m.max_fps = static_cast<uint8_t>(g_sh.fps);
     m.vsync = 1;
     const int st = espgpu_set_mode(dev, &m, 0, 1500);

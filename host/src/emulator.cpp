@@ -18,6 +18,7 @@
 extern "C" {
 #include "core.h"
 #include "espgpu_lz.h"
+#include "espgpu_block.h"
 void gp_host_set_log_hook(void (*fn)(int level, const char *msg));
 }
 
@@ -120,10 +121,18 @@ void on_present(void *user, const uint16_t *px, uint16_t w, uint16_t h)
     const size_t pixels = static_cast<size_t>(w) * h;
     const uint32_t raw = static_cast<uint32_t>(pixels * 2);
 
-    /* 像素级 RLE，格式与 framebuffer.c 相同 */
+    /* BLOCK 模式发有损块关键帧（让没有硬件时也能看到有损画质）；
+     * 其余模式（含 AUTO：模拟器没有带宽限制，永远走无损分支）发像素级 RLE 关键帧，
+     * 格式与 framebuffer.c 相同 */
     std::vector<uint8_t> enc;
-    enc.reserve(raw / 4);
-    size_t i = 0;
+    const bool block = e->codec == ESPGPU_CODEC_BLOCK;
+    size_t i = block ? pixels : 0;
+    if (block) {
+        enc.resize(espgpu_block_max_encoded(w, h));
+        enc.resize(espgpu_block_encode(px, nullptr, w, h, 1, enc.data(), enc.size()));
+    } else {
+        enc.reserve(raw / 4);
+    }
     while (i < pixels) {
         size_t run = 1;
         while (i + run < pixels && run < 129 && px[i + run] == px[i]) {
@@ -178,7 +187,7 @@ void on_present(void *user, const uint16_t *px, uint16_t w, uint16_t h)
         fh.raw_len = raw;
         fh.total_enc = total;
         fh.format = ESPGPU_FMT_RGB565;
-        fh.codec = ESPGPU_CODEC_RLE;
+        fh.codec = block ? ESPGPU_CODEC_BLOCK : ESPGPU_CODEC_RLE;
         fh.frag_index = static_cast<uint8_t>(f);
         fh.frag_count = static_cast<uint8_t>(count);
         fh.flags = static_cast<uint8_t>((f == 0 ? ESPGPU_FF_FIRST : 0) |
@@ -216,7 +225,8 @@ void fill_info(EmuState *e, espgpu_device_info_t &di)
                       ESPGPU_CAP_OTA | ESPGPU_CAP_TNL | ESPGPU_CAP_TEX_LRU |
                       ESPGPU_CAP_PALETTED_TEX | ESPGPU_CAP_BUFFERS | ESPGPU_CAP_CLOCK |
                       ESPGPU_CAP_DEBUG_VIEW | ESPGPU_CAP_LZ;
-    di.codecs = ESPGPU_CAP_CODEC_RAW | ESPGPU_CAP_CODEC_RLE | ESPGPU_CAP_CODEC_DELTA_RLE;
+    di.codecs = ESPGPU_CAP_CODEC_RAW | ESPGPU_CAP_CODEC_RLE | ESPGPU_CAP_CODEC_DELTA_RLE |
+                ESPGPU_CAP_CODEC_BLOCK | ESPGPU_CAP_CODEC_AUTO;
     di.texture_cache_size = kTexBudget;
     di.max_texture_dim = 512;
     di.max_texture_units = ESPGPU_MAX_TEXTURE_UNITS;
@@ -263,6 +273,7 @@ void handle_ctrl(EmuState *e, const espgpu_ctrl_req_t &req, const uint8_t *extra
             if (!gpu_core_set_size(e->core, w, h)) {
                 st = ESPGPU_ERR_NO_MEM;
             }
+            e->codec = e->mode.codec;
         }
         break;
     case ESPGPU_CTRL_SET_CLOCK:
@@ -298,8 +309,14 @@ void handle_ctrl(EmuState *e, const espgpu_ctrl_req_t &req, const uint8_t *extra
         e->ota_state = 0;
         break;
     case ESPGPU_CTRL_SET_CLUT:
-    case ESPGPU_CTRL_REQUEST_KEYFRAME:
     case ESPGPU_CTRL_SET_CODEC:
+        if (req.arg0 <= ESPGPU_CODEC_AUTO && req.arg0 != ESPGPU_CODEC_TILE_DELTA) {
+            e->codec = static_cast<uint8_t>(req.arg0);
+        } else {
+            st = ESPGPU_ERR_UNSUPPORTED;
+        }
+        break;
+    case ESPGPU_CTRL_REQUEST_KEYFRAME:
     case ESPGPU_CTRL_LOG_SUBSCRIBE:
     case ESPGPU_CTRL_SOFT_RESET:
         break;

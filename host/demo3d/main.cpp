@@ -236,7 +236,9 @@ int main(int argc, char **argv)
     mode.width = static_cast<uint16_t>(W);
     mode.height = static_cast<uint16_t>(H);
     mode.format = ESPGPU_FMT_RGB565;
-    mode.codec = ESPGPU_CODEC_DELTA_RLE;
+    /* 镜头一直在转，整屏每帧都变：无损帧放不进 USB FS 的带宽，AUTO 会改发有损块编码。
+     * ESPGPU_CODEC=delta 可以强制无损对比 */
+    mode.codec = espgpu_preferred_codec(dev);
     mode.max_fps = static_cast<uint8_t>(fps);
     mode.vsync = 1;
     espgpu_set_mode(dev, &mode, 0, 1500);
@@ -349,7 +351,10 @@ int main(int argc, char **argv)
     const espgpu_vertex_layout_t layout = make_layout(1);
     const Mat4 proj = perspective(1.0f, static_cast<float>(W) / H, 0.3f, 40.0f);
 
-    printf("espgpu-demo3d: %dx%d @ %d fps%s, Esc to quit\n", W, H, fps,
+    static const char *const kCodecName[] = {"raw", "rle", "delta-rle", "tile", "block (lossy)",
+                                             "auto"};
+    printf("espgpu-demo3d: %dx%d @ %d fps, codec %s%s, Esc to quit\n", W, H, fps,
+           mode.codec < 6 ? kCodecName[mode.codec] : "?",
            espgpu_is_emulator(dev) ? " (software emulator)" : "");
 
     /* 跨帧不变的状态只发一次（设备端状态跨 PRESENT 保持，与 GL 一致），每帧省 ~100 B 下行 */

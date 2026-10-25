@@ -70,11 +70,11 @@ bool device_open()
     m.width = static_cast<uint16_t>(d.width);
     m.height = static_cast<uint16_t>(d.height);
     m.format = ESPGPU_FMT_RGB565;
-    m.codec = ESPGPU_CODEC_DELTA_RLE;
+    m.codec = espgpu_preferred_codec(d.dev); /* AUTO：静止无损、动起来有损块编码 */
     m.max_fps = 30;
     m.vsync = 1;
     espgpu_set_mode(d.dev, &m, ESPGPU_PATTERN_DOOMISH, 1500);
-    espgpu_set_codec(d.dev, ESPGPU_CODEC_DELTA_RLE, 500);
+    espgpu_set_codec(d.dev, m.codec, 500);
     if (const char *sync = std::getenv("ESPGPU_GLES_SYNC")) d.sync_swap = std::atoi(sync) != 0;
     d.ok = true;
     d.invalidate();

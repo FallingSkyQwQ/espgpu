@@ -275,7 +275,7 @@ int main(int argc, char **argv)
     mode.width = kWidth;
     mode.height = kHeight;
     mode.format = static_cast<uint8_t>(ESPGPU_FMT_RGB565);
-    mode.codec = static_cast<uint8_t>(ESPGPU_CODEC_DELTA_RLE);
+    mode.codec = espgpu_preferred_codec(dev);
     mode.max_fps = kTargetFps;
     mode.vsync = 1;
     espgpu_set_mode(dev, &mode, 0, 1000);

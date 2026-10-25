@@ -182,6 +182,28 @@ int main()
     printf("mesh %dx%d: flat list %u bytes, indexed draw %u bytes (%.1fx less)\n", N, N, b_flat, b_idx,
            double(b_flat) / b_idx);
 
+    /* 有损块编码（ESPGPU_CODEC_BLOCK）：模拟器发 BLOCK 关键帧，主机按块解码。
+     * 与无损参考相比：有误差（不是逐字节相同），但平均误差很小；切回无损后又逐字节一致。 */
+    {
+        EXPECT(espgpu_set_codec(dev, ESPGPU_CODEC_BLOCK, 1000) == 0);
+        setup(dev);
+        EXPECT(espgpu_cmd_draw(dev, ESPGPU_PRIM_TRIANGLES, flat.data(), uint32_t(flat.size()), sizeof(V), nullptr, 0, 1) == 0);
+        const auto blk = grab(dev);
+        EXPECT(blk.size() == ref.size());
+        double err = 0;
+        for (size_t i = 0; i < blk.size() && i < ref.size(); i++) {
+            if ((i & 3) != 3) err += std::abs(int(blk[i]) - int(ref[i]));
+        }
+        err /= double(ref.size()) * 0.75;
+        printf("block codec: mean abs error %.2f / 255 per channel\n", err);
+        /* 这张网格是逐顶点随机色（BC1 的最坏情况），真实画面误差小得多（~32 dB PSNR） */
+        EXPECT(err > 0.0 && err < 24.0);
+        EXPECT(espgpu_set_codec(dev, ESPGPU_CODEC_RLE, 1000) == 0);
+        setup(dev);
+        EXPECT(espgpu_cmd_draw(dev, ESPGPU_PRIM_TRIANGLES, flat.data(), uint32_t(flat.size()), sizeof(V), nullptr, 0, 1) == 0);
+        EXPECT(grab(dev) == ref);
+    }
+
     /* fence 往返 */
     espgpu_cmd_fence(dev, 7);
     EXPECT(espgpu_wait_fence(dev, 7, 1000) == 0);

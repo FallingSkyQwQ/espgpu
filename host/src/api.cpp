@@ -7,6 +7,8 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -355,6 +357,26 @@ void espgpu_set_log_level(int level)
 void espgpu_set_log_callback(espgpu_log_fn cb, void *user)
 {
     log_set_callback(cb, user);
+}
+
+uint8_t espgpu_preferred_codec(espgpu_device_t *dev)
+{
+    if (const char *e = getenv("ESPGPU_CODEC")) {
+        std::string v(e);
+        for (auto &ch : v) {
+            ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+        }
+        if (v == "auto") return ESPGPU_CODEC_AUTO;
+        if (v == "block" || v == "lossy" || v == "bc1") return ESPGPU_CODEC_BLOCK;
+        if (v == "delta" || v == "delta_rle" || v == "lossless") return ESPGPU_CODEC_DELTA_RLE;
+        if (v == "rle") return ESPGPU_CODEC_RLE;
+        if (v == "raw") return ESPGPU_CODEC_RAW;
+        log_msg(LOG_WARN, "ESPGPU_CODEC=%s not recognized (auto|block|delta|rle|raw)", e);
+    }
+    if (dev && dev->have_info && (dev->info.codecs & ESPGPU_CAP_CODEC_AUTO)) {
+        return ESPGPU_CODEC_AUTO;
+    }
+    return ESPGPU_CODEC_DELTA_RLE;
 }
 
 } // extern "C"

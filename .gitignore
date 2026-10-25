@@ -30,3 +30,4 @@ compile_commands.json
 # ---- 工具产物 ----
 *.log
 /tmp/
+.DS_Store

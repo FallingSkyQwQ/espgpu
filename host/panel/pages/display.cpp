@@ -12,6 +12,10 @@ const int kRes[][2] = {{160, 120}, {320, 200}, {320, 240}, {400, 240}, {640, 480
 const char *const kResName[] = {"160x120", "320x200", "320x240", "400x240", "640x480"};
 const char *const kFmt[] = {"RGB565", "INDEX8"};
 const char *const kCodec[] = {"RAW", "RLE", "DELTA_RLE"};
+/* 命令模式的编码多两个：有损块编码与自适应（见 espgpu_proto.h 的 ESPGPU_CODEC_BLOCK / AUTO） */
+const char *const kRenderCodec[] = {"RAW", "RLE", "DELTA", "BLOCK", "AUTO"};
+const uint8_t kRenderCodecValue[] = {ESPGPU_CODEC_RAW, ESPGPU_CODEC_RLE, ESPGPU_CODEC_DELTA_RLE,
+                                     ESPGPU_CODEC_BLOCK, ESPGPU_CODEC_AUTO};
 const char *const kPattern[] = {"Bars", "UI", "Doom-like", "Noise", "Mixed"};
 
 void defaults(ModeDraft &d)
@@ -107,9 +111,20 @@ void page_display()
     const float w2 = ui::column_width(2);
     ui::card_begin("rcodec", w2);
     card_title("Rendering codec",
-               "Codec used for frames produced by draw commands (command mode). DELTA_RLE is "
-               "best for mostly static scenes; RLE for full-screen motion.");
-    ui::segmented("rc", kCodec, 3, &d.render_codec);
+               "Codec for frames produced by draw commands. DELTA is lossless and best for "
+               "static scenes. BLOCK is lossy (BC1, fixed 4:1, unchanged blocks skipped) and keeps "
+               "full-screen motion within the USB budget. AUTO uses lossless frames while they "
+               "fit and switches to BLOCK during motion, then refreshes losslessly.");
+    int rc_idx = 2;
+    for (int k = 0; k < IM_ARRAYSIZE(kRenderCodecValue); k++) {
+        if (kRenderCodecValue[k] == d.render_codec) {
+            rc_idx = k;
+        }
+    }
+    const bool has_new = (snapshot().info.codecs & ESPGPU_CAP_CODEC_AUTO) != 0;
+    if (ui::segmented("rc", kRenderCodec, has_new ? 5 : 3, &rc_idx)) {
+        d.render_codec = kRenderCodecValue[rc_idx];
+    }
     ImGui::Dummy(ImVec2(0, px(4)));
     if (ui::button("Apply codec", ui::ButtonKind::Tonal)) {
         const int rc = d.render_codec;

@@ -323,6 +323,14 @@ ESPGPU_API int espgpu_ota_flash(espgpu_device_t *dev, const void *image, size_t 
  */
 ESPGPU_API int espgpu_blit_to_hdc(espgpu_device_t *dev, void *hdc, int dst_w, int dst_h);
 
+/**
+ * 命令模式推荐的帧编码，前端传给 espgpu_set_mode 的 mode.codec：
+ *   环境变量 ESPGPU_CODEC = auto | block | delta | rle | raw 优先；
+ *   否则设备支持 ESPGPU_CODEC_AUTO 就用它（动起来有损、静止无损，见 espgpu_proto.h），
+ *   老固件退回 ESPGPU_CODEC_DELTA_RLE。
+ */
+ESPGPU_API uint8_t espgpu_preferred_codec(espgpu_device_t *dev);
+
 /** 当前连接是否是软件模拟器（环境变量 ESPGPU_EMULATOR=1 时打开的是模拟器）。 */
 ESPGPU_API bool espgpu_is_emulator(espgpu_device_t *dev);
 

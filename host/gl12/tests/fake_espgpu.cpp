@@ -171,6 +171,8 @@ espgpu_device_t *espgpu_open(int, char *, size_t)
     g_core = gpu_core_create(&cfg, &cb);
     return &g_d;
 }
+uint8_t espgpu_preferred_codec(espgpu_device_t *) { return ESPGPU_CODEC_AUTO; }
+
 int espgpu_set_mode(espgpu_device_t *, const espgpu_mode_t *m, uint8_t, int)
 {
     if (g_core) gpu_core_set_size(g_core, m->width, m->height);

@@ -18,6 +18,8 @@
 
 #include "internal.h"
 
+#include "espgpu_block.h"
+
 #include <chrono>
 #include <cstring>
 
@@ -210,6 +212,24 @@ void convert8(const uint8_t *idx, size_t pixels, uint16_t *px565, uint8_t *rgba,
     }
 }
 
+struct BlockCtx {
+    const uint16_t *px;
+    uint8_t *rgba;
+    uint32_t w;
+};
+
+/** BLOCK 解码回调：只把变化的块转换成 RGBA */
+void block_to_rgba(uint32_t x0, uint32_t y0, uint32_t nx, uint32_t ny, void *user)
+{
+    const auto *c = static_cast<const BlockCtx *>(user);
+    for (uint32_t y = 0; y < ny; y++) {
+        const size_t i = static_cast<size_t>(y0 + y) * c->w + x0;
+        for (uint32_t x = 0; x < nx; x++) {
+            st32(c->rgba + (i + x) * 4, to_rgba(c->px[i + x]));
+        }
+    }
+}
+
 } // namespace
 
 int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_t raw_len,
@@ -228,8 +248,9 @@ int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_
         return -1;
     }
     if (codec != ESPGPU_CODEC_RAW && codec != ESPGPU_CODEC_RLE &&
-        codec != ESPGPU_CODEC_DELTA_RLE) {
-        log_msg(LOG_WARN, "unsupported codec %u", codec);
+        codec != ESPGPU_CODEC_DELTA_RLE &&
+        !(codec == ESPGPU_CODEC_BLOCK && bpp == 2)) {
+        log_msg(LOG_WARN, "unsupported codec %u (format %u)", codec, format);
         return -1;
     }
 
@@ -238,8 +259,47 @@ int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_
 
     std::lock_guard<std::mutex> lk(dev->frame_mu);
 
+    /* 有损块编码：位图 + BC1 块。关键帧 = 位图全置位，否则需要可信的上一帧 */
+    if (codec == ESPGPU_CODEC_BLOCK) {
+        int is_key = 0;
+        if (!espgpu_block_scan(enc, enc_len, static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                               &is_key)) {
+            log_msg(LOG_WARN, "block frame malformed (enc=%zu %dx%d)", enc_len, w, h);
+            dev->ref_valid = false;
+            return -1;
+        }
+        if (!is_key && !(dev->ref_valid && dev->width == w && dev->height == h &&
+                         dev->format == format && dev->rgb565.size() == pixels)) {
+            std::lock_guard<std::mutex> slk(dev->stats_mu);
+            dev->stats.frames_dropped++;
+            return -1;
+        }
+        dev->rgb565.resize(pixels);
+        dev->rgba.resize(pixels * 4);
+        dev->prev.clear();
+        BlockCtx bc{dev->rgb565.data(), dev->rgba.data(), static_cast<uint32_t>(w)};
+        espgpu_block_decode(enc, static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                            dev->rgb565.data(), block_to_rgba, &bc);
+        dev->width = w;
+        dev->height = h;
+        dev->format = format;
+        dev->codec = codec;
+        dev->ref_valid = true;
+        dev->ref_exact = false;
+        dev->frame_id = dev->cur_frame_id;
+        dev->frame_ready = true;
+        dev->frame_cv.notify_all();
+        const double ms =
+            std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+        std::lock_guard<std::mutex> slk(dev->stats_mu);
+        dev->stats.frames_received++;
+        dev->stats.decode_ms = static_cast<float>(ms);
+        dev->win_frames++;
+        return 0;
+    }
+
     const bool delta = codec == ESPGPU_CODEC_DELTA_RLE;
-    if (delta && !(dev->ref_valid && dev->width == w && dev->height == h &&
+    if (delta && !(dev->ref_valid && dev->ref_exact && dev->width == w && dev->height == h &&
                    dev->format == format)) {
         /* 没有可信的参考帧（刚打开 / 丢过帧 / 换过模式）：丢掉，等关键帧 */
         std::lock_guard<std::mutex> slk(dev->stats_mu);
@@ -305,6 +365,7 @@ int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_
     dev->format = format;
     dev->codec = codec;
     dev->ref_valid = true;
+    dev->ref_exact = true;
 
     dev->frame_id = dev->cur_frame_id;
     dev->frame_ready = true;

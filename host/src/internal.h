@@ -130,6 +130,7 @@ struct espgpu_device {
     std::vector<uint16_t> rgb565;
     std::vector<uint8_t> rgba;
     bool ref_valid = false;     /**< 参考帧与设备 shadow 一致，可以应用差分帧 */
+    bool ref_exact = false;     /**< 参考帧是无损的（上一帧不是 BLOCK）：DELTA_RLE 只能接在它后面 */
     bool clut_dirty = true;     /**< clut 改过，INDEX8 需要整帧重新查表 */
     uint32_t clut_rgba[256] = {};
     int width = 0;

@@ -83,6 +83,8 @@ int espgpu_set_mode(espgpu_device_t *d, const espgpu_mode_t *m, uint8_t, int)
     return 0;
 }
 int espgpu_set_codec(espgpu_device_t *, int, int) { return 0; }
+uint8_t espgpu_preferred_codec(espgpu_device_t *) { return ESPGPU_CODEC_AUTO; }
+void espgpu_cmd_discard(espgpu_device_t *) {}
 int espgpu_cmd_pipeline(espgpu_device_t *d, const espgpu_pipeline_t *p, const espgpu_pipeline_fog_t *fog,
                         const espgpu_pipeline_ext_t *ext)
 {

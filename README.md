@@ -35,6 +35,17 @@ PRESENT → 逐 tile（双核领取）：按行解析求跨度，每 8 像素一
 - 设备端缓冲（显示列表 / 静态几何）、下行 LZ 压缩、调试视图（深度 / overdraw / tile / 线框）
 - 管理：OTA（带回滚）、80/160/240 MHz 调频、设备日志转发
 
+### 帧编码（USB 带宽）
+
+USB Full-Speed 实测只有 ~0.75 MB/s，24 fps 时每帧 ~31 KB。镜头一动整屏都变，带纹理的画面
+无损压不进去，所以命令模式默认用 **AUTO**：静止或局部变化时发无损 DELTA_RLE，整屏在动时
+改发有损的 BLOCK（BC1 4x4 块，固定 4:1，没变的块跳过，320x200 每帧最多 32.5 KB），
+画面停下来后再补一帧无损关键帧。想强制某种编码可设环境变量：
+
+```powershell
+$env:ESPGPU_CODEC = "delta"   # auto | block | delta | rle | raw
+```
+
 ### 没有硬件时
 
 设环境变量 `ESPGPU_EMULATOR=1`，`espgpu.dll` 会在进程内跑设备核心，所有前端、demo、
