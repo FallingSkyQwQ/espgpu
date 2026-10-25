@@ -187,3 +187,29 @@
 回传的帧存成 BMP（`perf: tex ... KB in ...` 一行给出纹理驻留量）。窗口被遮挡时
 `CopyFromScreen` 抓不到 GL 画面，用这个直接看设备侧光栅器的真实输出。
 
+---
+
+## 内层循环在 flash 里：取指比算术贵得多
+
+上面那批「段建立 / 融合内核 / 段长」的改动之后，px 内层循环仍然 ~200 周期/片元，
+而且出现了两个反常现象：**关雾（少 ~25% 指令）像素时间不变**、**把所有纹理压成 16x16
+（工作集 256 B）像素时间也不变**。两条只能用「取指瓶颈」解释 —— 代码在 flash。
+
+实测（每一次都只改这一个属性，算法不动，320x200，Doom MAP01 静止）：
+
+| 改动 | 效果 |
+|---|---|
+| `raster_tile`（13 KB，fill/fast/px/generic 全内联）加 `IRAM_ATTR` | 12.8 → **14.9 fps**；tile 110 → 91 ms，pixel 64 → 54 ms |
+| T&L 链（`fetch_attr` `get_vertex` `clip_poly` `draw_triangle` `gp_setup_tri` `gp_draw3d`）加 `GP_HOT` | demo3d tnl 40 → **22 ms**；Doom DEMO1 vtx 10.4 → 2.5、setup 11.8 → 2.4 ms |
+| `px_setup`（每三角形×tile）加 `GP_HOT` | +0.2 fps |
+| `raster3d.c / tnl.c / tex.c / vm.c` 单独 `-O3`（不能全局：IDF spiffs 会挂在 `-Werror`） | 15.8 → **16.3 fps**，pixel 50 → 47 ms |
+| 融合内核两像素展开 | pixel −3% |
+
+**教训：先确认代码在 IRAM 里，再抠指令。**`IRAM_ATTR` 的静态函数被 `always_inline`
+内联进 flash 函数时，属性会失效 —— 看 ELF 符号表（`.iram0.text` vs `.flash.text`）
+确认，或者用 `idf.py size`。IRAM 预算：S3 上 `iram0_0_seg` 有 358 KB，实测用了 ~100 KB。
+
+同样口径下的死路（已回退）：BC1 编码器搬 IRAM 无变化（enc 34.3 → 34.0 ms，算术受限）；
+把 Doom 的雾关掉、纹理压到 16x16 也无变化（见上）。
+
+
