@@ -92,10 +92,15 @@ static inline size_t espgpu_lz_decode(const uint8_t *src, size_t src_len, uint8_
             return 0;
         }
 
-        /* 允许重叠拷贝（off < mlen 时就是游程），必须逐字节 */
+        /* 不重叠（off >= mlen）时 memcpy；重叠（off < mlen，即游程）必须逐字节才符合 LZ4 语义。
+         * 很短的匹配逐字节反而比函数调用便宜，所以只有较长时才走 memcpy */
         const uint8_t *m = dst + di - off;
-        for (size_t k = 0; k < mlen; k++) {
-            dst[di + k] = m[k];
+        if (off >= mlen && mlen >= 16) {
+            memcpy(dst + di, m, mlen);
+        } else {
+            for (size_t k = 0; k < mlen; k++) {
+                dst[di + k] = m[k];
+            }
         }
         di += mlen;
     }

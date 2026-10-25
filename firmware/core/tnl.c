@@ -101,6 +101,25 @@ static void fetch_attr(const uint8_t *base, const espgpu_vertex_attrib_t *a, flo
     }
 }
 
+/** fetch_attr 会读取的字节数（相对 a->offset） */
+static uint32_t attr_bytes(const espgpu_vertex_attrib_t *a)
+{
+    const uint32_t n = a->components < 1 ? 1u : (a->components > 4 ? 4u : a->components);
+    switch (a->type) {
+    case ESPGPU_TYPE_I8:
+    case ESPGPU_TYPE_U8: return n;
+    case ESPGPU_TYPE_I16:
+    case ESPGPU_TYPE_U16: return n * 2;
+    case ESPGPU_TYPE_I32:
+    case ESPGPU_TYPE_U32:
+    case ESPGPU_TYPE_F32:
+    case ESPGPU_TYPE_FIXED16_16: return n * 4;
+    case ESPGPU_TYPE_RGB565:
+    case ESPGPU_TYPE_RGBA4444: return 2;
+    default: return 0;
+    }
+}
+
 static inline void mat_vec4(const float *m, const float v[4], float o[4])
 {
     o[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3] * v[3];
@@ -456,6 +475,10 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
     const gp_wvtx_t *V[3] = {v0, v1, v2};
     int32_t X[3], Y[3];
     for (int i = 0; i < 3; i++) {
+        /* NaN / 极端坐标（坏矩阵、坏视口）：直接丢弃。±2^20 像素内边函数系数放得进 int32 */
+        if (!(fabsf(V[i]->x) < 1048576.0f) || !(fabsf(V[i]->y) < 1048576.0f)) {
+            return true;
+        }
         X[i] = (int32_t)lrintf(V[i]->x * 16.0f);
         Y[i] = (int32_t)lrintf(V[i]->y * 16.0f);
     }
@@ -755,10 +778,17 @@ void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data
     memset(&dc, 0, sizeof(dc));
     dc.c = c;
     dc.stride = c->layout.stride;
+    uint32_t extent = 0; /* 一个顶点实际读到的最远字节（属性可以越过 stride） */
     for (int i = 0; i < c->layout.attrib_count; i++) {
         const espgpu_vertex_attrib_t *a = &c->layout.attribs[i];
         if (a->slot < 8) {
             dc.attr[a->slot] = a;
+        }
+    }
+    for (int s = 0; s <= ESPGPU_ATTR_TEXCOORD3; s++) { /* fetch_attr 只读这些槽 */
+        if (dc.attr[s]) {
+            const uint32_t e = (uint32_t)dc.attr[s]->offset + attr_bytes(dc.attr[s]);
+            if (e > extent) extent = e;
         }
     }
     if (dc.attr[ESPGPU_ATTR_POSITION] == NULL) {
@@ -767,6 +797,7 @@ void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data
 
     const unsigned isz = c->layout.index_type == 2 ? 4u : 2u;
     const uint8_t *indices = NULL;
+    uint64_t vbytes_avail = 0;
 
     if (d->source == ESPGPU_VSRC_BUFFER) {
         uint32_t blen = 0;
@@ -780,6 +811,7 @@ void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data
         }
         dc.vdata = b + vstart;
         dc.vavail = (uint32_t)((blen - vstart) / dc.stride);
+        vbytes_avail = blen - vstart;
         if (d->index_count) {
             if ((uint64_t)d->index_offset + (uint64_t)d->index_count * isz > blen) {
                 return;
@@ -793,11 +825,21 @@ void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data
         }
         dc.vdata = inline_data;
         dc.vavail = d->vertex_count;
+        vbytes_avail = inline_len;
         if (d->index_count) {
             if (vbytes + (uint64_t)d->index_count * isz > inline_len) {
                 return;
             }
             indices = inline_data + vbytes;
+        }
+    }
+    /* 顶点 i 读 [i*stride, i*stride + extent)，不能越过数据末尾 */
+    if (extent > dc.stride) {
+        const uint32_t fit = vbytes_avail >= extent
+                                 ? (uint32_t)((vbytes_avail - extent) / dc.stride) + 1u
+                                 : 0u;
+        if (fit < dc.vavail) {
+            dc.vavail = fit;
         }
     }
 

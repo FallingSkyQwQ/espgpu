@@ -46,7 +46,9 @@ uint64_t gp_time_us(void)
         QueryPerformanceFrequency(&freq);
     }
     QueryPerformanceCounter(&now);
-    return (uint64_t)(now.QuadPart * 1000000ull / (uint64_t)freq.QuadPart);
+    /* 先除后乘：QuadPart * 1e6 在 10 MHz 的 QPC 下约 21 天就溢出 */
+    const uint64_t q = (uint64_t)now.QuadPart, f = (uint64_t)freq.QuadPart;
+    return (q / f) * 1000000ull + (q % f) * 1000000ull / f;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

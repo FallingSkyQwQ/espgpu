@@ -211,7 +211,8 @@ enum {
  *       FLAT: C   TEX: T0   TEX_MOD_COLOR: T0*C   TEX_MOD_TEX: T0*T1*C
  *       TEX_ADD: rgb=T0+C a=T0.a*C.a   TEX_ADD_TEX: rgb=T0*C+T1 a=T0.a*C.a
  *       TEX_MOD_ADD_COLOR: rgb=T0*T1+C a=T0.a   TEX_DECAL: rgb=mix(C,T0,T0.a) a=C.a
- *       然后依次：雾（f 由 clip w 计算，即眼空间深度）→ alpha 测试 → 深度测试 → 混合。
+ *       然后依次：雾（距离 = |眼空间 z|，由 MODELVIEW 槽算出；该槽从未设置时退化为 |clip w|）
+ *       → alpha 测试 → 深度测试 → 混合。
  *       帧缓冲没有 alpha 通道，DST_ALPHA 视为 1。
  * 线 / 点：投影后按 line_width / point_size 展成屏幕对齐的四边形。
  * CLEAR 受裁剪矩形约束（GL 语义）。

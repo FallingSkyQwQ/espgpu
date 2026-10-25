@@ -59,6 +59,7 @@ typedef struct {
     gp_tex_t **slots;   /* 开放寻址哈希，NULL = 空，GP_TEX_TOMB = 删除 */
     uint32_t cap;
     uint32_t count;
+    uint32_t tombs;     /* GP_TEX_TOMB 个数 */
     uint32_t bytes;
     uint32_t budget;
     uint32_t evictions;
@@ -79,6 +80,7 @@ typedef struct {
     uint16_t count;
     uint8_t varyings;
     uint8_t valid;
+    uint8_t ntemps;     /* 用到的临时寄存器个数：每像素只清这么多 */
     espgpu_vm_insn_t code[ESPGPU_VM_MAX_INSNS];
 } gp_prog_t;
 
@@ -292,6 +294,7 @@ struct gpu_core {
     uint8_t debug_view;
     uint8_t *dbg;           /* 每像素 overdraw / 线框标记，屏幕大小 */
     uint16_t *dbg_img;      /* 合成后的调试画面 */
+    uint32_t dbg_tile_tris[GP_MAX_TILES]; /* 本帧每 tile 光栅的三角形数（分箱在 PRESENT 前就清了） */
 
     /* 统计 */
     uint32_t frame;
@@ -357,6 +360,8 @@ uint32_t gp_sample(const gp_sampler_t *s, float u, float v);
 bool gp_vm_run(const gp_prog_t *p, const float *consts, const gp_sampler_t *smp, const float *v,
                float *regs, float out[4]);
 bool gp_vm_validate(const espgpu_vm_insn_t *code, uint32_t n);
+/** 程序引用到的最大临时寄存器编号 + 1（validate 通过后调用） */
+uint8_t gp_vm_temps_used(const espgpu_vm_insn_t *code, uint32_t n);
 
 /* ── 小工具 ───────────────────────────────────────────────────────── */
 
@@ -391,6 +396,30 @@ static inline uint32_t gp_mul8(uint32_t a, uint32_t b)
     return (t + (t >> 8)) >> 8;
 }
 
+/**
+ * 比较函数的位掩码形式：ESPGPU_CMP_* 恰好是 GL 的 {小于=1, 等于=2, 大于=4} 组合，
+ * 于是 pass = (mask >> ((a >= b) + (a > b))) & 1，内层循环里不用 switch。
+ */
+static inline uint32_t gp_cmp_mask(uint8_t func)
+{
+    return func > ESPGPU_CMP_ALWAYS ? 7u : func;
+}
+
+static inline uint32_t gp_cmp_m(uint32_t mask, uint32_t a, uint32_t b)
+{
+    return (mask >> ((uint32_t)(a >= b) + (uint32_t)(a > b))) & 1u;
+}
+
+/** floor 后转 int；非有限或超出 ±2^30 时按 0 处理（避免 float→int 越界 UB），范围内与 (int)floorf 相同 */
+static inline int gp_floor_i(float f)
+{
+    if (!(f > -1073741824.0f && f < 1073741824.0f)) {
+        return 0;
+    }
+    const int i = (int)f;
+    return (f < (float)i) ? i - 1 : i;
+}
+
 static inline bool gp_cmp(uint8_t func, uint32_t a, uint32_t b)
 {
     switch (func) {
@@ -403,6 +432,106 @@ static inline bool gp_cmp(uint8_t func, uint32_t a, uint32_t b)
     case ESPGPU_CMP_GEQUAL: return a >= b;
     default: return true;
     }
+}
+
+/* ── 纹理采样（内联版本：光栅器直接展开，tex.c 的 gp_sample 也调用它）。
+ *    GP_HOT：编译器若没内联，留下的副本也要在 IRAM 里 ── */
+
+GP_HOT static inline int gp_wrap(int v, int n, uint8_t mode)
+{
+    if (v >= 0 && v < n) {
+        return v;
+    }
+    switch (mode) {
+    case ESPGPU_WRAP_CLAMP:
+        return v < 0 ? 0 : n - 1;
+    case ESPGPU_WRAP_MIRROR: {
+        int m = v % (2 * n);
+        if (m < 0) m += 2 * n;
+        return m < n ? m : 2 * n - 1 - m;
+    }
+    default: {
+        int m = v % n;
+        return m < 0 ? m + n : m;
+    }
+    }
+}
+
+GP_HOT static inline uint32_t gp_texel(const gp_tex_t *t, int x, int y)
+{
+    const size_t i = (size_t)y * t->w + x;
+    if (t->px) {
+        uint32_t c = gp_expand565(t->px[i]);
+        if (t->alpha) {
+            c = (c & 0x00FFFFFFu) | ((uint32_t)t->alpha[i] << 24);
+        }
+        return c;
+    }
+    const uint8_t v = t->idx[i];
+    if (t->fmt == ESPGPU_FMT_R8) {
+        return 0xFF000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8) | v;
+    }
+    uint32_t c = t->pal ? gp_expand565(t->pal[v])
+                        : (0xFF000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8) | v);
+    if (t->pal_a) {
+        c = (c & 0x00FFFFFFu) | ((uint32_t)t->pal_a[v] << 24);
+    }
+    return c;
+}
+
+/** 最近邻；t 必须有像素 */
+GP_HOT static inline uint32_t gp_sample_nearest(const gp_sampler_t *s, float u, float v)
+{
+    const gp_tex_t *t = s->tex;
+    const int x = gp_wrap(gp_floor_i(u), t->w, s->wrap_u);
+    const int y = gp_wrap(gp_floor_i(v), t->h, s->wrap_v);
+    return gp_texel(t, x, y);
+}
+
+/** 双线性（8 位权重）；t 必须有像素 */
+GP_HOT static inline uint32_t gp_sample_linear(const gp_sampler_t *s, float u, float v)
+{
+    const gp_tex_t *t = s->tex;
+    const int w = t->w, h = t->h;
+    const float fu = u - 0.5f;
+    const float fv = v - 0.5f;
+    const int x0 = gp_floor_i(fu);
+    const int y0 = gp_floor_i(fv);
+    const float flu = (float)x0;
+    const float flv = (float)y0;
+    /* 越界 / NaN 坐标 gp_floor_i 给 0，小数部分也要夹住（NaN → 0）才不会把权重算爆 */
+    float frx = fu - flu, fry = fv - flv;
+    frx = frx > 0.0f ? (frx < 0.99999994f ? frx : 0.99999994f) : 0.0f;
+    fry = fry > 0.0f ? (fry < 0.99999994f ? fry : 0.99999994f) : 0.0f;
+    const uint32_t ax = (uint32_t)(frx * 256.0f);
+    const uint32_t ay = (uint32_t)(fry * 256.0f);
+    const int xa = gp_wrap(x0, w, s->wrap_u), xb = gp_wrap(x0 + 1, w, s->wrap_u);
+    const int ya = gp_wrap(y0, h, s->wrap_v), yb = gp_wrap(y0 + 1, h, s->wrap_v);
+    const uint32_t w00 = (256 - ax) * (256 - ay), w10 = ax * (256 - ay);
+    const uint32_t w01 = (256 - ax) * ay, w11 = ax * ay;
+    if (t->px && !t->alpha) {
+        /* 最常见的不透明 RGB565：直接取像素、alpha 恒 255（四个 255 加权和恰好还是 255），
+         * 省掉 gp_texel 的格式分支和一条通道的乘加；结果与通用分支逐位相同 */
+        const uint16_t *p = t->px;
+        const uint32_t c00 = gp_expand565(p[(size_t)ya * w + xa]), c10 = gp_expand565(p[(size_t)ya * w + xb]);
+        const uint32_t c01 = gp_expand565(p[(size_t)yb * w + xa]), c11 = gp_expand565(p[(size_t)yb * w + xb]);
+        uint32_t out = 0xFF000000u;
+        for (int sh = 0; sh < 24; sh += 8) {
+            const uint32_t v4 = ((c00 >> sh) & 255) * w00 + ((c10 >> sh) & 255) * w10 +
+                                ((c01 >> sh) & 255) * w01 + ((c11 >> sh) & 255) * w11;
+            out |= ((v4 + 32768) >> 16) << sh; /* 权重和 = 65536，不会超过 255 */
+        }
+        return out;
+    }
+    const uint32_t c00 = gp_texel(t, xa, ya), c10 = gp_texel(t, xb, ya);
+    const uint32_t c01 = gp_texel(t, xa, yb), c11 = gp_texel(t, xb, yb);
+    uint32_t out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        const uint32_t v4 = ((c00 >> sh) & 255) * w00 + ((c10 >> sh) & 255) * w10 +
+                            ((c01 >> sh) & 255) * w01 + ((c11 >> sh) & 255) * w11;
+        out |= ((v4 + 32768) >> 16 > 255 ? 255u : (v4 + 32768) >> 16) << sh;
+    }
+    return out;
 }
 
 #ifdef __cplusplus

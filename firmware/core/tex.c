@@ -91,9 +91,9 @@ gp_tex_t *gp_tex_find(gp_texcache_t *tc, uint32_t id)
 
 static bool tc_insert(gp_texcache_t *tc, gp_tex_t *t)
 {
-    if ((tc->count + 1) * 10 > tc->cap * 7) {
-        /* 扩容重哈希 */
-        const uint32_t ncap = tc->cap * 2;
+    if ((tc->count + tc->tombs + 1) * 10 > tc->cap * 7) {
+        /* 重哈希：活跃项多就扩容，否则只是清掉墓碑（否则反复增删后 find 未命中要扫全表） */
+        const uint32_t ncap = (tc->count + 1) * 20 > tc->cap * 7 ? tc->cap * 2 : tc->cap;
         gp_tex_t **ns = (gp_tex_t **)gp_alloc_big(sizeof(gp_tex_t *) * ncap);
         if (ns == NULL) {
             return false;
@@ -110,11 +110,15 @@ static bool tc_insert(gp_texcache_t *tc, gp_tex_t *t)
         gp_free(tc->slots);
         tc->slots = ns;
         tc->cap = ncap;
+        tc->tombs = 0;
     }
     const uint32_t mask = tc->cap - 1;
     uint32_t i = hash_id(t->id) & mask;
     while (tc->slots[i] && tc->slots[i] != GP_TEX_TOMB) {
         i = (i + 1) & mask;
+    }
+    if (tc->slots[i] == GP_TEX_TOMB) {
+        tc->tombs--;
     }
     tc->slots[i] = t;
     tc->count++;
@@ -129,6 +133,7 @@ static void tc_remove(gp_texcache_t *tc, gp_tex_t *t)
         if (tc->slots[i] == t) {
             tc->slots[i] = GP_TEX_TOMB;
             tc->count--;
+            tc->tombs++;
             return;
         }
         if (tc->slots[i] == NULL) {
@@ -175,6 +180,7 @@ void gp_tex_delete_all(gpu_core_t *c)
         tc->slots[i] = NULL;
     }
     tc->count = 0;
+    tc->tombs = 0;
     tc->bytes = 0;
     c->rstate_off = 0;
     c->rstate_2d_off = 0;
@@ -228,6 +234,9 @@ static void *tex_alloc(gpu_core_t *c, size_t bytes, const gp_tex_t *keep)
 
 gp_tex_t *gp_tex_get(gpu_core_t *c, uint32_t id)
 {
+    if (id == 0) {
+        return NULL; /* 0 = 未绑定；find 永远找不到它，建了就是泄漏 */
+    }
     gp_tex_t *t = gp_tex_find(&c->tc, id);
     if (t) {
         return t;
@@ -311,6 +320,22 @@ bool gp_tex_upload(gpu_core_t *c, const espgpu_upload_texture_t *u, uint8_t flag
         return false;
     }
 
+    /* 存储格式：RGBA4444 展开成 RGB565 + alpha 平面 */
+    const uint8_t sfmt = (u->format == ESPGPU_FMT_RGBA4444) ? ESPGPU_FMT_RGB565 : u->format;
+    const bool want_alpha = u->format == ESPGPU_FMT_RGBA4444;
+
+    if (u->offset != 0) {
+        /* 续传片必须与首片的存储形态一致：否则 RGB565 首片 + RGBA4444 续片会写空的 alpha 平面 */
+        gp_tex_t *e = gp_tex_find(&c->tc, u->id);
+        if (e == NULL || e->total_len != expected || e->w != u->width || e->h != u->height ||
+            e->fmt != sfmt || (sfmt == ESPGPU_FMT_RGB565 ? e->px == NULL : e->idx == NULL) ||
+            (want_alpha && e->alpha == NULL)) {
+            gp_log(GP_LOG_WARN, "texture %u: continuation does not match first chunk",
+                   (unsigned)u->id);
+            return false;
+        }
+    }
+
     gp_tex_t *t = gp_tex_get(c, u->id);
     if (t == NULL) {
         return false;
@@ -319,8 +344,6 @@ bool gp_tex_upload(gpu_core_t *c, const espgpu_upload_texture_t *u, uint8_t flag
 
     if (u->offset == 0) {
         /* 同尺寸同格式时复用存储（glTexSubImage 式的整张更新很常见） */
-        const uint8_t sfmt = (u->format == ESPGPU_FMT_RGBA4444) ? ESPGPU_FMT_RGB565 : u->format;
-        const bool want_alpha = u->format == ESPGPU_FMT_RGBA4444;
         const bool reuse = t->w == u->width && t->h == u->height && t->fmt == sfmt &&
                            (t->px != NULL || t->idx != NULL) && ((t->alpha != NULL) == want_alpha);
         if (!reuse) {
@@ -358,9 +381,6 @@ bool gp_tex_upload(gpu_core_t *c, const espgpu_upload_texture_t *u, uint8_t flag
         t->has_alpha = want_alpha || (t->fmt == ESPGPU_FMT_INDEX8 && t->pal_a != NULL);
         t->total_len = expected;
         t->received = 0;
-    } else if (t->total_len != expected || t->w != u->width || t->h != u->height ||
-               (t->px == NULL && t->idx == NULL)) {
-        return false;
     }
 
     const uint32_t first = u->offset / bpp;
@@ -445,79 +465,13 @@ void gp_tex_palette(gpu_core_t *c, const espgpu_tex_palette_t *p, const uint8_t 
 
 /* ── 采样 ─────────────────────────────────────────────────────────── */
 
-static inline int wrap_i(int v, int n, uint8_t mode)
-{
-    if (v >= 0 && v < n) {
-        return v;
-    }
-    switch (mode) {
-    case ESPGPU_WRAP_CLAMP:
-        return v < 0 ? 0 : n - 1;
-    case ESPGPU_WRAP_MIRROR: {
-        int m = v % (2 * n);
-        if (m < 0) m += 2 * n;
-        return m < n ? m : 2 * n - 1 - m;
-    }
-    default: {
-        int m = v % n;
-        return m < 0 ? m + n : m;
-    }
-    }
-}
-
-static inline uint32_t fetch(const gp_tex_t *t, int x, int y)
-{
-    const size_t i = (size_t)y * t->w + x;
-    if (t->px) {
-        uint32_t c = gp_expand565(t->px[i]);
-        if (t->alpha) {
-            c = (c & 0x00FFFFFFu) | ((uint32_t)t->alpha[i] << 24);
-        }
-        return c;
-    }
-    const uint8_t v = t->idx[i];
-    if (t->fmt == ESPGPU_FMT_R8) {
-        return 0xFF000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8) | v;
-    }
-    uint32_t c = t->pal ? gp_expand565(t->pal[v])
-                        : (0xFF000000u | ((uint32_t)v << 16) | ((uint32_t)v << 8) | v);
-    if (t->pal_a) {
-        c = (c & 0x00FFFFFFu) | ((uint32_t)t->pal_a[v] << 24);
-    }
-    return c;
-}
-
+/* 实现在 core_internal.h（光栅器内联展开）；这里是给片元 VM 等调用方的出口 */
 GP_HOT uint32_t gp_sample(const gp_sampler_t *s, float u, float v)
 {
     const gp_tex_t *t = s->tex;
     if (t == NULL || (t->px == NULL && t->idx == NULL)) {
         return 0xFFFFFFFFu;
     }
-    const int w = t->w, h = t->h;
-    if (s->filter == ESPGPU_FILTER_LINEAR) {
-        const float fu = u - 0.5f;
-        const float fv = v - 0.5f;
-        const float flu = floorf(fu);
-        const float flv = floorf(fv);
-        const int x0 = (int)flu;
-        const int y0 = (int)flv;
-        const uint32_t ax = (uint32_t)((fu - flu) * 256.0f);
-        const uint32_t ay = (uint32_t)((fv - flv) * 256.0f);
-        const int xa = wrap_i(x0, w, s->wrap_u), xb = wrap_i(x0 + 1, w, s->wrap_u);
-        const int ya = wrap_i(y0, h, s->wrap_v), yb = wrap_i(y0 + 1, h, s->wrap_v);
-        const uint32_t c00 = fetch(t, xa, ya), c10 = fetch(t, xb, ya);
-        const uint32_t c01 = fetch(t, xa, yb), c11 = fetch(t, xb, yb);
-        const uint32_t w00 = (256 - ax) * (256 - ay), w10 = ax * (256 - ay);
-        const uint32_t w01 = (256 - ax) * ay, w11 = ax * ay;
-        uint32_t out = 0;
-        for (int sh = 0; sh < 32; sh += 8) {
-            const uint32_t v4 = ((c00 >> sh) & 255) * w00 + ((c10 >> sh) & 255) * w10 +
-                                ((c01 >> sh) & 255) * w01 + ((c11 >> sh) & 255) * w11;
-            out |= ((v4 + 32768) >> 16 > 255 ? 255u : (v4 + 32768) >> 16) << sh;
-        }
-        return out;
-    }
-    const int x = wrap_i((int)floorf(u), w, s->wrap_u);
-    const int y = wrap_i((int)floorf(v), h, s->wrap_v);
-    return fetch(t, x, y);
+    return s->filter == ESPGPU_FILTER_LINEAR ? gp_sample_linear(s, u, v)
+                                             : gp_sample_nearest(s, u, v);
 }

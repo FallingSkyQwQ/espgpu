@@ -55,6 +55,30 @@ bool gp_vm_validate(const espgpu_vm_insn_t *code, uint32_t n)
     return true;
 }
 
+uint8_t gp_vm_temps_used(const espgpu_vm_insn_t *code, uint32_t n)
+{
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const espgpu_vm_insn_t *in = &code[i];
+        if (in->op == ESPGPU_VM_END) {
+            break;
+        }
+        if (in->op == ESPGPU_VM_NOP) {
+            continue;
+        }
+        for (int k = 0; k < 3; k++) {
+            if ((in->src[k] & 0xC0) == ESPGPU_VM_BANK_TEMP && (in->src[k] & 0x3Fu) + 1u > m) {
+                m = (in->src[k] & 0x3Fu) + 1u;
+            }
+        }
+        if (in->op != ESPGPU_VM_KIL && (in->dst & 0xC0) == ESPGPU_VM_BANK_TEMP &&
+            (in->dst & 0x3Fu) + 1u > m) {
+            m = (in->dst & 0x3Fu) + 1u;
+        }
+    }
+    return (uint8_t)(m > ESPGPU_VM_TEMPS ? ESPGPU_VM_TEMPS : m);
+}
+
 static inline const float *reg_ptr(uint8_t r, const float *regs, const float *v, const float *k)
 {
     const uint8_t idx = r & 0x3F;
@@ -92,6 +116,8 @@ GP_HOT bool gp_vm_run(const gp_prog_t *p, const float *consts, const gp_sampler_
                       const float *v, float *regs, float out[4])
 {
     float o[4] = {0, 0, 0, 1};
+    /* 规范：r0..r15 每像素开始时清零（否则结果取决于上一个像素 / 哪个核跑的 tile） */
+    memset(regs, 0, (size_t)p->ntemps * 4 * sizeof(float));
 
     for (uint32_t pc = 0; pc < p->count; pc++) {
         const espgpu_vm_insn_t *in = &p->code[pc];

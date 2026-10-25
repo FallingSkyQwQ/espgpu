@@ -7,6 +7,8 @@
  *   core_vm.bmp   片元 VM 程序（等离子）+ FBO 渲染到纹理再贴回屏幕
  * 并检查若干像素的期望值。返回非 0 表示失败。
  *
+ * 之后是一组回归测试（覆盖规则、透视跨度、状态快照、VM、调试视图、坏输入）。
+ *
  *   cc -std=c11 -Ishared -Ifirmware/core host/tests/core_test.c firmware/core/[a-z]*.c -lm
  */
 
@@ -482,6 +484,448 @@ static void scene_vm(gpu_core_t *c)
     expect("fbo top (red)", (qx0 + qx1) / 2, qy_top + (qy_bot - qy_top) / 3, 255, 0, 0, 8);
 }
 
+
+/* ── 回归测试 ─────────────────────────────────────────────────────── */
+
+static void pipeline_ex(uint8_t shade, int dtest, int dwrite, int blend, uint8_t bsrc, uint8_t bdst)
+{
+    uint8_t body[sizeof(espgpu_pipeline_t) + sizeof(espgpu_pipeline_fog_t) +
+                 sizeof(espgpu_pipeline_ext_t)];
+    espgpu_pipeline_t p;
+    memset(&p, 0, sizeof(p));
+    p.mask = 0xFFFF & ~ESPGPU_PS_TEXTURE;
+    p.blend_enable = (uint8_t)blend;
+    p.blend_src = bsrc;
+    p.blend_dst = bdst;
+    p.depth_test = (uint8_t)dtest;
+    p.depth_write = (uint8_t)dwrite;
+    p.depth_func = ESPGPU_CMP_LEQUAL;
+    p.alpha_func = ESPGPU_CMP_ALWAYS;
+    p.shade_mode = shade;
+    espgpu_pipeline_fog_t f = {0, 1, 1};
+    espgpu_pipeline_ext_t e;
+    memset(&e, 0, sizeof(e));
+    e.shade_model = ESPGPU_SHADE_MODEL_SMOOTH;
+    e.color_write = 1;
+    memcpy(body, &p, sizeof(p));
+    memcpy(body + sizeof(p), &f, sizeof(f));
+    memcpy(body + sizeof(p) + sizeof(f), &e, sizeof(e));
+    push(ESPGPU_OP_PIPELINE, 0, body, sizeof(body));
+}
+
+static const float k_ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+/** 只有 POSITION（n 分量 F32）的布局 */
+static void layout_pos(int comps)
+{
+    espgpu_vertex_layout_t l;
+    memset(&l, 0, sizeof(l));
+    l.stride = (uint16_t)(comps * 4);
+    l.attrib_count = 1;
+    l.attribs[0] = (espgpu_vertex_attrib_t){ESPGPU_ATTR_POSITION, ESPGPU_TYPE_F32, (uint8_t)comps, 0, 0, 0, 0};
+    push(ESPGPU_OP_VERTEX_LAYOUT, 0, &l, sizeof(l));
+}
+
+static void draw_raw(uint8_t prim, const void *v, int n, int stride)
+{
+    static uint8_t body[sizeof(espgpu_draw_t) + 4096 * 16];
+    espgpu_draw_t d;
+    memset(&d, 0, sizeof(d));
+    d.prim = prim;
+    d.vertex_count = (uint16_t)n;
+    memcpy(body, &d, sizeof(d));
+    memcpy(body + sizeof(d), v, (size_t)n * stride);
+    push(ESPGPU_OP_DRAW, ESPGPU_DRAWF_3D, body, (uint32_t)(sizeof(d) + (size_t)n * stride));
+}
+
+static void set_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    espgpu_color_t col = {r, g, b, a};
+    push(ESPGPU_OP_COLOR, 0, &col, sizeof(col));
+}
+
+static uint32_t g_rs = 12345;
+static float frand(float a, float b)
+{
+    g_rs = g_rs * 1103515245u + 12345u;
+    return a + (b - a) * (float)((g_rs >> 8) & 0xFFFF) / 65535.0f;
+}
+
+/* top-left 规则：共享边的网格（含跨 tile、出屏、亚像素抖动）每个像素恰好被画一次 */
+static void test_coverage(gpu_core_t *c)
+{
+    enum { GX = 11, GY = 9 };
+    static float vx[GY][GX], vy[GY][GX];
+    for (int j = 0; j < GY; j++)
+        for (int i = 0; i < GX; i++) {
+            vx[j][i] = -1.3f + 2.6f * (float)i / (GX - 1);
+            vy[j][i] = -1.3f + 2.6f * (float)j / (GY - 1);
+            if (i > 0 && i < GX - 1) vx[j][i] += frand(-0.08f, 0.08f);
+            if (j > 0 && j < GY - 1) vy[j][i] += frand(-0.08f, 0.08f);
+        }
+    static float tri[(GX - 1) * (GY - 1) * 6 * 2 + 64 * 3 * 2];
+    int n = 0;
+    for (int j = 0; j + 1 < GY; j++)
+        for (int i = 0; i + 1 < GX; i++) {
+            const float ax = vx[j][i], ay = vy[j][i], bx = vx[j][i + 1], by = vy[j][i + 1];
+            const float cx = vx[j + 1][i + 1], cy = vy[j + 1][i + 1], dx = vx[j + 1][i], dy = vy[j + 1][i];
+            const float q[6][2] = {{ax, ay}, {bx, by}, {cx, cy}, {ax, ay}, {cx, cy}, {dx, dy}};
+            const float r[6][2] = {{ax, ay}, {bx, by}, {dx, dy}, {bx, by}, {cx, cy}, {dx, dy}};
+            const float(*use)[2] = ((i + j) & 1) ? q : r;
+            for (int k = 0; k < 6; k++) {
+                tri[n * 2] = use[k][0];
+                tri[n * 2 + 1] = use[k][1];
+                n++;
+            }
+        }
+    clear(rgb(0, 0, 0));
+    mat(ESPGPU_MATRIX_MVP, k_ident);
+    layout_pos(2);
+    pipeline_ex(ESPGPU_SHADE_FLAT, 0, 0, 1, ESPGPU_BLEND_ONE, ESPGPU_BLEND_ONE);
+    set_color(8, 0, 0, 255);
+    draw_raw(ESPGPU_PRIM_TRIANGLES, tri, n, 8);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    int bad = 0;
+    for (int i = 0; i < g_w * g_h; i++) bad += g_frame[i] != 0x0800;
+    if (bad) {
+        printf("FAIL coverage: %d pixels not hit exactly once\n", bad);
+        g_fails++;
+    }
+
+    /* 扇形：64 个细长三角形共享圆心，不能有洞或重复 */
+    n = 0;
+    const float cx = 0.1f, cy = -0.05f;
+    for (int k = 0; k < 64; k++) {
+        const float a0 = 6.2831853f * k / 64, a1 = 6.2831853f * (k + 1) / 64;
+        const float p[3][2] = {{cx, cy}, {cx + 0.9f * cosf(a0), cy + 0.9f * sinf(a0) * 1.6f},
+                               {cx + 0.9f * cosf(a1), cy + 0.9f * sinf(a1) * 1.6f}};
+        for (int m = 0; m < 3; m++) {
+            tri[n * 2] = p[m][0];
+            tri[n * 2 + 1] = p[m][1];
+            n++;
+        }
+    }
+    clear(rgb(0, 0, 0));
+    draw_raw(ESPGPU_PRIM_TRIANGLES, tri, n, 8);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    bad = 0;
+    for (int y = 0; y < g_h; y++)
+        for (int x = 0; x < g_w; x++) {
+            const uint16_t v = g_frame[y * g_w + x];
+            if (v != 0 && v != 0x0800) bad++;
+            /* 圆心附近必须被画到 */
+            const float nx = (x + 0.5f) / g_w * 2 - 1 - cx, ny = 1 - (y + 0.5f) / g_h * 2 - cy;
+            if (nx * nx + (ny / 1.6f) * (ny / 1.6f) < 0.6f * 0.6f && v != 0x0800) bad++;
+        }
+    if (bad) {
+        printf("FAIL fan coverage: %d bad pixels\n", bad);
+        g_fails++;
+    }
+}
+
+/* 透视：跨度最后一段不能用三角形外的 R+1 外推 1/w（这里那一点 1/w < 0，旧代码整段纹理坐标乱掉） */
+static void test_persp_span_end(gpu_core_t *c)
+{
+    static uint16_t ramp[256];
+    for (int i = 0; i < 256; i++) ramp[i] = (uint16_t)i; /* 像素值 = texel 下标 */
+    upload_tex(40, 256, 1, ESPGPU_FMT_RGB565, ramp);
+    const float w0 = 0.05f, w1 = 50.0f;
+    const float xr = -1.0f + 2.0f * 100.0f / 320.0f; /* 屏幕 x = 100 */
+    /* POSITION 4 分量（裁剪坐标）+ TEXCOORD0 */
+    float v[4][6] = {
+        {-1.0f * w0, 1.0f * w0, 0, w0, 0, 0},
+        {xr * w1, 1.0f * w1, 0, w1, 1, 0},
+        {xr * w1, 0.8f * w1, 0, w1, 1, 0},
+        {-1.0f * w0, 0.8f * w0, 0, w0, 0, 0},
+    };
+    espgpu_vertex_layout_t l;
+    memset(&l, 0, sizeof(l));
+    l.stride = 24;
+    l.attrib_count = 2;
+    l.attribs[0] = (espgpu_vertex_attrib_t){ESPGPU_ATTR_POSITION, ESPGPU_TYPE_F32, 4, 0, 0, 0, 0};
+    l.attribs[1] = (espgpu_vertex_attrib_t){ESPGPU_ATTR_TEXCOORD0, ESPGPU_TYPE_F32, 2, 0, 16, 0, 0};
+    clear(rgb(0, 0, 0));
+    mat(ESPGPU_MATRIX_MVP, k_ident);
+    push(ESPGPU_OP_VERTEX_LAYOUT, 0, &l, sizeof(l));
+    pipeline_ex(ESPGPU_SHADE_TEX, 0, 0, 0, 0, 0);
+    bind(0, 40, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_CLAMP);
+    draw_raw(ESPGPU_PRIM_QUADS, v, 4, 24);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    /* 每 8 像素线性插值本身有误差（这里曲率极大，段起点又随 tile 边界变化），所以只要求：
+     * u 单调不减、跨度最后一个像素精确到 ±2 texel。旧代码最后一段整段塌成 texel 0。 */
+    int bad = 0;
+    for (int y = 3; y < 17; y++) {
+        int prev = -1;
+        for (int x = 0; x < 100; x++) {
+            const float t = (x + 0.5f) / 100.0f;
+            const float u = (t * 256.0f / w1) / ((1 - t) / w0 + t / w1);
+            const int want = (int)u > 255 ? 255 : (int)u;
+            const int got = g_frame[y * g_w + x];
+            if (got < prev) bad++;
+            if (x == 99 && abs(got - want) > 2) bad++;
+            prev = got;
+        }
+    }
+    if (bad) {
+        printf("FAIL perspective span end: %d bad pixels\n", bad);
+        g_fails++;
+    }
+}
+
+static void quad2d(int x0, int y0, int x1, int y1, int u1, int v1, uint16_t col)
+{
+    espgpu_vertex2d_t q[4] = {
+        {(int16_t)(x0 * 16), (int16_t)(y0 * 16), 0, 0, col},
+        {(int16_t)(x1 * 16), (int16_t)(y0 * 16), (int16_t)(u1 * 16), 0, col},
+        {(int16_t)(x1 * 16), (int16_t)(y1 * 16), (int16_t)(u1 * 16), (int16_t)(v1 * 16), col},
+        {(int16_t)(x0 * 16), (int16_t)(y1 * 16), 0, (int16_t)(v1 * 16), col},
+    };
+    uint8_t body[sizeof(espgpu_draw_t) + sizeof(q)];
+    espgpu_draw_t d;
+    memset(&d, 0, sizeof(d));
+    d.prim = ESPGPU_PRIM_QUADS;
+    d.vertex_count = 4;
+    memcpy(body, &d, sizeof(d));
+    memcpy(body + sizeof(d), q, sizeof(q));
+    push(ESPGPU_OP_DRAW, 0, body, sizeof(body));
+}
+
+/* PIPELINE 的 PS_TEXTURE 改了单元 0 的绑定，2D 路径缓存的状态快照必须失效 */
+static void test_pipeline_rebinds_2d(gpu_core_t *c)
+{
+    static uint16_t red[16], blue[16];
+    for (int i = 0; i < 16; i++) {
+        red[i] = rgb(255, 0, 0);
+        blue[i] = rgb(0, 0, 255);
+    }
+    upload_tex(30, 4, 4, ESPGPU_FMT_RGB565, red);
+    upload_tex(31, 4, 4, ESPGPU_FMT_RGB565, blue);
+    clear(rgb(0, 0, 0));
+    espgpu_pipeline2d_t p2 = {ESPGPU_BLEND_NONE, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT, 0, 0, {0}};
+    push(ESPGPU_OP_PIPELINE2D, 0, &p2, sizeof(p2));
+    bind(0, 30, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT);
+    quad2d(0, 0, 100, 100, 4, 4, 0xFFFF);
+    espgpu_pipeline_t p;
+    memset(&p, 0, sizeof(p));
+    p.mask = ESPGPU_PS_TEXTURE;
+    p.tex_count = 1;
+    p.tex_unit[0] = 0;
+    p.tex_id[0] = 31;
+    push(ESPGPU_OP_PIPELINE, 0, &p, sizeof(p));
+    quad2d(150, 0, 250, 100, 4, 4, 0xFFFF);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    expect("2d before rebind (red)", 50, 50, 255, 0, 0, 8);
+    expect("2d after PIPELINE rebind (blue)", 200, 50, 0, 0, 255, 8);
+}
+
+/* 片元 VM：临时寄存器每像素清零（r1 += 0.5 → 每个像素都是 0.5，而不是逐像素累加） */
+static void test_vm_temps_zeroed(gpu_core_t *c)
+{
+    struct {
+        espgpu_load_program_t h;
+        espgpu_vm_insn_t code[3];
+    } prog;
+    memset(&prog, 0, sizeof(prog));
+    const uint8_t R1 = ESPGPU_VM_REG(ESPGPU_VM_BANK_TEMP, 1);
+    const uint8_t C0 = ESPGPU_VM_REG(ESPGPU_VM_BANK_CONST, 0);
+    const uint8_t ID = ESPGPU_VM_SWZ_IDENTITY;
+    prog.code[0] = I(ESPGPU_VM_ADD, R1, 0xF, R1, C0, 0, ID, ID, 0);
+    prog.code[1] = I(ESPGPU_VM_MOV, ESPGPU_VM_OUT, 0x7, R1, 0, 0, ID, 0, 0);
+    prog.code[2] = I(ESPGPU_VM_END, 0, 0, 0, 0, 0, 0, 0, 0);
+    prog.h.program_id = 5;
+    prog.h.varying_count = 0;
+    prog.h.insn_count = 3;
+    push(ESPGPU_OP_LOAD_PROGRAM, 0, &prog, sizeof(espgpu_load_program_t) + 3 * 12);
+    struct {
+        espgpu_set_uniforms_t h;
+        float v[4];
+    } un = {{0, 1, 0}, {0.5f, 0.5f, 0.5f, 0.5f}};
+    push(ESPGPU_OP_SET_UNIFORMS, 0, &un, sizeof(un));
+    clear(rgb(0, 0, 0));
+    mat(ESPGPU_MATRIX_MVP, k_ident);
+    layout_pos(2);
+    uint8_t body[sizeof(espgpu_pipeline_t) + sizeof(espgpu_pipeline_fog_t) +
+                 sizeof(espgpu_pipeline_ext_t)];
+    espgpu_pipeline_t p;
+    memset(&p, 0, sizeof(p));
+    p.mask = ESPGPU_PS_SHADE | ESPGPU_PS_DEPTH | ESPGPU_PS_BLEND;
+    p.shade_mode = ESPGPU_SHADE_PROGRAM;
+    espgpu_pipeline_fog_t fg = {0, 1, 1};
+    espgpu_pipeline_ext_t e;
+    memset(&e, 0, sizeof(e));
+    e.color_write = 1;
+    e.program_id = 5;
+    e.shade_model = 1;
+    memcpy(body, &p, sizeof(p));
+    memcpy(body + sizeof(p), &fg, sizeof(fg));
+    memcpy(body + sizeof(p) + sizeof(fg), &e, sizeof(e));
+    push(ESPGPU_OP_PIPELINE, 0, body, sizeof(body));
+    const float full[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+    draw_raw(ESPGPU_PRIM_QUADS, full, 4, 8);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    expect("vm temps zeroed per pixel", 160, 100, 128, 128, 128, 8);
+}
+
+/* 调试视图：TILES 显示每 tile 三角形数；改分辨率后调试视图仍有效 */
+static void test_debug_views(gpu_core_t *c)
+{
+    mat(ESPGPU_MATRIX_MVP, k_ident);
+    layout_pos(2);
+    pipeline_ex(ESPGPU_SHADE_FLAT, 0, 0, 0, 0, 0);
+    set_color(255, 255, 255, 255);
+    gpu_core_set_debug_view(c, ESPGPU_DEBUG_VIEW_TILES);
+    clear(rgb(0, 0, 0));
+    /* tile (0,0)：30 个小三角形；tile (1,0)：一个盖满的大三角形 */
+    static float tri[32 * 6];
+    int n = 0;
+    for (int k = 0; k < 30; k++) {
+        const float px = 10 + (k % 6) * 8, py = 20 + (k / 6) * 8;
+        const float p[3][2] = {{px, py}, {px + 4, py}, {px, py + 4}};
+        for (int m = 0; m < 3; m++) {
+            tri[n * 2] = p[m][0] / 160.0f - 1;
+            tri[n * 2 + 1] = 1 - p[m][1] / 100.0f;
+            n++;
+        }
+    }
+    const float big[3][2] = {{64, 0}, {64 + 200, 0}, {64, 200}};
+    for (int m = 0; m < 3; m++) {
+        tri[n * 2] = big[m][0] / 160.0f - 1;
+        tri[n * 2 + 1] = 1 - big[m][1] / 100.0f;
+        n++;
+    }
+    draw_raw(ESPGPU_PRIM_TRIANGLES, tri, n, 8);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    {
+        const uint16_t a = g_frame[4 * g_w + 30], b = g_frame[4 * g_w + 100];
+        if ((a >> 11) < 28 || (b >> 11) > 4) {
+            printf("FAIL tiles view: busy tile %04x, single-tri tile %04x\n", a, b);
+            g_fails++;
+        }
+    }
+
+    gpu_core_set_debug_view(c, ESPGPU_DEBUG_VIEW_OVERDRAW);
+    gpu_core_set_size(c, 160, 100);
+    clear(rgb(0, 0, 0));
+    const float full[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+    draw_raw(ESPGPU_PRIM_QUADS, full, 4, 8);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    /* overdraw = 1 → heat(1, 8)：深蓝，不是白色原画面 */
+    if (g_w != 160 || g_frame[50 * g_w + 80] == 0xFFFF) {
+        printf("FAIL debug view lost after resize (%dx%d, %04x)\n", g_w, g_h, g_frame[50 * g_w + 80]);
+        g_fails++;
+    }
+    gpu_core_set_debug_view(c, ESPGPU_DEBUG_VIEW_NONE);
+    gpu_core_set_size(c, 320, 200);
+}
+
+/* 深度只测不写的批次跳过写回后，深度缓冲内容仍然保留 */
+static void test_depth_persist(gpu_core_t *c)
+{
+    mat(ESPGPU_MATRIX_MVP, k_ident);
+    layout_pos(3);
+    clear(rgb(0, 0, 0));
+    pipeline_ex(ESPGPU_SHADE_FLAT, 1, 1, 0, 0, 0);
+    const float nearq[4][3] = {{-1, -1, -0.5f}, {1, -1, -0.5f}, {1, 1, -0.5f}, {-1, 1, -0.5f}};
+    const float farq[4][3] = {{-1, -1, 0.5f}, {1, -1, 0.5f}, {1, 1, 0.5f}, {-1, 1, 0.5f}};
+    set_color(255, 0, 0, 255);
+    draw_raw(ESPGPU_PRIM_QUADS, nearq, 4, 12);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    pipeline_ex(ESPGPU_SHADE_FLAT, 1, 0, 0, 0, 0); /* 只测不写 */
+    set_color(0, 255, 0, 255);
+    draw_raw(ESPGPU_PRIM_QUADS, farq, 4, 12);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    pipeline_ex(ESPGPU_SHADE_FLAT, 1, 1, 0, 0, 0);
+    set_color(0, 0, 255, 255);
+    draw_raw(ESPGPU_PRIM_QUADS, farq, 4, 12);
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+    expect("depth persists across test-only pass", 160, 100, 255, 0, 0, 8);
+}
+
+/* 坏输入：不能崩、不能越界、不能泄漏 */
+static void test_bad_input(gpu_core_t *c)
+{
+    espgpu_stats_t st0, st1;
+    memset(&st0, 0, sizeof(st0));
+    gpu_core_fill_stats(c, &st0);
+
+    /* 1. RGB565 首片 + RGBA4444 续片（旧代码写空的 alpha 平面） */
+    {
+        uint8_t body[sizeof(espgpu_upload_texture_t) + 64];
+        espgpu_upload_texture_t u;
+        memset(&u, 0, sizeof(u));
+        u.id = 50;
+        u.width = 8;
+        u.height = 8;
+        u.total_len = 128;
+        u.format = ESPGPU_FMT_RGB565;
+        memset(body, 0x5A, sizeof(body));
+        memcpy(body, &u, sizeof(u));
+        push(ESPGPU_OP_UPLOAD_TEXTURE, 0, body, (uint32_t)sizeof(u) + 64);
+        u.offset = 64;
+        u.format = ESPGPU_FMT_RGBA4444;
+        memcpy(body, &u, sizeof(u));
+        push(ESPGPU_OP_UPLOAD_TEXTURE, 0, body, (uint32_t)sizeof(u) + 64);
+        submit(c);
+    }
+    /* 2. 巨大的 COPY_TO_TEXTURE（32 位 size_t 上 w*h*2 回绕）、id 0 的调色板 */
+    {
+        espgpu_fbo_t f;
+        memset(&f, 0, sizeof(f));
+        f.action = ESPGPU_FBO_COPY_TO_TEXTURE;
+        f.texture_id = 51;
+        f.width = 46341;
+        f.height = 46341;
+        push(ESPGPU_OP_FBO, 0, &f, sizeof(f));
+        uint8_t pb[8 + 3];
+        espgpu_tex_palette_t pal = {0, 0, 1};
+        memcpy(pb, &pal, 8);
+        pb[8] = pb[9] = 0;
+        pb[10] = 255;
+        push(ESPGPU_OP_TEX_PALETTE, 0, pb, sizeof(pb));
+        submit(c);
+    }
+    memset(&st1, 0, sizeof(st1));
+    gpu_core_fill_stats(c, &st1);
+    if (st1.tex_resident != st0.tex_resident + 1) { /* 只有 50 */
+        printf("FAIL bad input created textures: %u -> %u\n", st0.tex_resident, st1.tex_resident);
+        g_fails++;
+    }
+    /* 3. 属性越过 stride：最后一个顶点不能读出命令缓冲（ASan 下验证） */
+    {
+        layout_pos(3);
+        submit(c);
+        espgpu_vertex_layout_t l;
+        memset(&l, 0, sizeof(l));
+        l.stride = 8;
+        l.attrib_count = 1;
+        l.attribs[0] = (espgpu_vertex_attrib_t){ESPGPU_ATTR_POSITION, ESPGPU_TYPE_F32, 3, 0, 0, 0, 0};
+        push(ESPGPU_OP_VERTEX_LAYOUT, 0, &l, sizeof(l));
+        submit(c);
+        const uint32_t n = (uint32_t)(4 + sizeof(espgpu_draw_t) + 3 * 8);
+        uint8_t *cmd = (uint8_t *)malloc(n);
+        espgpu_cmd_t h = {ESPGPU_OP_DRAW, ESPGPU_DRAWF_3D, (uint16_t)(n - 4)};
+        espgpu_draw_t d;
+        memset(&d, 0, sizeof(d));
+        d.prim = ESPGPU_PRIM_TRIANGLES;
+        d.vertex_count = 3;
+        memcpy(cmd, &h, 4);
+        memcpy(cmd + 4, &d, sizeof(d));
+        memset(cmd + 4 + sizeof(d), 0, 24);
+        gpu_core_exec(c, cmd, n);
+        free(cmd);
+    }
+    push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+    submit(c);
+}
+
 int main(void)
 {
     gpu_core_config_t cfg = {2u << 20, 4u << 20, 1u << 20, 512};
@@ -501,6 +945,13 @@ int main(void)
         scene_3d(c, name, false);
     }
     gpu_core_set_debug_view(c, 0);
+    test_coverage(c);
+    test_persp_span_end(c);
+    test_pipeline_rebinds_2d(c);
+    test_vm_temps_zeroed(c);
+    test_debug_views(c);
+    test_depth_persist(c);
+    test_bad_input(c);
     espgpu_stats_t st;
     memset(&st, 0, sizeof(st));
     gpu_core_fill_stats(c, &st);

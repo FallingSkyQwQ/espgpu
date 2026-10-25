@@ -258,7 +258,9 @@ static void cmd_fbo(gpu_core_t *c, const espgpu_fbo_t *f)
         if (t->bottom_up) {
             y = t->h - (y + h);
         }
-        if (w <= 0 || h <= 0) {
+        /* 尺寸上限：32 位 size_t 上 w*h*2 会回绕成小分配再整块写入 */
+        if (w <= 0 || h <= 0 || f->texture_id == 0 || w > c->cfg.max_texture_dim ||
+            h > c->cfg.max_texture_dim) {
             break;
         }
         gp_tex_t *tex = gp_tex_make_rgb565(c, f->texture_id, (uint16_t)w, (uint16_t)h);
@@ -551,6 +553,7 @@ static void do_present(gpu_core_t *c)
     if (c->dbg) {
         memset(c->dbg, 0, (size_t)c->screen.w * c->screen.h);
     }
+    memset(c->dbg_tile_tris, 0, sizeof(c->dbg_tile_tris));
     c->frame++;
     c->last_fill_frame = c->last_fill;
     c->last_fill = 0;
@@ -599,7 +602,8 @@ static void reset_state(gpu_core_t *c)
 
 gpu_core_t *gpu_core_create(const gpu_core_config_t *cfg, const gpu_core_cb_t *cb)
 {
-    gpu_core_t *c = (gpu_core_t *)gp_alloc_big(sizeof(gpu_core_t));
+    /* 约 4.5 KB，每个热路径都在读（状态、分箱、worker、矩阵）：放内部 SRAM，失败退回 PSRAM */
+    gpu_core_t *c = (gpu_core_t *)gp_alloc_fast(sizeof(gpu_core_t));
     if (c == NULL) {
         return NULL;
     }
@@ -679,6 +683,8 @@ void gpu_core_destroy(gpu_core_t *c)
     gp_free(c);
 }
 
+static void dbg_ensure(gpu_core_t *c);
+
 bool gpu_core_set_size(gpu_core_t *c, uint16_t w, uint16_t h)
 {
     if (w == 0 || h == 0 || w > GP_MAX_W || h > GP_MAX_H) {
@@ -707,20 +713,32 @@ bool gpu_core_set_size(gpu_core_t *c, uint16_t w, uint16_t h)
     gp_log(GP_LOG_INFO, "screen %ux%u (%s)", w, h,
            c->screen.color_fast ? "fast memory, direct raster" : "slow memory, tiled copy");
     set_target(c, &c->screen);
+    dbg_ensure(c); /* 调试视图开着时按新尺寸重建，否则改分辨率后视图静默失效 */
     return true;
+}
+
+/** 调试视图需要的屏幕大小缓冲（改分辨率后也要重建） */
+static void dbg_ensure(gpu_core_t *c)
+{
+    if (c->debug_view == ESPGPU_DEBUG_VIEW_NONE || c->screen.color == NULL) {
+        return;
+    }
+    const size_t n = (size_t)c->screen.w * c->screen.h;
+    if (c->dbg == NULL) {
+        c->dbg = (uint8_t *)gp_alloc_big(n);
+        if (c->dbg) {
+            memset(c->dbg, 0, n);
+        }
+    }
+    if (c->dbg_img == NULL) {
+        c->dbg_img = (uint16_t *)gp_alloc_big(n * 2);
+    }
 }
 
 void gpu_core_set_debug_view(gpu_core_t *c, uint8_t view)
 {
     c->debug_view = view < ESPGPU_DEBUG_VIEW_COUNT ? view : 0;
-    if (c->debug_view && c->dbg == NULL) {
-        const size_t n = (size_t)c->screen.w * c->screen.h;
-        c->dbg = (uint8_t *)gp_alloc_big(n);
-        c->dbg_img = (uint16_t *)gp_alloc_big(n * 2);
-        if (c->dbg) {
-            memset(c->dbg, 0, n);
-        }
-    }
+    dbg_ensure(c);
 }
 
 uint32_t gpu_core_frame_counter(gpu_core_t *c)
@@ -957,6 +975,7 @@ static void exec_one(gpu_core_t *c, const espgpu_cmd_t *cmd, const uint8_t *body
         if (size >= sizeof(espgpu_pipeline_t)) {
             apply_pipeline(c, body, size);
             c->rstate_off = 0;
+            c->rstate_2d_off = 0; /* PS_TEXTURE 改的绑定 2D 路径也在用 */
         }
         break;
 
@@ -1034,12 +1053,16 @@ static void exec_one(gpu_core_t *c, const espgpu_cmd_t *cmd, const uint8_t *body
             espgpu_draw_t d;
             memcpy(&d, body, sizeof(d));
             const uint64_t t0 = gp_time_us();
+            const uint32_t r0 = c->st_raster_us;
             if (cmd->flags & ESPGPU_DRAWF_3D) {
                 gp_draw3d(c, &d, body + sizeof(d), size - (uint32_t)sizeof(d));
             } else {
                 gp_draw2d(c, &d, body + sizeof(d), size - (uint32_t)sizeof(d));
             }
-            c->st_tnl_us += (uint32_t)(gp_time_us() - t0);
+            /* arena 满时绘制中途会刷新光栅：那部分已记进 t_raster，别再算进 T&L */
+            const uint32_t dt = (uint32_t)(gp_time_us() - t0);
+            const uint32_t dr = c->st_raster_us - r0;
+            c->st_tnl_us += dt > dr ? dt - dr : 0;
             c->st_draws++;
         }
         break;
@@ -1155,6 +1178,7 @@ static void exec_one(gpu_core_t *c, const espgpu_cmd_t *cmd, const uint8_t *body
             p->count = (uint16_t)n;
             p->varyings = h.varying_count;
             p->valid = gp_vm_validate(p->code, n) ? 1 : 0;
+            p->ntemps = p->valid ? gp_vm_temps_used(p->code, n) : 0;
             if (!p->valid) {
                 gp_log(GP_LOG_WARN, "program %u rejected by validator", h.program_id);
             }

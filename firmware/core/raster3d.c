@@ -6,13 +6,15 @@
  *   2. 依序执行分箱记录：CLEAR 矩形、三角形
  *   3. 写回
  *
- * 三角形按行求跨度（边函数解析求交，不逐像素做内测试），跨度内每 8 像素做一次
- * 精确透视除法、中间线性插值（经典的 Quake 式分段透视校正）。
+ * 三角形按行求跨度（边函数解析求交，不逐像素做内测试；tile 内整体在内侧的边不再逐行看），
+ * 跨度内每 8 像素做一次精确透视除法、中间线性插值（经典的 Quake 式分段透视校正）；
+ * 段终点即下一段起点，1/w 每段只除一次，最后一段终点取跨度末像素（不外推到三角形外）。
  *
  * 内层循环按"状态组合"分三条：
- *   fill   —— 常量色、不混合、无深度：UI / 背景
+ *   fill   —— 常量色（含无纹理的 TEX_MOD_COLOR）、不混合、无深度：UI / 背景 / 2D 纯色块
  *   fast   —— 单纹理（RGB565）× 常量色、最近邻、不混合、无 alpha 测试 / 雾，可带深度：
- *             2D 背景与 Doom 墙面地面的主路径
+ *             2D 背景与 Doom 墙面地面的主路径。纹理坐标 16.16 定点步进，
+ *             REPEAT + 2 的幂尺寸时 texel 下标直接取掩码
  *   generic—— 其它一切（多纹理、混合、雾、alpha 测试、片元 VM）
  */
 
@@ -30,41 +32,60 @@ typedef struct {
     uint16_t *cbuf;           /* tile 左上角对应的颜色指针 */
     int cstride;
     uint16_t *dbuf;           /* tile 深度（stride = GP_TILE） */
-    bool depth_dirty;
     uint8_t *dbg;             /* 屏幕目标的调试缓冲，可空 */
     uint8_t dbg_mode;
 } tile_ctx_t;
 
 /* ── 混合 ─────────────────────────────────────────────────────────── */
 
-static inline uint32_t blend_factor(uint8_t f, uint32_t src_c, uint32_t dst_c, uint32_t sa)
+/**
+ * 混合因子的无分支形式：f = base ± sel，sel ∈ {0, 源色, 目标色, 源 alpha}。
+ * 每个三角形算一次，内层循环里不再对因子 switch（取值与 GL 因子定义逐一相同）。
+ */
+typedef struct {
+    uint32_t base, msc, mdc, msa, neg;
+} bfac_t;
+
+static void bfac_init(bfac_t *f, uint8_t factor)
 {
-    switch (f) {
-    case ESPGPU_BLEND_ZERO: return 0;
-    case ESPGPU_BLEND_ONE: return 255;
-    case ESPGPU_BLEND_SRC_COLOR: return src_c;
-    case ESPGPU_BLEND_ONE_MINUS_SRC_COLOR: return 255 - src_c;
-    case ESPGPU_BLEND_DST_COLOR: return dst_c;
-    case ESPGPU_BLEND_ONE_MINUS_DST_COLOR: return 255 - dst_c;
-    case ESPGPU_BLEND_SRC_ALPHA: return sa;
-    case ESPGPU_BLEND_ONE_MINUS_SRC_ALPHA: return 255 - sa;
-    case ESPGPU_BLEND_DST_ALPHA: return 255; /* 帧缓冲无 alpha，视为 1 */
-    case ESPGPU_BLEND_ONE_MINUS_DST_ALPHA: return 0;
-    default: return 255;
+    f->base = 0;
+    f->msc = f->mdc = f->msa = 0;
+    f->neg = 0;
+    switch (factor) {
+    case ESPGPU_BLEND_ZERO: break;
+    case ESPGPU_BLEND_SRC_COLOR: f->msc = ~0u; break;
+    case ESPGPU_BLEND_ONE_MINUS_SRC_COLOR: f->base = 255; f->msc = ~0u; f->neg = ~0u; break;
+    case ESPGPU_BLEND_DST_COLOR: f->mdc = ~0u; break;
+    case ESPGPU_BLEND_ONE_MINUS_DST_COLOR: f->base = 255; f->mdc = ~0u; f->neg = ~0u; break;
+    case ESPGPU_BLEND_SRC_ALPHA: f->msa = ~0u; break;
+    case ESPGPU_BLEND_ONE_MINUS_SRC_ALPHA: f->base = 255; f->msa = ~0u; f->neg = ~0u; break;
+    case ESPGPU_BLEND_ONE_MINUS_DST_ALPHA: break;      /* 帧缓冲无 alpha：1 - 1 = 0 */
+    default: f->base = 255; break;                     /* ONE / DST_ALPHA / 未知 */
     }
 }
 
-static inline uint32_t blend_ch(const gp_rstate_t *s, uint32_t sc, uint32_t dc, uint32_t sa)
+static inline uint32_t bfac(const bfac_t *f, uint32_t sc, uint32_t dc, uint32_t sa)
 {
-    const uint32_t a = gp_mul8(sc, blend_factor(s->bsrc, sc, dc, sa));
-    const uint32_t b = gp_mul8(dc, blend_factor(s->bdst, sc, dc, sa));
+    const uint32_t sel = (sc & f->msc) | (dc & f->mdc) | (sa & f->msa);
+    return f->base + ((sel ^ f->neg) - f->neg);
+}
+
+typedef struct {
+    bfac_t src, dst;
+    uint8_t op;
+} blend_t;
+
+static inline uint32_t blend_ch(const blend_t *b, uint32_t sc, uint32_t dc, uint32_t sa)
+{
+    const uint32_t x = gp_mul8(sc, bfac(&b->src, sc, dc, sa));
+    const uint32_t y = gp_mul8(dc, bfac(&b->dst, sc, dc, sa));
     int32_t r;
-    switch (s->bop) {
-    case ESPGPU_BLEND_OP_SUB: r = (int32_t)a - (int32_t)b; break;
-    case ESPGPU_BLEND_OP_REV_SUB: r = (int32_t)b - (int32_t)a; break;
+    switch (b->op) {
+    case ESPGPU_BLEND_OP_SUB: r = (int32_t)x - (int32_t)y; break;
+    case ESPGPU_BLEND_OP_REV_SUB: r = (int32_t)y - (int32_t)x; break;
     case ESPGPU_BLEND_OP_MIN: r = (int32_t)(sc < dc ? sc : dc); break;
     case ESPGPU_BLEND_OP_MAX: r = (int32_t)(sc > dc ? sc : dc); break;
-    default: r = (int32_t)(a + b); break;
+    default: r = (int32_t)(x + y); break;
     }
     return (uint32_t)gp_clampi(r, 0, 255);
 }
@@ -120,51 +141,115 @@ static inline uint32_t shade_fixed(uint8_t mode, uint32_t C, uint32_t T0, uint32
     }
 }
 
+/** 夹到 [0,1]；NaN（VM 输出 / 病态插值）当 0，免得后面的 float→int 是 UB */
+static inline float unit_f(float v)
+{
+    return v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;
+}
+
 static inline uint32_t float_rgba(const float *v)
 {
-    const int r = (int)(gp_clampf(v[0], 0.0f, 1.0f) * 255.0f + 0.5f);
-    const int g = (int)(gp_clampf(v[1], 0.0f, 1.0f) * 255.0f + 0.5f);
-    const int b = (int)(gp_clampf(v[2], 0.0f, 1.0f) * 255.0f + 0.5f);
-    const int a = (int)(gp_clampf(v[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+    const int r = (int)(unit_f(v[0]) * 255.0f + 0.5f);
+    const int g = (int)(unit_f(v[1]) * 255.0f + 0.5f);
+    const int b = (int)(unit_f(v[2]) * 255.0f + 0.5f);
+    const int a = (int)(unit_f(v[3]) * 255.0f + 0.5f);
     return ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+/** 深度 float → 16 位：范围内与 clamp((int)z) 相同，超范围 / NaN 不触发 float→int 的 UB */
+static inline uint32_t z16(float z)
+{
+    if (!(z > 0.0f)) return 0;
+    if (z >= 65535.0f) return 65535;
+    return (uint32_t)z;
 }
 
 /* ── 跨度求解 ─────────────────────────────────────────────────────── */
 
-/** 在 [lo, hi] 内求三条边都 >= 0 的连续跨度，空则返回 false */
-static inline bool row_span(const gp_tri_t *t, int y, int lo, int hi, int *out_l, int *out_r)
+/**
+ * 一个三角形在一个 tile 矩形 [lo,hi]×[y0,y1] 内的逐行跨度。
+ *
+ * 初始化时把三条边分成三类：整个矩形都在内侧（以后不再看）、整个在外侧（整块跳过）、
+ * 穿过矩形（"活跃"）。逐行只处理活跃边：E(x=0) 每行加 b（int64 加法），起点估计
+ * est = -E/a 每行加一个常量（float 加法），再用精确的整数边函数修正 ±1。
+ * 这样每行不再有 int64→float 转换、ceilf/floorf 库调用；结果与逐行解析求解逐像素相同。
+ */
+typedef struct {
+    int n;
+    int lo, hi;
+    int32_t a[3];
+    int32_t b[3];
+    int64_t E[3];     /* 当前行 x=0 处的边函数值 */
+    float est[3];     /* 当前行的交点估计 -E/a */
+    float estep[3];
+} span_t;
+
+GP_HOT static inline bool span_init(span_t *sp, const gp_tri_t *t, int lo, int hi, int y0, int y1)
 {
-    int L = lo, R = hi;
+    sp->n = 0;
+    sp->lo = lo;
+    sp->hi = hi;
+    if (lo > hi || y0 > y1) {
+        return false;
+    }
+    const int64_t rw = hi - lo, rh = y1 - y0;
     for (int k = 0; k < 3; k++) {
-        const int64_t a = t->ea[k];
-        const int64_t Ey = (int64_t)t->eb[k] * y + t->ec[k];
-        if (a == 0) {
-            if (Ey < 0) {
-                return false;
-            }
+        const int64_t a = t->ea[k], b = t->eb[k];
+        const int64_t e00 = a * lo + b * y0 + t->ec[k];
+        const int64_t emin = e00 + (a < 0 ? a * rw : 0) + (b < 0 ? b * rh : 0);
+        const int64_t emax = e00 + (a > 0 ? a * rw : 0) + (b > 0 ? b * rh : 0);
+        if (emax < 0) {
+            return false; /* 整个矩形在这条边外侧 */
+        }
+        if (emin >= 0) {
+            continue;     /* 整个矩形在内侧 */
+        }
+        const int i = sp->n++;
+        sp->a[i] = t->ea[k];
+        sp->b[i] = t->eb[k];
+        sp->E[i] = b * y0 + t->ec[k];
+        sp->est[i] = a != 0 ? -(float)sp->E[i] * t->inv_ea[k] : 0.0f;
+        sp->estep[i] = a != 0 ? -(float)b * t->inv_ea[k] : 0.0f;
+    }
+    return true;
+}
+
+/** 当前行的跨度（空则返回 false），并前进到下一行。必须对 y0..y1 每一行依次调用。 */
+GP_HOT static inline bool span_next(span_t *sp, int *out_l, int *out_r)
+{
+    const int lo = sp->lo, hi = sp->hi;
+    int L = lo, R = hi;
+    bool ok = true;
+    for (int k = 0; k < sp->n; k++) {
+        const int64_t a = sp->a[k];
+        const int64_t Ey = sp->E[k];
+        float est = sp->est[k];
+        sp->E[k] = Ey + sp->b[k];
+        sp->est[k] = est + sp->estep[k];
+        if (!ok) {
             continue;
         }
-        float est = -(float)Ey * t->inv_ea[k];
-        if (est < (float)(lo - 1)) est = (float)(lo - 1);
+        if (a == 0) {
+            ok = Ey >= 0;
+            continue;
+        }
+        if (!(est > (float)(lo - 1))) est = (float)(lo - 1);
         if (est > (float)(hi + 1)) est = (float)(hi + 1);
+        int x = (int)est;
         if (a > 0) {
-            int x = (int)ceilf(est);
             while (x <= hi && a * x + Ey < 0) x++;
             while (x > lo && a * (x - 1) + Ey >= 0) x--;
             if (x > L) L = x;
         } else {
-            int x = (int)floorf(est);
             while (x >= lo && a * x + Ey < 0) x--;
             while (x < hi && a * (x + 1) + Ey >= 0) x++;
             if (x < R) R = x;
         }
-        if (L > R) {
-            return false;
-        }
+        ok = L <= R;
     }
     *out_l = L;
     *out_r = R;
-    return L <= R;
+    return ok;
 }
 
 static inline float plane_at(const gp_plane_t *p, float x, float y)
@@ -172,35 +257,53 @@ static inline float plane_at(const gp_plane_t *p, float x, float y)
     return p->c + p->dx * x + p->dy * y;
 }
 
+/** 一行的深度起点：起点 / 终点超出 ±1e9（病态平面）时把这一行压平，避免累加出 inf */
+GP_HOT static inline void row_z(const gp_tri_t *t, int L, int R, float fy, float *z, float *dz)
+{
+    *z = plane_at(&t->z, (float)L, fy);
+    *dz = t->z.dx;
+    if (!(fabsf(*z) < 1e9f) || !(fabsf(*dz) * (float)(R - L + 1) < 1e9f)) {
+        *z = gp_clampf(*z, 0.0f, 65535.0f); /* NaN 时 clampf 原样返回，z16 再兜底 */
+        *dz = 0.0f;
+    }
+}
+
+/* 1/n，n = 0..SEG（常量折叠，与运行时 1.0f / n 逐位相同） */
+static const float k_inv[SEG + 1] = {0.0f, 1.0f / 1, 1.0f / 2, 1.0f / 3, 1.0f / 4,
+                                     1.0f / 5, 1.0f / 6, 1.0f / 7, 1.0f / 8};
+
 /* ── 通用路径 ─────────────────────────────────────────────────────── */
 
 GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const gp_rstate_t *s)
 {
-    gpu_core_t *c = tc->c;
     const int n = t->n_att;
     const bool affine = (t->flags & GP_TF_AFFINE) != 0;
-    const bool const_color = (t->flags & GP_TF_CONST_COLOR) != 0;
     const bool vm = (t->flags & GP_TF_VM) != 0 && s->vm && s->prog;
 
     const int o_col = t->o_col, o_t0 = t->o_t0, o_t1 = t->o_t1, o_fog = t->o_fog;
-    (void)const_color;
 
     const uint32_t Cconst = ((uint32_t)t->const_rgba[3] << 24) | ((uint32_t)t->const_rgba[0] << 16) |
                             ((uint32_t)t->const_rgba[1] << 8) | t->const_rgba[2];
     const bool dtest = s->depth_test != 0;
     const bool dwrite = s->depth_write != 0;
-    const uint8_t dfunc = s->depth_func;
+    const uint32_t zmask = gp_cmp_mask(s->depth_func);
     const bool cwrite = s->color_write != 0;
     const bool blend = s->blend != 0;
+    blend_t bl;
+    bfac_init(&bl.src, s->bsrc);
+    bfac_init(&bl.dst, s->bdst);
+    bl.op = s->bop;
     const bool atest = s->alpha_test != 0;
-    const uint8_t afunc = s->alpha_func;
+    const uint32_t amask = gp_cmp_mask(s->alpha_func);
     const uint32_t aref = s->alpha_ref;
     const bool fog = s->fog && o_fog >= 0;
-    const gp_sampler_t *s0 = s->smp[0].tex ? &s->smp[0] : NULL;
-    const gp_sampler_t *s1 = s->smp[1].tex ? &s->smp[1] : NULL;
+    const uint32_t fog_r = s->fog_r, fog_g = s->fog_g, fog_b = s->fog_b;
+    const gp_sampler_t *s0 = (s->smp[0].tex && o_t0 >= 0) ? &s->smp[0] : NULL;
+    const gp_sampler_t *s1 = (s->smp[1].tex && o_t1 >= 0) ? &s->smp[1] : NULL;
+    const bool lin0 = s0 && s0->filter == ESPGPU_FILTER_LINEAR;
+    const bool lin1 = s1 && s1->filter == ESPGPU_FILTER_LINEAR;
     const uint8_t mode = s->shade;
-    uint8_t *dbg = tc->dbg;
-    const uint8_t dbg_mode = tc->dbg_mode;
+    uint8_t *dbg = tc->dbg_mode == ESPGPU_DEBUG_VIEW_OVERDRAW ? tc->dbg : NULL;
     const int sw = tc->tg->w;
 
     const int y0 = t->by0 > tc->ty0 ? t->by0 : tc->ty0;
@@ -208,62 +311,86 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
     const int lo = t->bx0 > tc->tx0 ? t->bx0 : tc->tx0;
     const int hi = t->bx1 < tc->tx1 ? t->bx1 : tc->tx1;
 
+    span_t sp;
+    if (!span_init(&sp, t, lo, hi, y0, y1)) {
+        return;
+    }
+
     float va[GP_MAX_ATT];
-    float vs[GP_MAX_ATT];
     float vstep[GP_MAX_ATT];
+    float ve[GP_MAX_ATT];   /* 段终点的属性值，下一段直接接着用 */
     float vmv[ESPGPU_VM_VARYINGS * 4];
+    const int nv = (o_fog >= 0 ? n - 1 : n); /* VM：雾因子在最后，不是 varying */
+    if (vm) {
+        memset(vmv, 0, sizeof(vmv)); /* 未用到的 varying 恒为 0，只需清一次 */
+    }
     uint32_t frags = 0;
 
     for (int y = y0; y <= y1; y++) {
         int L, R;
-        if (!row_span(t, y, lo, hi, &L, &R)) {
+        if (!span_next(&sp, &L, &R)) {
             continue;
         }
         uint16_t *crow = tc->cbuf + (size_t)(y - tc->ty0) * tc->cstride - tc->tx0;
         uint16_t *drow = tc->dbuf ? tc->dbuf + (size_t)(y - tc->ty0) * GP_TILE - tc->tx0 : NULL;
         const float fy = (float)y;
-        float z = plane_at(&t->z, (float)L, fy);
-        const float dz = t->z.dx;
+        float z, dz;
+        row_z(t, L, R, fy, &z, &dz);
+        bool have_end = false;
 
         for (int xs = L; xs <= R; xs += SEG) {
             const int len = (R - xs + 1) < SEG ? (R - xs + 1) : SEG;
             const float fx = (float)xs;
             if (affine) {
                 for (int k = 0; k < n; k++) {
-                    vs[k] = plane_at(&t->att[k], fx, fy);
+                    va[k] = plane_at(&t->att[k], fx, fy);
                     vstep[k] = t->att[k].dx;
                 }
             } else {
-                const float iw_s = plane_at(&t->iw, fx, fy);
-                const float iw_e = plane_at(&t->iw, fx + (float)len, fy);
-                const float ws = iw_s != 0.0f ? 1.0f / iw_s : 0.0f;
-                const float we = iw_e != 0.0f ? 1.0f / iw_e : 0.0f;
-                const float inv_len = 1.0f / (float)len;
-                for (int k = 0; k < n; k++) {
-                    const float as = plane_at(&t->att[k], fx, fy) * ws;
-                    const float ae = plane_at(&t->att[k], fx + (float)len, fy) * we;
-                    vs[k] = as;
-                    vstep[k] = (ae - as) * inv_len;
+                if (have_end) {
+                    for (int k = 0; k < n; k++) {
+                        va[k] = ve[k];
+                    }
+                } else {
+                    const float iw_s = plane_at(&t->iw, fx, fy);
+                    const float ws = iw_s != 0.0f ? 1.0f / iw_s : 0.0f;
+                    for (int k = 0; k < n; k++) {
+                        va[k] = plane_at(&t->att[k], fx, fy) * ws;
+                    }
                 }
-            }
-            for (int k = 0; k < n; k++) {
-                va[k] = vs[k];
+                /* 段终点：中间段取下一段起点（可复用，1/w 每段只除一次）；
+                 * 最后一段取 R 本身——R+1 在三角形外，1/w 外推可能接近 0 或变负，把整段插坏 */
+                const int steps = (xs + SEG <= R) ? SEG : len - 1;
+                if (steps > 0) {
+                    const float fe = fx + (float)steps;
+                    const float iw_e = plane_at(&t->iw, fe, fy);
+                    const float we = iw_e != 0.0f ? 1.0f / iw_e : 0.0f;
+                    const float inv_len = k_inv[steps];
+                    for (int k = 0; k < n; k++) {
+                        const float ae = plane_at(&t->att[k], fe, fy) * we;
+                        vstep[k] = (ae - va[k]) * inv_len;
+                        ve[k] = ae;
+                    }
+                } else {
+                    for (int k = 0; k < n; k++) {
+                        vstep[k] = 0.0f;
+                    }
+                }
+                have_end = true;
             }
 
             for (int i = 0; i < len; i++, z += dz) {
                 const int x = xs + i;
                 uint32_t zi = 0;
                 if (dtest || dwrite) {
-                    zi = (uint32_t)gp_clampi((int)z, 0, 65535);
+                    zi = z16(z);
                 }
-                if (dtest && !gp_cmp(dfunc, zi, drow[x])) {
+                if (dtest && !gp_cmp_m(zmask, zi, drow[x])) {
                     goto next;
                 }
 
                 uint32_t out;
                 if (vm) {
-                    memset(vmv, 0, sizeof(vmv));
-                    const int nv = (o_fog >= 0 ? n - 1 : n);
                     memcpy(vmv, va, sizeof(float) * (size_t)nv);
                     vmv[24] = (float)x + 0.5f;
                     vmv[25] = fy + 0.5f;
@@ -276,23 +403,28 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
                     out = float_rgba(o);
                 } else {
                     const uint32_t C = o_col >= 0 ? float_rgba(&va[o_col]) : Cconst;
-                    const uint32_t T0 =
-                        (s0 && o_t0 >= 0) ? gp_sample(s0, va[o_t0], va[o_t0 + 1]) : 0xFFFFFFFFu;
-                    const uint32_t T1 =
-                        (s1 && o_t1 >= 0) ? gp_sample(s1, va[o_t1], va[o_t1 + 1]) : 0xFFFFFFFFu;
+                    uint32_t T0 = 0xFFFFFFFFu, T1 = 0xFFFFFFFFu;
+                    if (s0) {
+                        T0 = lin0 ? gp_sample_linear(s0, va[o_t0], va[o_t0 + 1])
+                                  : gp_sample_nearest(s0, va[o_t0], va[o_t0 + 1]);
+                    }
+                    if (s1) {
+                        T1 = lin1 ? gp_sample_linear(s1, va[o_t1], va[o_t1 + 1])
+                                  : gp_sample_nearest(s1, va[o_t1], va[o_t1 + 1]);
+                    }
                     out = shade_fixed(mode, C, T0, T1);
                 }
 
                 if (fog) {
-                    const uint32_t f = (uint32_t)(gp_clampf(va[o_fog], 0.0f, 1.0f) * 255.0f + 0.5f);
-                    const uint32_t r = gp_mul8((out >> 16) & 255, f) + gp_mul8(s->fog_r, 255 - f);
-                    const uint32_t g = gp_mul8((out >> 8) & 255, f) + gp_mul8(s->fog_g, 255 - f);
-                    const uint32_t b = gp_mul8(out & 255, f) + gp_mul8(s->fog_b, 255 - f);
+                    const uint32_t f = (uint32_t)(unit_f(va[o_fog]) * 255.0f + 0.5f);
+                    const uint32_t r = gp_mul8((out >> 16) & 255, f) + gp_mul8(fog_r, 255 - f);
+                    const uint32_t g = gp_mul8((out >> 8) & 255, f) + gp_mul8(fog_g, 255 - f);
+                    const uint32_t b = gp_mul8(out & 255, f) + gp_mul8(fog_b, 255 - f);
                     out = (out & 0xFF000000u) | ((r > 255 ? 255 : r) << 16) |
                           ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
                 }
 
-                if (atest && !gp_cmp(afunc, out >> 24, aref)) {
+                if (atest && !gp_cmp_m(amask, out >> 24, aref)) {
                     goto next;
                 }
 
@@ -300,9 +432,9 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
                     if (blend) {
                         const uint32_t d = gp_expand565(crow[x]);
                         const uint32_t sa = out >> 24;
-                        const uint32_t r = blend_ch(s, (out >> 16) & 255, (d >> 16) & 255, sa);
-                        const uint32_t g = blend_ch(s, (out >> 8) & 255, (d >> 8) & 255, sa);
-                        const uint32_t b = blend_ch(s, out & 255, d & 255, sa);
+                        const uint32_t r = blend_ch(&bl, (out >> 16) & 255, (d >> 16) & 255, sa);
+                        const uint32_t g = blend_ch(&bl, (out >> 8) & 255, (d >> 8) & 255, sa);
+                        const uint32_t b = blend_ch(&bl, out & 255, d & 255, sa);
                         crow[x] = gp_pack565(r, g, b);
                     } else {
                         crow[x] = gp_pack565((out >> 16) & 255, (out >> 8) & 255, out & 255);
@@ -312,8 +444,7 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
                     drow[x] = (uint16_t)zi;
                 }
                 frags++;
-                if (dbg && (dbg_mode == ESPGPU_DEBUG_VIEW_OVERDRAW ||
-                            dbg_mode == ESPGPU_DEBUG_VIEW_TILES)) {
+                if (dbg) {
                     uint8_t *p = &dbg[(size_t)y * sw + x];
                     if (*p < 255) (*p)++;
                 }
@@ -325,7 +456,6 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
         }
     }
     tc->w->fragments += frags;
-    (void)c;
 }
 
 /* ── 快速路径：RGB565 纹理 × 常量色、最近邻、不混合 ────────────── */
@@ -336,15 +466,23 @@ GP_HOT static void raster_tri_fast(tile_ctx_t *tc, const gp_tri_t *t, const gp_r
     const gp_tex_t *tex = sm->tex;
     const uint16_t *tpx = tex->px;
     const int tw = tex->w, th = tex->h;
-    const float ftw = (float)tw, fth = (float)th;
     const bool rep_u = sm->wrap_u != ESPGPU_WRAP_CLAMP;
     const bool rep_v = sm->wrap_v != ESPGPU_WRAP_CLAMP;
-    const bool mirror_u = sm->wrap_u == ESPGPU_WRAP_MIRROR;
-    const bool mirror_v = sm->wrap_v == ESPGPU_WRAP_MIRROR;
+    /* 起点折回的周期：REPEAT = n，MIRROR = 2n */
+    const float fpu = (float)(sm->wrap_u == ESPGPU_WRAP_MIRROR ? 2 * tw : tw);
+    const float fpv = (float)(sm->wrap_v == ESPGPU_WRAP_MIRROR ? 2 * th : th);
+    /* 两个方向都是 REPEAT 且尺寸是 2 的幂：texel 下标用掩码 */
+    const bool pow2 = sm->wrap_u == ESPGPU_WRAP_REPEAT && sm->wrap_v == ESPGPU_WRAP_REPEAT &&
+                      (tw & (tw - 1)) == 0 && (th & (th - 1)) == 0;
+    const uint32_t mask_u = (uint32_t)tw - 1u, mask_v = (uint32_t)th - 1u;
+    int shift_w = 0;
+    while ((1 << shift_w) < tw) {
+        shift_w++;
+    }
     const bool affine = (t->flags & GP_TF_AFFINE) != 0;
     const bool dtest = s->depth_test != 0;
     const bool dwrite = s->depth_write != 0;
-    const uint8_t dfunc = s->depth_func;
+    const uint32_t zmask = gp_cmp_mask(s->depth_func);
 
     const bool modulate = s->shade == ESPGPU_SHADE_TEX_MOD_COLOR &&
                           !(t->const_rgba[0] == 255 && t->const_rgba[1] == 255 &&
@@ -360,16 +498,23 @@ GP_HOT static void raster_tri_fast(tile_ctx_t *tc, const gp_tri_t *t, const gp_r
     const gp_plane_t *pv = &t->att[1];
     uint32_t frags = 0;
 
+    span_t sp;
+    if (!span_init(&sp, t, lo, hi, y0, y1)) {
+        return;
+    }
+
     for (int y = y0; y <= y1; y++) {
         int L, R;
-        if (!row_span(t, y, lo, hi, &L, &R)) {
+        if (!span_next(&sp, &L, &R)) {
             continue;
         }
         uint16_t *crow = tc->cbuf + (size_t)(y - tc->ty0) * tc->cstride - tc->tx0;
         uint16_t *drow = tc->dbuf ? tc->dbuf + (size_t)(y - tc->ty0) * GP_TILE - tc->tx0 : NULL;
         const float fy = (float)y;
-        float z = plane_at(&t->z, (float)L, fy);
-        const float dz = t->z.dx;
+        float z, dz;
+        row_z(t, L, R, fy, &z, &dz);
+        float ue = 0.0f, ve = 0.0f;
+        bool have_end = false;
 
         for (int xs = L; xs <= R; xs += SEG) {
             const int len = (R - xs + 1) < SEG ? (R - xs + 1) : SEG;
@@ -381,61 +526,136 @@ GP_HOT static void raster_tri_fast(tile_ctx_t *tc, const gp_tri_t *t, const gp_r
                 du = pu->dx;
                 dv = pv->dx;
             } else {
-                const float iw_s = plane_at(&t->iw, fx, fy);
-                const float iw_e = plane_at(&t->iw, fx + (float)len, fy);
-                const float ws = iw_s != 0.0f ? 1.0f / iw_s : 0.0f;
-                const float we = iw_e != 0.0f ? 1.0f / iw_e : 0.0f;
-                const float inv_len = 1.0f / (float)len;
-                u = plane_at(pu, fx, fy) * ws;
-                v = plane_at(pv, fx, fy) * ws;
-                du = (plane_at(pu, fx + (float)len, fy) * we - u) * inv_len;
-                dv = (plane_at(pv, fx + (float)len, fy) * we - v) * inv_len;
+                if (have_end) {
+                    u = ue;
+                    v = ve;
+                } else {
+                    const float iw_s = plane_at(&t->iw, fx, fy);
+                    const float ws = iw_s != 0.0f ? 1.0f / iw_s : 0.0f;
+                    u = plane_at(pu, fx, fy) * ws;
+                    v = plane_at(pv, fx, fy) * ws;
+                }
+                /* 段终点：中间段取下一段起点（可复用，1/w 每段只除一次）；
+                 * 最后一段取 R 本身——R+1 在三角形外，1/w 外推可能接近 0 或变负，把整段插坏 */
+                const int steps = (xs + SEG <= R) ? SEG : len - 1;
+                if (steps > 0) {
+                    const float fe = fx + (float)steps;
+                    const float iw_e = plane_at(&t->iw, fe, fy);
+                    const float we = iw_e != 0.0f ? 1.0f / iw_e : 0.0f;
+                    const float inv_len = k_inv[steps];
+                    const float pue = plane_at(pu, fe, fy);
+                    const float pve = plane_at(pv, fe, fy);
+                    du = (pue * we - u) * inv_len;
+                    dv = (pve * we - v) * inv_len;
+                    ue = pue * we;
+                    ve = pve * we;
+                } else {
+                    du = dv = 0.0f;
+                }
+                have_end = true;
             }
-            /* REPEAT：把起点折回 [0, n)，循环内只需偶尔加减一次 */
-            if (rep_u && !mirror_u && (u < 0.0f || u >= ftw)) {
-                u -= floorf(u / ftw) * ftw;
+            /* 折回起点：REPEAT 到 [0, n)，MIRROR 到 [0, 2n)（周期不变）。
+             * 定点步进要求坐标幅度有限，折回后通常只剩 [-n, 2n) 量级 */
+            if (rep_u && (u < 0.0f || u >= fpu)) {
+                u -= floorf(u / fpu) * fpu;
             }
-            if (rep_v && !mirror_v && (v < 0.0f || v >= fth)) {
-                v -= floorf(v / fth) * fth;
+            if (rep_v && (v < 0.0f || v >= fpv)) {
+                v -= floorf(v / fpv) * fpv;
+            }
+            const float uz = u + du * (float)(len - 1);
+            const float vz = v + dv * (float)(len - 1);
+
+            if (fabsf(u) < 16000.0f && fabsf(uz) < 16000.0f && fabsf(v) < 16000.0f &&
+                fabsf(vz) < 16000.0f) {
+                /* 16.16 定点步进：每像素两次整数加法 + 移位，省掉 float→int、float 比较。
+                 * 段两端都在 ±16000 内，中间各点（线性）也在，int32 不会溢出。
+                 * 负数右移按算术移位（GCC/Clang/MSVC 都是），即 floor。 */
+                /* 四舍五入到 1/65536：截断会让恰好落在 texel 边界上的坐标（2D 里很常见）掉到前一个 texel */
+                int32_t U = gp_floor_i(u * 65536.0f + 0.5f), V = gp_floor_i(v * 65536.0f + 0.5f);
+                const int32_t dU = len > 1 ? gp_floor_i(du * 65536.0f + 0.5f) : 0;
+                const int32_t dV = len > 1 ? gp_floor_i(dv * 65536.0f + 0.5f) : 0;
+                if (pow2) {
+                    /* REPEAT + 2 的幂：取模就是与掩码，无分支 */
+                    for (int i = 0; i < len; i++, z += dz, U += dU, V += dV) {
+                        const int x = xs + i;
+                        uint32_t zi = 0;
+                        if (dtest || dwrite) {
+                            zi = z16(z);
+                            if (dtest && !gp_cmp_m(zmask, zi, drow[x])) {
+                                continue;
+                            }
+                        }
+                        const uint32_t iu = (uint32_t)(U >> 16) & mask_u;
+                        const uint32_t iv = (uint32_t)(V >> 16) & mask_v;
+                        uint16_t px = tpx[(iv << shift_w) | iu];
+                        if (modulate) {
+                            const uint32_t r = (((uint32_t)(px >> 11) & 0x1F) * mr) >> 8;
+                            const uint32_t g = (((uint32_t)(px >> 5) & 0x3F) * mg) >> 8;
+                            const uint32_t b = (((uint32_t)px & 0x1F) * mb) >> 8;
+                            px = (uint16_t)((r << 11) | (g << 5) | b);
+                        }
+                        crow[x] = px;
+                        if (dwrite) {
+                            drow[x] = (uint16_t)zi;
+                        }
+                        frags++;
+                    }
+                } else {
+                    for (int i = 0; i < len; i++, z += dz, U += dU, V += dV) {
+                        const int x = xs + i;
+                        uint32_t zi = 0;
+                        if (dtest || dwrite) {
+                            zi = z16(z);
+                            if (dtest && !gp_cmp_m(zmask, zi, drow[x])) {
+                                continue;
+                            }
+                        }
+                        int iu = (int)(U >> 16);
+                        int iv = (int)(V >> 16);
+                        if ((unsigned)iu >= (unsigned)tw) {
+                            iu = gp_wrap(iu, tw, sm->wrap_u);
+                        }
+                        if ((unsigned)iv >= (unsigned)th) {
+                            iv = gp_wrap(iv, th, sm->wrap_v);
+                        }
+                        uint16_t px = tpx[(size_t)iv * tw + iu];
+                        if (modulate) {
+                            const uint32_t r = (((uint32_t)(px >> 11) & 0x1F) * mr) >> 8;
+                            const uint32_t g = (((uint32_t)(px >> 5) & 0x3F) * mg) >> 8;
+                            const uint32_t b = (((uint32_t)px & 0x1F) * mb) >> 8;
+                            px = (uint16_t)((r << 11) | (g << 5) | b);
+                        }
+                        crow[x] = px;
+                        if (dwrite) {
+                            drow[x] = (uint16_t)zi;
+                        }
+                        frags++;
+                    }
+                }
+                continue;
             }
 
+            /* 少见的大坐标（CLAMP 下纹理坐标远超纹理、极端缩小）：逐像素 float，
+             * 病态值（|u| 上亿 / NaN）钉在 0，免得 float→int 越界 */
+            if (!(fabsf(u) < 1e8f) || !(fabsf(du) < 1e7f)) {
+                u = 0.0f;
+                du = 0.0f;
+            }
+            if (!(fabsf(v) < 1e8f) || !(fabsf(dv) < 1e7f)) {
+                v = 0.0f;
+                dv = 0.0f;
+            }
             for (int i = 0; i < len; i++, z += dz, u += du, v += dv) {
                 const int x = xs + i;
                 uint32_t zi = 0;
                 if (dtest || dwrite) {
-                    zi = (uint32_t)gp_clampi((int)z, 0, 65535);
-                    if (dtest && !gp_cmp(dfunc, zi, drow[x])) {
+                    zi = z16(z);
+                    if (dtest && !gp_cmp_m(zmask, zi, drow[x])) {
                         continue;
                     }
                 }
-                int iu = (int)u;
-                if (u < 0.0f) iu = (int)floorf(u);
-                int iv = (int)v;
-                if (v < 0.0f) iv = (int)floorf(v);
-                if (iu < 0 || iu >= tw) {
-                    if (mirror_u) {
-                        int m = iu % (2 * tw);
-                        if (m < 0) m += 2 * tw;
-                        iu = m < tw ? m : 2 * tw - 1 - m;
-                    } else if (rep_u) {
-                        iu %= tw;
-                        if (iu < 0) iu += tw;
-                    } else {
-                        iu = iu < 0 ? 0 : tw - 1;
-                    }
-                }
-                if (iv < 0 || iv >= th) {
-                    if (mirror_v) {
-                        int m = iv % (2 * th);
-                        if (m < 0) m += 2 * th;
-                        iv = m < th ? m : 2 * th - 1 - m;
-                    } else if (rep_v) {
-                        iv %= th;
-                        if (iv < 0) iv += th;
-                    } else {
-                        iv = iv < 0 ? 0 : th - 1;
-                    }
-                }
+                const int iu = gp_wrap(gp_floor_i(u), tw, sm->wrap_u);
+                const int iv = gp_wrap(gp_floor_i(v), th, sm->wrap_v);
                 uint16_t px = tpx[(size_t)iv * tw + iu];
                 if (modulate) {
                     const uint32_t r = (((uint32_t)(px >> 11) & 0x1F) * mr) >> 8;
@@ -463,10 +683,14 @@ GP_HOT static void raster_tri_fill(tile_ctx_t *tc, const gp_tri_t *t)
     const int y1 = t->by1 < tc->ty1 ? t->by1 : tc->ty1;
     const int lo = t->bx0 > tc->tx0 ? t->bx0 : tc->tx0;
     const int hi = t->bx1 < tc->tx1 ? t->bx1 : tc->tx1;
+    span_t sp;
+    if (!span_init(&sp, t, lo, hi, y0, y1)) {
+        return;
+    }
     uint32_t frags = 0;
     for (int y = y0; y <= y1; y++) {
         int L, R;
-        if (!row_span(t, y, lo, hi, &L, &R)) {
+        if (!span_next(&sp, &L, &R)) {
             continue;
         }
         uint16_t *crow = tc->cbuf + (size_t)(y - tc->ty0) * tc->cstride - tc->tx0;
@@ -492,10 +716,14 @@ static void mark_wire(tile_ctx_t *tc, const gp_tri_t *t)
         const float l = sqrtf(a * a + b * b);
         inv_len[k] = l > 0 ? 1.0f / l : 0.0f;
     }
+    span_t sp;
+    if (!span_init(&sp, t, lo, hi, y0, y1)) {
+        return;
+    }
     const int sw = tc->tg->w;
     for (int y = y0; y <= y1; y++) {
         int L, R;
-        if (!row_span(t, y, lo, hi, &L, &R)) {
+        if (!span_next(&sp, &L, &R)) {
             continue;
         }
         for (int x = L; x <= R; x++) {
@@ -533,9 +761,17 @@ static bool state_is_fast(const gp_tri_t *t, const gp_rstate_t *s)
 
 static bool state_is_fill(const gp_tri_t *t, const gp_rstate_t *s)
 {
-    return !s->vm && !s->blend && !s->alpha_test && s->color_write && !s->depth_test &&
-           !s->depth_write && s->shade == ESPGPU_SHADE_FLAT && (t->flags & GP_TF_CONST_COLOR) &&
-           !(t->flags & GP_TF_FOG) && t->const_rgba[3] == 255;
+    if (s->vm || s->blend || s->alpha_test || !s->color_write || s->depth_test || s->depth_write ||
+        !(t->flags & GP_TF_CONST_COLOR) || (t->flags & GP_TF_FOG)) {
+        return false;
+    }
+    /* 不混合、无 alpha 测试时 alpha 不影响结果。TEX_MOD_COLOR 没有纹理时 T0 = 白，
+     * 白 × C = C（gp_mul8(255, c) == c），于是 2D 的纯色四边形也走填充 */
+    if (s->shade == ESPGPU_SHADE_FLAT) {
+        return true;
+    }
+    return s->shade == ESPGPU_SHADE_TEX_MOD_COLOR &&
+           (s->smp[0].tex == NULL || !(t->flags & GP_TF_TEX0) || t->o_t0 < 0);
 }
 
 static void raster_tile(gpu_core_t *c, int worker, int tile)
@@ -568,8 +804,10 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
         tc.dbg_mode = c->debug_view;
     }
 
-    /* 扫一遍：是否需要深度，第一条是否整块清除 */
+    /* 扫一遍：是否需要深度、是否会写深度，第一条是否整块清除 */
     bool need_depth = false;
+    bool writes_depth = false;
+    uint32_t ntris = 0;
     bool first_clears_color = false;
     bool first_clears_depth = false;
     bool first = true;
@@ -587,6 +825,7 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
                 }
                 if (cl->flags & 2) {
                     need_depth = true;
+                    writes_depth = true;
                 }
             } else {
                 const gp_tri_t *t = (const gp_tri_t *)rec;
@@ -594,6 +833,10 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
                 if (s->depth_test || s->depth_write) {
                     need_depth = true;
                 }
+                if (s->depth_write) {
+                    writes_depth = true;
+                }
+                ntris++;
             }
             first = false;
         }
@@ -601,6 +844,9 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
     }
     if (need_depth && tg->depth == NULL) {
         need_depth = false; /* 分配失败时状态已被降级，不会走到这里 */
+    }
+    if (tc.dbg && tc.dbg_mode == ESPGPU_DEBUG_VIEW_TILES) {
+        c->dbg_tile_tris[tile] += ntris; /* 每个 tile 只属于一个 worker，不用加锁 */
     }
 
     /* 颜色 */
@@ -655,8 +901,8 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
             if ((s->depth_test || s->depth_write) && tc.dbuf == NULL) {
                 continue;
             }
-            const bool count_frags = tc.dbg && (tc.dbg_mode == ESPGPU_DEBUG_VIEW_OVERDRAW ||
-                                                 tc.dbg_mode == ESPGPU_DEBUG_VIEW_TILES);
+            /* OVERDRAW 要逐片元计数，只有通用路径做这件事 */
+            const bool count_frags = tc.dbg && tc.dbg_mode == ESPGPU_DEBUG_VIEW_OVERDRAW;
             if (!count_frags && state_is_fill(t, s)) {
                 raster_tri_fill(&tc, t);
             } else if (!count_frags && state_is_fast(t, s)) {
@@ -677,7 +923,8 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
                    w->color + (size_t)y * GP_TILE, (size_t)tw * 2);
         }
     }
-    if (tc.dbuf) {
+    /* 深度只测不写（或全被跳过）时 PSRAM 里的副本没变，省掉写回 */
+    if (tc.dbuf && writes_depth) {
         for (int y = 0; y < th; y++) {
             memcpy(tg->depth + (size_t)(tc.ty0 + y) * tg->w + tc.tx0,
                    w->depth + (size_t)y * GP_TILE, (size_t)tw * 2);
@@ -763,10 +1010,11 @@ void gp_compose_debug(gpu_core_t *c)
         }
         break;
     case ESPGPU_DEBUG_VIEW_TILES: {
-        /* 原画面压暗 + 每 tile 三角形数热力 + 网格 */
+        /* 原画面压暗 + 网格 + 每 tile 顶部一条热力条：本帧光栅到该 tile 的三角形数
+         * （按全帧最大值归一化）。计数在光栅时累加，PRESENT 前分箱已经清空，不能再看 bins */
         uint32_t maxc = 1;
         for (int t = 0; t < c->tiles_x * c->tiles_y; t++) {
-            if (c->bins[t].count > maxc) maxc = c->bins[t].count;
+            if (c->dbg_tile_tris[t] > maxc) maxc = c->dbg_tile_tris[t];
         }
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
@@ -779,30 +1027,23 @@ void gp_compose_debug(gpu_core_t *c)
                 c->dbg_img[i] = gp_pack565(r, g, b);
             }
         }
-        /* 分箱在 PRESENT 前已经清空，这里用帧统计：每 tile 填充像素的近似由 overdraw 缓冲给出 */
-        if (c->dbg) {
-            for (int ty = 0; ty < c->tiles_y; ty++) {
-                for (int tx = 0; tx < c->tiles_x; tx++) {
-                    uint32_t sum = 0;
-                    const int x0 = tx * GP_TILE, y0 = ty * GP_TILE;
-                    const int x1 = x0 + GP_TILE < W ? x0 + GP_TILE : W;
-                    const int y1 = y0 + GP_TILE < H ? y0 + GP_TILE : H;
-                    for (int y = y0; y < y1; y++) {
-                        for (int x = x0; x < x1; x++) {
-                            sum += c->dbg[(size_t)y * W + x];
-                        }
-                    }
-                    const uint32_t area = (uint32_t)((x1 - x0) * (y1 - y0));
-                    const uint16_t hc = heat(area ? sum * 4 / area : 0, 8);
-                    for (int y = y0 + 2; y < y0 + 8 && y < y1; y++) {
-                        for (int x = x0 + 2; x < x1 - 2; x++) {
-                            c->dbg_img[(size_t)y * W + x] = hc;
-                        }
+        for (int ty = 0; ty < c->tiles_y; ty++) {
+            for (int tx = 0; tx < c->tiles_x; tx++) {
+                const uint32_t cnt = c->dbg_tile_tris[ty * c->tiles_x + tx];
+                if (cnt == 0) {
+                    continue;
+                }
+                const uint16_t hc = heat(cnt, maxc);
+                const int x0 = tx * GP_TILE, y0 = ty * GP_TILE;
+                const int x1 = x0 + GP_TILE < W ? x0 + GP_TILE : W;
+                const int y1 = y0 + GP_TILE < H ? y0 + GP_TILE : H;
+                for (int y = y0 + 2; y < y0 + 8 && y < y1; y++) {
+                    for (int x = x0 + 2; x < x1 - 2; x++) {
+                        c->dbg_img[(size_t)y * W + x] = hc;
                     }
                 }
             }
         }
-        (void)maxc;
         break;
     }
     case ESPGPU_DEBUG_VIEW_WIREFRAME:
