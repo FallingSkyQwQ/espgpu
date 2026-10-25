@@ -235,9 +235,17 @@ static inline uint16_t tex_sample(const espgpu_texture_t *t, float u, float v, u
 
 /* ── 三角形光栅化 ─────────────────────────────────────────────────── */
 
+/*
+ * 逐像素回调式采样是这里最大的性能陷阱：tex_sample 同时包含最近邻和双线性
+ * 两条路径，函数体大到编译器不会内联，于是每像素一次函数调用加内部分支。
+ *
+ * 解决办法是按「采样模式 × 混合模式」把内层循环特化开。最常见的一条是
+ * 「不透明纹理 + 最近邻 + 无顶点色调制」，它应该退化成一个数组索引。
+ * 特化循环之间只共享外围的四边形/三角形设置代码。
+ */
 IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
-                     espgpu_vertex2d_t a, espgpu_vertex2d_t b, espgpu_vertex2d_t c,
-                     const espgpu_draw_state_t *st, uint16_t flat_color)
+                               espgpu_vertex2d_t a, espgpu_vertex2d_t b, espgpu_vertex2d_t c,
+                               const espgpu_draw_state_t *st, uint16_t flat_color)
 {
     /* 1/16 像素定点 */
     int32_t area = (int32_t)(b.x - a.x) * (int32_t)(c.y - a.y) -
@@ -252,7 +260,6 @@ IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
         area = -area;
     }
 
-    /* 包围盒（像素单位），夹到 scissor */
     int32_t minx = a.x < b.x ? (a.x < c.x ? a.x : c.x) : (b.x < c.x ? b.x : c.x);
     int32_t maxx = a.x > b.x ? (a.x > c.x ? a.x : c.x) : (b.x > c.x ? b.x : c.x);
     int32_t miny = a.y < b.y ? (a.y < c.y ? a.y : c.y) : (b.y < c.y ? b.y : c.y);
@@ -271,7 +278,6 @@ IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
         return;
     }
 
-    /* 边缘函数在像素中心处的值，按行/列增量推进 */
     const int32_t px0 = x0 * 16 + 8;
     const int32_t py0 = y0 * 16 + 8;
 
@@ -286,7 +292,6 @@ IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
     const int32_t dw2dx = -(b.y - a.y) * 16;
     const int32_t dw2dy = (b.x - a.x) * 16;
 
-    /* UV：以 texel 为单位，按像素步进 */
     const float inv_area = 1.0f / (float)area;
     const float ua = a.u / 16.0f, va = a.v / 16.0f;
     const float ub = b.u / 16.0f, vb = b.v / 16.0f;
@@ -301,29 +306,83 @@ IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
     const float dv_dy = (va * (float)(c.x - b.x) + vb * (float)(a.x - c.x) +
                          vc * (float)(b.x - a.x)) * inv_area * 16.0f;
 
-    /* 首行首列的 UV */
     float u_row = (ua * (float)w0_row + ub * (float)w1_row + uc * (float)w2_row) * inv_area;
     float v_row = (va * (float)w0_row + vb * (float)w1_row + vc * (float)w2_row) * inv_area;
 
-    /* 顶点色调制是常量：把解包提到循环外。
-     * 之前每个像素都做一遍 unpack565×2 + pack565，实测这是内层循环的大头。 */
-    const bool modulate = (flat_color != 0xFFFFu);
-    uint32_t tr = 31, tg = 63, tb = 31;
-    if (modulate) {
-        unpack565(flat_color, &tr, &tg, &tb);
-    }
-
-    /* 把状态和纹理字段提到局部变量。
-     * 内层循环里有 row[x] = src 这样的写入，编译器无法证明 st/tex 不被别名，
-     * 于是每个像素都要重新加载 filter/wrap/blend/width/height —— 这是主要的
-     * 隐藏开销。 */
+    /* 状态提到局部：内层有 row[x] 写入，编译器无法证明 st 不被别名 */
     const uint8_t blend = st->blend;
     const uint8_t filter = st->filter;
     const uint8_t wrap = st->wrap;
     const uint8_t alpha_test = st->alpha_test;
     const uint8_t alpha_ref = st->alpha_ref;
-    const uint16_t *restrict tpx = tex ? tex->pixels : NULL;
+    const bool modulate = (flat_color != 0xFFFFu);
 
+    uint32_t tr = 31, tg = 63, tb = 31;
+    if (modulate) {
+        unpack565(flat_color, &tr, &tg, &tb);
+    }
+
+    const uint16_t *restrict tpx = tex ? tex->pixels : NULL;
+    const uint8_t *restrict talpha = tex ? tex->alpha : NULL;
+    const int32_t tw = tex ? (int32_t)tex->width : 1;
+    const int32_t th = tex ? (int32_t)tex->height : 1;
+    const float ftw = (float)tw;
+    const float fth = (float)th;
+
+    /* ── 特化 1：不透明纹理 + 最近邻 + 不混合 + 无 alpha 测试 + 无调制 ──
+     * 这是背景填充的路径，应该退化成一个数组索引。 */
+    if (tpx != NULL && talpha == NULL && filter == ESPGPU_FILTER_NEAREST &&
+        blend == ESPGPU_BLEND_NONE && !alpha_test && !modulate) {
+        const bool rep = (wrap == ESPGPU_WRAP_REPEAT);
+        for (int32_t y = y0; y <= y1; y++) {
+            int32_t w0 = w0_row;
+            int32_t w1 = w1_row;
+            int32_t w2 = w2_row;
+            float u = u_row;
+            float v = v_row;
+
+            if (rep) {
+                while (u >= ftw) u -= ftw;
+                while (u < 0.0f) u += ftw;
+                while (v >= fth) v -= fth;
+                while (v < 0.0f) v += fth;
+            }
+
+            int32_t vi = (int32_t)v;
+            if (vi < 0) vi = 0;
+            if (vi >= th) vi = th - 1;
+            const uint16_t *trow = tpx + (size_t)vi * tw;
+            uint16_t *row = s->pixels + (size_t)y * s->width;
+
+            for (int32_t x = x0; x <= x1; x++) {
+                if ((w0 | w1 | w2) >= 0) {
+                    int32_t ui = (int32_t)u;
+                    if (rep) {
+                        if (ui >= tw) ui -= tw;
+                        else if (ui < 0) ui += tw;
+                    } else {
+                        if (ui < 0) ui = 0;
+                        else if (ui >= tw) ui = tw - 1;
+                    }
+                    row[x] = trow[ui];
+                }
+                w0 += dw0dx;
+                w1 += dw1dx;
+                w2 += dw2dx;
+                u += du_dx;
+                v += dv_dx;
+            }
+            w0_row += dw0dy;
+            w1_row += dw1dy;
+            w2_row += dw2dy;
+            u_row += du_dy;
+            v_row += dv_dy;
+        }
+        return;
+    }
+
+    /* ── 通用路径 ──
+     * 采样函数按 filter 在循环外选好，循环里不再判断 filter。 */
     for (int32_t y = y0; y <= y1; y++) {
         int32_t w0 = w0_row;
         int32_t w1 = w1_row;
@@ -346,7 +405,6 @@ IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
                     }
                 } else {
                     src = flat_color;
-                    alpha = 255;
                 }
 
                 if (alpha_test && alpha < alpha_ref) {
@@ -371,6 +429,7 @@ IRAM_ATTR static void draw_tri(espgpu_surface_t *s, const espgpu_texture_t *tex,
         v_row += dv_dy;
     }
 }
+
 
 IRAM_ATTR void raster_draw_quad(espgpu_surface_t *s, const espgpu_texture_t *tex,
                       const espgpu_vertex2d_t v[4], const espgpu_draw_state_t *st)

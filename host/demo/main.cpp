@@ -12,6 +12,7 @@
  */
 
 #include <windows.h>
+#include <timeapi.h>
 
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,8 @@
 #include <vector>
 
 #include "espgpu/espgpu.h"
+
+#pragma comment(lib, "winmm.lib")
 
 namespace {
 
@@ -173,6 +176,10 @@ int main(int argc, char **argv)
     setvbuf(stdout, nullptr, _IONBF, 0);
     espgpu_set_log_level(2);
 
+    /* Windows 默认计时器精度 15.6ms，sleep_for(34ms) 会被量化成 46.8ms，
+     * 直接把 24fps 的节奏压成 20fps。提到 1ms。 */
+    timeBeginPeriod(1);
+
     long max_frames = 0;
     bool stress_scroll = false;
     for (int i = 1; i < argc; i++) {
@@ -220,6 +227,7 @@ int main(int argc, char **argv)
     uint64_t frames = 0;
     float angle = 0.0f;
     float scroll = 0.0f;
+    double t_build = 0.0, t_present = 0.0, t_poll = 0.0, t_sleep = 0.0;
 
     for (;;) {
         const auto frame_start = std::chrono::steady_clock::now();
@@ -303,14 +311,22 @@ int main(int argc, char **argv)
         if (stress_scroll) {
             scroll += 0.6f;
         }
+
+        const auto tp0 = std::chrono::steady_clock::now();
         espgpu_cmd_present(dev, 1000);
+        const auto tp1 = std::chrono::steady_clock::now();
+        t_present += std::chrono::duration<double, std::milli>(tp1 - tp0).count();
         frames++;
 
         /* 帧率控制 */
         const auto elapsed = std::chrono::steady_clock::now() - frame_start;
         const auto period = std::chrono::milliseconds(1000 / kTargetFps);
         if (elapsed < period) {
+            const auto ts0 = std::chrono::steady_clock::now();
             std::this_thread::sleep_for(period - elapsed);
+            t_sleep +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0)
+                    .count();
         }
 
         if (!espgpu_is_connected(dev)) {
@@ -323,12 +339,16 @@ int main(int argc, char **argv)
             const double secs =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             const espgpu_link_stats_t *ls = espgpu_link_stats(dev);
+            const double n = static_cast<double>(kTargetFps * 4);
             /* 统计窗口在 espgpu_poll 里滚动，所以打印必须放在 poll 之后，
              * 否则读到的是刚被清零的窗口。 */
-            printf("frames %llu  %.1f fps  %.0f KB/s (bytes_in %u)  decode %.2f ms | resync %u lost %u\n",
+            printf("frames %llu  %.1f fps  %.0f KB/s  decode %.2f ms | resync %u lost %u\n"
+                   "    host: present %.1f ms  sleep %.1f ms  (per frame, last %d)\n",
                    static_cast<unsigned long long>(frames), frames / secs, ls->in_kbps,
-                   ls->bytes_in, ls->decode_ms, ls->resyncs, ls->fragments_lost);
+                   ls->decode_ms, ls->resyncs, ls->fragments_lost, t_present / n, t_sleep / n,
+                   kTargetFps * 4);
             fflush(stdout);
+            t_present = t_sleep = 0.0;
         }
 
         /* 第 96 帧导出一次，方便离线检查画面 */
@@ -343,5 +363,6 @@ int main(int argc, char **argv)
     }
 
     espgpu_close(dev);
+    timeEndPeriod(1);
     return 0;
 }
