@@ -120,7 +120,14 @@ ESPGPU_API int espgpu_frame_width(espgpu_device_t *dev);
 ESPGPU_API int espgpu_frame_height(espgpu_device_t *dev);
 ESPGPU_API uint32_t espgpu_frame_id(espgpu_device_t *dev);
 
+/**
+ * 链路统计快照（加锁拷贝，返回的指针指向每设备一份的快照，下次调用会覆盖）。
+ * 多个线程都要读时用 espgpu_get_link_stats()。
+ */
 ESPGPU_API const espgpu_link_stats_t *espgpu_link_stats(espgpu_device_t *dev);
+
+/** 线程安全地拷贝链路统计。返回 0 成功。 */
+ESPGPU_API int espgpu_get_link_stats(espgpu_device_t *dev, espgpu_link_stats_t *out);
 
 /* ── M2：绘制命令 ─────────────────────────────────────────────────── */
 

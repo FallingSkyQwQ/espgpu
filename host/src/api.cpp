@@ -326,7 +326,23 @@ uint32_t espgpu_frame_id(espgpu_device_t *dev)
 
 const espgpu_link_stats_t *espgpu_link_stats(espgpu_device_t *dev)
 {
-    return dev ? &dev->stats : nullptr;
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    /* 接收线程在 stats_mu 下改 dev->stats：返回加锁拷贝出的快照，避免撕裂读 */
+    std::lock_guard<std::mutex> lk(dev->stats_mu);
+    dev->stats_snapshot = dev->stats;
+    return &dev->stats_snapshot;
+}
+
+int espgpu_get_link_stats(espgpu_device_t *dev, espgpu_link_stats_t *out)
+{
+    if (dev == nullptr || out == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(dev->stats_mu);
+    *out = dev->stats;
+    return 0;
 }
 
 /* ── 诊断 ─────────────────────────────────────────────────────────── */

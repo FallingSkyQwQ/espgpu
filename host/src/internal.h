@@ -183,6 +183,7 @@ struct espgpu_device {
     /* 统计 */
     std::mutex stats_mu;
     espgpu_link_stats_t stats{};
+    espgpu_link_stats_t stats_snapshot{}; /**< espgpu_link_stats() 返回的加锁拷贝 */
     uint64_t win_start_ms = 0;
     uint32_t win_frames = 0;
     uint32_t win_bytes_in = 0;

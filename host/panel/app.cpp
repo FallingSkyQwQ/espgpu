@@ -476,9 +476,7 @@ static void worker_main()
 
         {
             std::lock_guard<std::mutex> lk(g_app.stats_mu);
-            if (const espgpu_link_stats_t *ls = espgpu_link_stats(dev)) {
-                g_app.link = *ls;
-            }
+            espgpu_get_link_stats(dev, &g_app.link);
             if (now - last_hist >= 0.2) {
                 last_hist = now;
                 push_history(g_app.link, g_app.stats, g_app.stats_valid);
