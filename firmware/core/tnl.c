@@ -256,6 +256,8 @@ static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_cvtx_t *o)
         fetch_attr(base, dc->attr[ESPGPU_ATTR_POSITION], pos);
     }
     if (dc->attr[ESPGPU_ATTR_COLOR]) {
+        /* GL：属性里没给的分量补 (0,0,0,1)，不是 (1,1,1,1) */
+        col[0] = col[1] = col[2] = 0.0f;
         fetch_attr(base, dc->attr[ESPGPU_ATTR_COLOR], col);
     } else {
         for (int i = 0; i < 4; i++) col[i] = (float)c->const_color[i] / 255.0f;
@@ -266,6 +268,8 @@ static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_cvtx_t *o)
         }
     }
     if (dc->attr[ESPGPU_ATTR_NORMAL]) {
+        nrm[0] = nrm[1] = nrm[2] = 0.0f;
+        nrm[3] = 1.0f;
         fetch_attr(base, dc->attr[ESPGPU_ATTR_NORMAL], nrm);
     }
 

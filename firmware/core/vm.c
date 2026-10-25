@@ -90,11 +90,33 @@ static inline const float *reg_ptr(uint8_t r, const float *regs, const float *v,
     }
 }
 
+/** 每条指令实际读几个源操作数：一元指令不必解码 / 搬运 b、c（每像素每条指令都省） */
+static const uint8_t k_nsrc[ESPGPU_VM_OP_COUNT] = {
+    [ESPGPU_VM_NOP] = 0,  [ESPGPU_VM_MOV] = 1,  [ESPGPU_VM_ADD] = 2,   [ESPGPU_VM_SUB] = 2,
+    [ESPGPU_VM_MUL] = 2,  [ESPGPU_VM_MAD] = 3,  [ESPGPU_VM_DIV] = 2,   [ESPGPU_VM_DP2] = 2,
+    [ESPGPU_VM_DP3] = 2,  [ESPGPU_VM_DP4] = 2,  [ESPGPU_VM_MIN] = 2,   [ESPGPU_VM_MAX] = 2,
+    [ESPGPU_VM_RCP] = 1,  [ESPGPU_VM_RSQ] = 1,  [ESPGPU_VM_SQRT] = 1,  [ESPGPU_VM_EXP2] = 1,
+    [ESPGPU_VM_LOG2] = 1, [ESPGPU_VM_POW] = 2,  [ESPGPU_VM_FRC] = 1,   [ESPGPU_VM_FLR] = 1,
+    [ESPGPU_VM_ABS] = 1,  [ESPGPU_VM_SLT] = 2,  [ESPGPU_VM_SGE] = 2,   [ESPGPU_VM_SEQ] = 2,
+    [ESPGPU_VM_SNE] = 2,  [ESPGPU_VM_LRP] = 3,  [ESPGPU_VM_CMP] = 3,   [ESPGPU_VM_SEL] = 3,
+    [ESPGPU_VM_CLAMP] = 3, [ESPGPU_VM_SIN] = 1, [ESPGPU_VM_COS] = 1,   [ESPGPU_VM_TEX] = 1,
+    [ESPGPU_VM_KIL] = 1,  [ESPGPU_VM_MOD] = 2,  [ESPGPU_VM_SIGN] = 1,  [ESPGPU_VM_STEP] = 2,
+    [ESPGPU_VM_SMOOTH] = 3, [ESPGPU_VM_END] = 0,
+};
+
 static inline void load_src(const espgpu_vm_insn_t *in, int i, const float *regs, const float *v,
                             const float *k, float o[4])
 {
     const float *p = reg_ptr(in->src[i], regs, v, k);
     const uint8_t sw = in->swz[i];
+    if (sw == ESPGPU_VM_SWZ_IDENTITY && !(in->neg & (1u << i))) {
+        /* 最常见：.xyzw 且不取负，直接搬 */
+        o[0] = p[0];
+        o[1] = p[1];
+        o[2] = p[2];
+        o[3] = p[3];
+        return;
+    }
     o[0] = p[sw & 3];
     o[1] = p[(sw >> 2) & 3];
     o[2] = p[(sw >> 4) & 3];
@@ -130,13 +152,13 @@ GP_HOT bool gp_vm_run(const gp_prog_t *p, const float *consts, const gp_sampler_
         }
 
         float a[4], b[4], c[4], r[4];
+        const uint8_t ns = k_nsrc[op];
         load_src(in, 0, regs, v, consts, a);
-        if (op != ESPGPU_VM_MOV && op != ESPGPU_VM_TEX && op != ESPGPU_VM_KIL) {
+        if (ns >= 2) {
             load_src(in, 1, regs, v, consts, b);
+        }
+        if (ns >= 3) {
             load_src(in, 2, regs, v, consts, c);
-        } else {
-            b[0] = b[1] = b[2] = b[3] = 0.0f;
-            c[0] = c[1] = c[2] = c[3] = 0.0f;
         }
 
         switch (op) {
