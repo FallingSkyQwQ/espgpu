@@ -218,9 +218,22 @@ void vertex_live(Shader &sh)
     for (const auto &o : d.var_out)
         for (int i = 0; i < o.n; i++) mark(o.s[i].node);
     d.live_order.clear();
+    d.pre_order.clear();
+    /* 只依赖 uniform / 常量的节点（uo）整批只算一次，其余逐顶点 */
+    std::vector<char> uo(d.nodes.size(), 0);
+    for (size_t id = 0; id < d.nodes.size(); id++) {
+        const Node &n = d.nodes[id];
+        bool u = n.kind == NK::Const || n.kind == NK::Uniform;
+        if (n.kind == NK::Op) {
+            u = true;
+            for (int k = 0; k < n.nargs; k++)
+                for (int i = 0; i < n.a[k].n; i++) u = u && uo[static_cast<size_t>(n.a[k].s[i].node)];
+        }
+        uo[id] = u;
+    }
     for (size_t id = 0; id < d.nodes.size(); id++) {
         if (!seen[id]) continue;
-        d.live_order.push_back(static_cast<int>(id));
+        (uo[id] ? d.pre_order : d.live_order).push_back(static_cast<int>(id));
         const Node &n = d.nodes[id];
         if (n.kind == NK::Attrib && n.index >= 0) sh.inputs[static_cast<size_t>(n.index)].used = true;
         if (n.kind == NK::Uniform) {

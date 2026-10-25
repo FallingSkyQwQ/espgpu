@@ -5,6 +5,7 @@
 #include "internal.h"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <set>
 
@@ -121,7 +122,14 @@ bool lex(const std::string &src, std::vector<Token> &out, std::string &err)
             } else {
                 t.kind = is_uint ? Tok::UInt : Tok::Int;
                 const bool oct = !hex && body.size() > 1 && body[0] == '0';
-                t.num = static_cast<double>(std::strtoull(body.c_str(), nullptr, hex ? 16 : (oct ? 8 : 10)));
+                errno = 0;
+                const unsigned long long v = std::strtoull(body.c_str(), nullptr, hex ? 16 : (oct ? 8 : 10));
+                if (errno == ERANGE || v > 0xFFFFFFFFull ||
+                    (oct && body.find_first_of("89") != std::string::npos)) {
+                    err = loc_str(t.loc) + ": error: invalid integer literal '" + t.text + "'";
+                    return false;
+                }
+                t.num = static_cast<double>(v);
             }
             adv(j - i);
             out.push_back(t);

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -198,10 +199,12 @@ struct Scalar {
 
 struct Operand {
     uint8_t n = 0;
+    uint8_t neg = 0; /**< 整个操作数取负（只由 codegen 的窥孔改写产生，lower 里恒为 0） */
     Scalar s[4];
     bool operator<(const Operand &o) const
     {
         if (n != o.n) return n < o.n;
+        if (neg != o.neg) return neg < o.neg;
         for (int i = 0; i < n; i++) {
             if (!(s[i] == o.s[i])) return s[i] < o.s[i];
         }
@@ -214,9 +217,17 @@ struct Node {
     uint8_t op = 0;    /**< ESPGPU_VM_* */
     uint8_t width = 1; /**< 结果分量数 */
     uint8_t nargs = 0;
+    uint8_t flags = 0; /**< ESPGPU_VM_F_*（只由 codegen 的窥孔改写设置） */
     Operand a[3];
     float c = 0;       /**< Const 的值 */
-    int index = 0;
+    int index = 0;     /**< Varying / Uniform / Attrib / Tex 的下标；Kill：1 = 操作数 < 0 时丢弃，0 = 操作数 > 0 时丢弃 */
+};
+
+/** 主机预计算出的常量槽的一个分量：node < 0 时是常量 k，否则是 DAG 标量 (node, comp) */
+struct PreLane {
+    int node = -1;
+    uint8_t comp = 0;
+    float k = 0;
 };
 
 struct Dag {
@@ -230,8 +241,15 @@ struct Dag {
     Operand position;
     std::vector<Operand> var_out;
 
-    /** 顶点着色器：从输出可达的节点，按拓扑序（主机解释执行用） */
+    /** 顶点着色器：从输出可达、依赖属性的节点，按拓扑序（主机逐顶点解释执行） */
     std::vector<int> live_order;
+    /**
+     * 只依赖 uniform / 常量的可达节点，按拓扑序。
+     * VS：每批顶点只算一次；FS：每次绘制在主机上算一次（preshader），结果经 xslots 进 c 寄存器。
+     */
+    std::vector<int> pre_order;
+    /** FS：c[uniform_slots + i] 的四个分量从哪里来 */
+    std::vector<std::array<PreLane, 4>> xslots;
 };
 
 /** 单条 VM 运算的数值语义（折叠、DAG 解释、参考解释器共用） */
@@ -242,6 +260,12 @@ bool lower(const TranslationUnit &tu, Stage stage, int version, Shader &sh);
 
 /** 第四阶段：片元着色器的模式识别 + VM 代码生成 */
 bool codegen_fragment(Shader &sh);
+
+/**
+ * 测试用：>= 0 时只用这一组优化开关生成 VM 代码（bit2 关预计算，bit1 关分量打包，bit0 关 SLP），
+ * 且跳过内置模式识别；-1（默认）= 自动挑最短的。
+ */
+extern int g_codegen_force_mode;
 
 /** 顶点着色器 T&L 识别（在 AST 上做） */
 void recognize_vertex(const TranslationUnit &tu, Shader &sh);

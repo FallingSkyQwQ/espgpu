@@ -1221,8 +1221,8 @@ private:
         auto ay = cw(ESPGPU_VM_ABS, y);
         auto mx = cw(ESPGPU_VM_MAX, ax, ay);
         auto mn = cw(ESPGPU_VM_MIN, ax, ay);
-        /* mx 为 0 时除法得 NaN，用 max(mx, tiny) 保护 */
-        auto t = cw(ESPGPU_VM_DIV, mn, cw(ESPGPU_VM_MAX, mx, splat(K(1e-20f), n)));
+        /* mx 为 0 时 VM 的 DIV 定义为 0（eval_op 与设备一致），atan2(0, 0) = 0 */
+        auto t = cw(ESPGPU_VM_DIV, mn, mx);
         auto a = atan_core(t);
         auto swap = cw(ESPGPU_VM_SLT, ax, ay);
         a = cw(ESPGPU_VM_SEL, swap, cw(ESPGPU_VM_SUB, splat(K(1.5707963f), n), a), a);
@@ -1333,6 +1333,24 @@ private:
         }
         if (name == "pow") {
             need(na == 2 && gen_float(a[0].ty) && a[0].ty == a[1].ty, l, name, a);
+            /* 常量小整数指数换成乘法（设备上 powf 是几百个周期的库函数）；
+             * x < 0 时 GLSL 的 pow 未定义，这里的结果与 POW 的"负底数按 0"不同也无妨 */
+            bool all_k = true;
+            float e0 = 0;
+            for (size_t i = 0; i < a[1].s.size(); i++) {
+                float e = 0;
+                all_k = all_k && isK(a[1].s[i], &e) && (i == 0 || e == e0);
+                if (i == 0) e0 = e;
+            }
+            if (all_k && (e0 == 1.0f || e0 == 2.0f || e0 == 3.0f || e0 == 4.0f)) {
+                const auto &x = a[0].s;
+                std::vector<Scalar> r = x;
+                if (e0 >= 2.0f) r = cw(ESPGPU_VM_MUL, x, x);
+                if (e0 == 3.0f) r = cw(ESPGPU_VM_MUL, r, x);
+                if (e0 == 4.0f) r = cw(ESPGPU_VM_MUL, r, r);
+                out = {a[0].ty, r, {}};
+                return true;
+            }
             out = {a[0].ty, cw(ESPGPU_VM_POW, a[0].s, a[1].s), {}};
             return true;
         }
@@ -1351,7 +1369,11 @@ private:
         if (name == "sqrt") { f1(ESPGPU_VM_SQRT); return true; }
         if (name == "inversesqrt") {
             need(na == 1 && gen_float(a[0].ty), l, name, a);
-            out = {a[0].ty, cw(ESPGPU_VM_DIV, splat(K(1), a[0].s.size()), cw(ESPGPU_VM_SQRT, a[0].s)), {}};
+            if (a[0].s.size() == 1) {
+                out = {a[0].ty, {unary_bcast(ESPGPU_VM_RSQ, a[0].s[0])}, {}}; /* 标量一条 RSQ */
+            } else {
+                out = {a[0].ty, cw(ESPGPU_VM_DIV, splat(K(1), a[0].s.size()), cw(ESPGPU_VM_SQRT, a[0].s)), {}};
+            }
             return true;
         }
         if (name == "abs" || name == "sign") {
@@ -1368,7 +1390,15 @@ private:
         }
         if (name == "round" || name == "roundEven") {
             need(na == 1 && gen_float(a[0].ty), l, name, a);
-            out = {a[0].ty, cw(ESPGPU_VM_FLR, cw(ESPGPU_VM_ADD, a[0].s, splat(K(0.5f), a[0].s.size()))), {}};
+            const size_t n = a[0].s.size();
+            auto r = cw(ESPGPU_VM_FLR, cw(ESPGPU_VM_ADD, a[0].s, splat(K(0.5f), n)));
+            if (name == "roundEven") {
+                /* 恰好 .5 且 floor(x + 0.5) 是奇数时退一：r - (r - x == 0.5) * mod(r, 2) */
+                auto tie = cw(ESPGPU_VM_SEQ, cw(ESPGPU_VM_SUB, r, a[0].s), splat(K(0.5f), n));
+                auto odd = cw(ESPGPU_VM_MOD, r, splat(K(2.0f), n));
+                r = cw(ESPGPU_VM_SUB, r, cw(ESPGPU_VM_MUL, tie, odd));
+            }
+            out = {a[0].ty, r, {}};
             return true;
         }
         if (name == "ceil") {
@@ -2062,9 +2092,10 @@ private:
 
     /**
      * 设备的 v6 是设备像素、左上原点（屏幕）；GLSL 要窗口像素、左下原点。
-     * 用隐藏 uniform "@fragcoord" = (sx, sy, oy, fy) 换算：
-     *   x = v6.x * sx，y = (oy + fy * v6.y) * sy
-     * 屏幕目标 oy = 设备高、fy = -1；FBO 目标 oy = 0、fy = 1、sx = sy = 1。由运行时每次绘制填写。
+     * 用隐藏 uniform "@fragcoord" = (kx, ky, bx, by) 换算，xy 一条 MAD：
+     *   gl_FragCoord.xy = v6.xy * (kx, ky) + (bx, by)
+     * 屏幕目标 kx = 窗口宽/设备宽，ky = -窗口高/设备高，bx = 0，by = 窗口高；
+     * FBO 目标 (1, 1, 0, 0)。由运行时每次绘制填写。
      */
     void make_fragcoord()
     {
@@ -2077,9 +2108,8 @@ private:
         const auto &u = hidden.s;
         auto fc = std::make_shared<Var>();
         fc->ty = T(BT::Float, 4);
-        const Scalar x = cw1(ESPGPU_VM_MUL, {id, 0}, u[0]);
-        const Scalar y = cw1(ESPGPU_VM_MUL, cw1(ESPGPU_VM_MAD, u[3], {id, 1}, u[2]), u[1]);
-        fc->s = {x, y, {id, 2}, {id, 3}};
+        const auto xy = cw(ESPGPU_VM_MAD, {{id, 0}, {id, 1}}, {u[0], u[1]}, {u[2], u[3]});
+        fc->s = {xy[0], xy[1], {id, 2}, {id, 3}};
         fc->readonly = true;
         fc->what = "gl_FragCoord";
         scopes_[0]["gl_FragCoord"] = fc;

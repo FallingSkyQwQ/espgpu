@@ -163,6 +163,10 @@ struct Device {
     uint32_t max_tex_dim = 512;
     uint64_t frame_counter = 1;
     uint32_t last_frame_id = 0;
+    /** 最近一次 PRESENT 之前收到的帧号；inflight = 那一帧还可能没回来（见 swap_buffers） */
+    uint32_t inflight_before = 0;
+    bool inflight = false;
+    bool sync_swap = false; /**< ESPGPU_GLES_SYNC=1：每次 SwapBuffers 都等本帧回来 */
     uint32_t fence_seq = 0;
 
     /* 镜像（valid=false 时下一次一定下发） */
@@ -311,6 +315,8 @@ void texture_deleted(GLuint id);
 /* ── 工具 ── */
 bool unpack_to_rgba(const Context &c, int w, int h, GLenum format, GLenum type, const void *src,
                     std::vector<uint8_t> &out, bool &has_alpha, bool &luminance);
+/** 按当前 UNPACK_* 状态，w×h 的像素数据要读多少字节（0 = 不支持的组合或空图） */
+size_t unpack_bytes(const Context &c, int w, int h, GLenum format, GLenum type);
 
 } // namespace gles
 

@@ -68,9 +68,15 @@ ESPGPU_GLES_INTERNAL int espgpu_gles_make_current(void *ctx, void *hwnd, int w, 
             h = rc.bottom - rc.top;
         }
     }
+    const bool has_surface = c->hwnd != nullptr || (w > 0 && h > 0);
+    if (!has_surface) {
+        /* 无表面：按设备尺寸当默认帧缓冲，视口留到第一次绑定真正的表面时再初始化 */
+        w = device().width;
+        h = device().height;
+    }
     c->win_w = std::max(1, w);
     c->win_h = std::max(1, h);
-    if (!c->viewport_set) {
+    if (!c->viewport_set && has_surface) {
         /* GL：第一次绑定到表面时视口 / 裁剪框初始化为表面大小 */
         c->viewport[0] = c->viewport[1] = 0;
         c->viewport[2] = c->win_w;

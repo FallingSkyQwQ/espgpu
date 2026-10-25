@@ -76,27 +76,43 @@ int format_channels(GLenum f)
 
 } // namespace
 
+namespace {
+
+/** 每像素字节数；格式 / 类型组合不支持时返回 0 */
+int pixel_bytes(GLenum format, GLenum type)
+{
+    const int ch = format_channels(format);
+    if (ch == 0) return 0;
+    switch (type) {
+    case GL_UNSIGNED_BYTE: return ch;
+    case GL_UNSIGNED_SHORT_5_6_5: return format == GL_RGB ? 2 : 0;
+    case GL_UNSIGNED_SHORT_4_4_4_4:
+    case GL_UNSIGNED_SHORT_5_5_5_1: return format == GL_RGBA ? 2 : 0;
+    case GL_FLOAT: return ch * 4;
+    case GL_HALF_FLOAT: case 0x8D61 /* GL_HALF_FLOAT_OES */: return ch * 2;
+    default: return 0;
+    }
+}
+
+} // namespace
+
+size_t unpack_bytes(const Context &c, int w, int h, GLenum format, GLenum type)
+{
+    const int bpp = pixel_bytes(format, type);
+    if (bpp == 0 || w <= 0 || h <= 0) return 0;
+    const int row_px = c.unpack_row_length > 0 ? c.unpack_row_length : w;
+    const int align = std::max(1, c.unpack_alignment);
+    const size_t row_bytes = (static_cast<size_t>(row_px) * bpp + align - 1) / align * align;
+    return (static_cast<size_t>(c.unpack_skip_rows) + static_cast<size_t>(h) - 1) * row_bytes +
+           (static_cast<size_t>(c.unpack_skip_pixels) + static_cast<size_t>(w)) * bpp;
+}
+
 bool unpack_to_rgba(const Context &c, int w, int h, GLenum format, GLenum type, const void *src,
                     std::vector<uint8_t> &out, bool &has_alpha, bool &luminance)
 {
     const int ch = format_channels(format);
-    if (ch == 0) return false;
-    int bpp;
-    switch (type) {
-    case GL_UNSIGNED_BYTE: bpp = ch; break;
-    case GL_UNSIGNED_SHORT_5_6_5:
-        if (format != GL_RGB) return false;
-        bpp = 2;
-        break;
-    case GL_UNSIGNED_SHORT_4_4_4_4:
-    case GL_UNSIGNED_SHORT_5_5_5_1:
-        if (format != GL_RGBA) return false;
-        bpp = 2;
-        break;
-    case GL_FLOAT: bpp = ch * 4; break;
-    case GL_HALF_FLOAT: case 0x8D61 /* GL_HALF_FLOAT_OES */: bpp = ch * 2; break;
-    default: return false;
-    }
+    const int bpp = pixel_bytes(format, type);
+    if (bpp == 0) return false;
     has_alpha = format == GL_RGBA || format == GL_LUMINANCE_ALPHA || format == GL_ALPHA || format == 0x80E1;
     luminance = format == GL_LUMINANCE;
 
@@ -699,6 +715,10 @@ static void attrib_pointer(GLuint index, GLint size, GLenum type, bool normalize
         break;
     default: return set_error(GL_INVALID_ENUM);
     }
+    /* GLES 3.0：非默认 VAO 不允许客户端数组（ES 2 + OES_vertex_array_object 允许，不限制） */
+    if (ctx->version >= 3 && ctx->vao != 0 && ctx->array_buffer == 0 && pointer != nullptr) {
+        return set_error(GL_INVALID_OPERATION);
+    }
     AttribArray &a = ctx->cur_vao().attribs[index];
     a.size = size;
     a.type = type;
@@ -873,7 +893,13 @@ static void tex_image(Texture &t, int w, int h, GLenum internal_format, GLenum f
     if (ctx->pixel_unpack_buffer) {
         auto it = ctx->sh->buffers.find(ctx->pixel_unpack_buffer);
         if (it == ctx->sh->buffers.end()) return set_error(GL_INVALID_OPERATION);
-        src = it->second.data.data() + reinterpret_cast<uintptr_t>(pixels);
+        /* PBO：偏移 + 需要的字节数必须在缓冲内（否则 GL_INVALID_OPERATION，而不是越界读） */
+        const size_t off = reinterpret_cast<uintptr_t>(pixels);
+        const size_t need = unpack_bytes(*ctx, w, h, format, type);
+        if (it->second.mapped || off > it->second.data.size() || need > it->second.data.size() - off) {
+            return set_error(GL_INVALID_OPERATION);
+        }
+        src = it->second.data.data() + off;
     }
     std::vector<uint8_t> rgba;
     bool alpha = true, lum = false;
@@ -947,7 +973,12 @@ GL_APICALL void GL_APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint xo
     if (ctx->pixel_unpack_buffer) {
         auto it = ctx->sh->buffers.find(ctx->pixel_unpack_buffer);
         if (it == ctx->sh->buffers.end()) return set_error(GL_INVALID_OPERATION);
-        src = it->second.data.data() + reinterpret_cast<uintptr_t>(pixels);
+        const size_t off = reinterpret_cast<uintptr_t>(pixels);
+        const size_t need = unpack_bytes(*ctx, width, height, format, type);
+        if (it->second.mapped || off > it->second.data.size() || need > it->second.data.size() - off) {
+            return set_error(GL_INVALID_OPERATION);
+        }
+        src = it->second.data.data() + off;
     }
     std::vector<uint8_t> sub;
     bool alpha, lum;

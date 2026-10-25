@@ -81,9 +81,14 @@ struct FragmentPlan {
     bool alpha_test = false;
     uint8_t alpha_func = 7; /**< ESPGPU_CMP_* */
     uint8_t alpha_ref = 0;
-    int color_input = -1;        /**< 作为顶点色的 varying（inputs 下标） */
-    int color_uniform_slot = -1; /**< 常量色来自哪个 uniform 槽（local_slot） */
-    bool color_white = false;    /**< 模式需要顶点色但着色器里没有：常量白 */
+    int color_input = -1;        /**< 作为顶点色的 varying（inputs 下标）；分量数 3 时 alpha 恒为 1 */
+    /**
+     * 颜色里与片元无关的因子：c 槽（fragment_consts 填好的常量表下标）。逐分量连乘得 K。
+     * 有 color_input 时顶点色 = varying × K（运行时逐顶点乘，插值是线性的所以等价）；
+     * 否则 K 就是 COLOR 命令下发的常量色。空 = (1,1,1,1)。
+     */
+    std::vector<int> color_slots;
+    bool color_white = false;    /**< 模式需要颜色但着色器里既没有顶点色也没有常量因子：常量白 */
 
     /** varying → 设备属性槽（ESPGPU_ATTR_*）。同一 varying 可以出现多次 */
     std::vector<std::pair<int, int>> varying_slots;
@@ -94,12 +99,9 @@ struct FragmentPlan {
     /* VM */
     std::vector<espgpu_vm_insn_t> code;
     uint8_t varying_count = 0;
-    int uniform_slots = 0; /**< c0..c(uniform_slots-1) 是 uniform，之后是常量 */
-    struct ConstSlot {
-        int slot;
-        std::array<float, 4> v;
-    };
-    std::vector<ConstSlot> consts;
+    int uniform_slots = 0; /**< c0..c(uniform_slots-1) 是 uniform，之后是常量与主机预计算值 */
+    int const_slots = 0;   /**< 常量表总槽数（含 uniform）；用 fragment_consts() 生成内容 */
+    int preshader_nodes = 0; /**< 每次绘制在主机上预计算的运算数（只依赖 uniform 的子表达式） */
 };
 
 /** 顶点阶段的设备映射 */
@@ -147,6 +149,21 @@ bool preprocess(const std::string &src, std::string &out, std::string &err, int 
  */
 void run_vertex(const Shader &vs, const float (*inputs)[4], const float (*uniforms)[4],
                 float out_pos[4], float (*out_var)[4]);
+
+/**
+ * 批量执行 n 个顶点：只依赖 uniform 的子表达式整批只算一次。
+ *   inputs = n × vs.inputs.size() 个 vec4（顶点主序）
+ *   out    = n × (1 + vs.outputs.size()) 个 vec4：每个顶点先 gl_Position，再各输出 varying
+ */
+void run_vertex_batch(const Shader &vs, const float (*uniforms)[4], size_t n, const float (*inputs)[4],
+                      float (*out)[4]);
+
+/**
+ * 片元着色器的常量表 c[0 .. frag.const_slots)：uniform 槽原样拷贝，其后是编译期常量
+ * 与主机预计算（preshader）的值。uniforms[k] = 第 k 个 local 槽。每次绘制前调用一次；
+ * VM 模式整表下发 SET_UNIFORMS，内置模式用它取 color_slots。
+ */
+void fragment_consts(const Shader &fs, const float (*uniforms)[4], float (*c)[4]);
 
 /* ── VM 工具 ───────────────────────────────────────────────────────── */
 

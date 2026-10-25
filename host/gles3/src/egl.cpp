@@ -421,7 +421,8 @@ EGLAPI EGLBoolean EGLAPIENTRY eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EG
     t_ctx = c;
     t_draw = d;
     t_read = r;
-    espgpu_gles_make_current(c ? c->gl : nullptr, d ? d->hwnd : nullptr, d ? d->w : 1, d ? d->h : 1);
+    /* 无表面（EGL_KHR_surfaceless_context）传 0×0：GL 侧不能拿它初始化视口 */
+    espgpu_gles_make_current(c ? c->gl : nullptr, d ? d->hwnd : nullptr, d ? d->w : 0, d ? d->h : 0);
     return EGL_TRUE;
 }
 

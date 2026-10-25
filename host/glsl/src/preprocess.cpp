@@ -308,6 +308,30 @@ struct PP {
         return false;
     }
 
+    int skip = 0; /* >0：处于短路掉的分支里，除零不报错 */
+
+    bool is_defined(const std::string &name) const
+    {
+        return macros.count(name) || name == "__VERSION__" || name == "__LINE__" || name == "__FILE__";
+    }
+
+    long long cond()
+    {
+        const long long c = expr(0);
+        if (!accept("?")) return c;
+        if (!c) skip++;
+        const long long a = cond();
+        if (!c) skip--;
+        if (!accept(":")) {
+            fail("missing ':' in #if expression");
+            return 0;
+        }
+        if (c) skip++;
+        const long long b = cond();
+        if (c) skip--;
+        return c ? a : b;
+    }
+
     long long primary()
     {
         const PPTok *t = peek();
@@ -316,7 +340,7 @@ struct PP {
             return 0;
         }
         if (accept("(")) {
-            long long v = expr(0);
+            long long v = cond();
             if (!accept(")")) {
                 fail("missing ')' in #if expression");
             }
@@ -329,7 +353,7 @@ struct PP {
             return ~primary();
         }
         if (accept("-")) {
-            return -primary();
+            return static_cast<long long>(0ull - static_cast<unsigned long long>(primary()));
         }
         if (accept("+")) {
             return primary();
@@ -381,7 +405,10 @@ struct PP {
                 break;
             }
             ep++;
+            const bool short_circuit = (op == "&&" && !lhs) || (op == "||" && lhs);
+            if (short_circuit) skip++;
             long long rhs = expr(p + 1);
+            if (short_circuit) skip--;
             if (op == "||") lhs = lhs || rhs;
             else if (op == "&&") lhs = lhs && rhs;
             else if (op == "|") lhs |= rhs;
@@ -393,17 +420,20 @@ struct PP {
             else if (op == ">") lhs = lhs > rhs;
             else if (op == "<=") lhs = lhs <= rhs;
             else if (op == ">=") lhs = lhs >= rhs;
-            else if (op == "<<") lhs <<= rhs;
-            else if (op == ">>") lhs >>= rhs;
-            else if (op == "+") lhs += rhs;
-            else if (op == "-") lhs -= rhs;
-            else if (op == "*") lhs *= rhs;
+            /* 无符号算术：溢出 / 大移位都有定义（UBSan 干净） */
+            else if (op == "<<") lhs = (rhs < 0 || rhs > 63) ? 0 : static_cast<long long>(static_cast<unsigned long long>(lhs) << rhs);
+            else if (op == ">>") lhs = (rhs < 0 || rhs > 63) ? (lhs < 0 ? -1 : 0) : lhs >> rhs;
+            else if (op == "+") lhs = static_cast<long long>(static_cast<unsigned long long>(lhs) + static_cast<unsigned long long>(rhs));
+            else if (op == "-") lhs = static_cast<long long>(static_cast<unsigned long long>(lhs) - static_cast<unsigned long long>(rhs));
+            else if (op == "*") lhs = static_cast<long long>(static_cast<unsigned long long>(lhs) * static_cast<unsigned long long>(rhs));
             else if (op == "/" || op == "%") {
                 if (rhs == 0) {
-                    fail("division by zero in #if");
-                    return 0;
+                    if (!skip) fail("division by zero in #if");
+                    lhs = 0;
+                    continue;
                 }
-                lhs = (op == "/") ? lhs / rhs : lhs % rhs;
+                if (rhs == -1) lhs = (op == "/") ? static_cast<long long>(0ull - static_cast<unsigned long long>(lhs)) : 0;
+                else lhs = (op == "/") ? lhs / rhs : lhs % rhs;
             }
         }
         return lhs;
@@ -427,8 +457,7 @@ struct PP {
                     return fail("'defined' without identifier");
                 }
                 const std::string &name = toks[j].text;
-                const bool d = macros.count(name) || name == "GL_ES" || name == "__VERSION__" ||
-                               name == "__LINE__" || name == "__FILE__";
+                const bool d = is_defined(name);
                 j++;
                 if (paren) {
                     while (j < toks.size() && toks[j].kind == PPTok::Space) j++;
@@ -445,7 +474,8 @@ struct PP {
         }
         et = expand(pre, {}, 0);
         ep = 0;
-        long long v = expr(0);
+        skip = 0;
+        long long v = cond();
         if (peek() != nullptr) {
             return fail("trailing tokens in #if expression");
         }
@@ -461,8 +491,10 @@ std::string strip_comments(const std::string &src)
     s.reserve(src.size());
     int pending = 0; /* 续行吞掉的换行，在逻辑行结束后补回，保持行号 */
     for (size_t i = 0; i < src.size(); i++) {
-        if (src[i] == '\\' && i + 1 < src.size() && src[i + 1] == '\n') {
-            i++;
+        /* 续行：反斜杠 + LF 或 CRLF（Windows 上的源码多半是 CRLF） */
+        if (src[i] == '\\' && i + 1 < src.size() &&
+            (src[i + 1] == '\n' || (src[i + 1] == '\r' && i + 2 < src.size() && src[i + 2] == '\n'))) {
+            i += src[i + 1] == '\r' ? 2 : 1;
             s += ' ';
             pending++;
             continue;
@@ -554,7 +586,7 @@ bool preprocess(const std::string &src, std::string &out, std::string &err, int 
                 if (n.empty() && active) {
                     pp.fail("#" + dir + " needs an identifier");
                 }
-                bool d = pp.macros.count(n) > 0;
+                bool d = pp.is_defined(n);
                 if (dir == "ifndef") d = !d;
                 stack.push_back({active, d, active && d, false});
             } else if (dir == "if") {

@@ -75,6 +75,7 @@ bool device_open()
     m.vsync = 1;
     espgpu_set_mode(d.dev, &m, ESPGPU_PATTERN_DOOMISH, 1500);
     espgpu_set_codec(d.dev, ESPGPU_CODEC_DELTA_RLE, 500);
+    if (const char *sync = std::getenv("ESPGPU_GLES_SYNC")) d.sync_swap = std::atoi(sync) != 0;
     d.ok = true;
     d.invalidate();
     return true;
@@ -546,34 +547,45 @@ const glsl::ProgramUniform *fs_uniform(const Program &p, int leaf)
     return nullptr;
 }
 
-void upload_consts(const Program &p)
+/** 片元常量表 c[0 .. const_slots)：uniform 存储按 FS local 槽排好，常量 / 主机预计算由编译器填 */
+int frag_consts(const Program &p, float (*c)[4])
 {
-    Device &d = device();
     const auto &fs = *p.fsc;
     const auto &fp = fs.frag;
-    float c[ESPGPU_VM_CONSTS][4] = {};
+    std::vector<std::array<float, 4>> un(static_cast<size_t>(std::max(1, fs.uniform_slot_count)), {0, 0, 0, 0});
     for (size_t li = 0; li < fs.uniforms.size(); li++) {
         const auto &leaf = fs.uniforms[li];
         if (leaf.is_sampler || leaf.local_slot < 0) continue;
         const glsl::ProgramUniform *u = fs_uniform(p, static_cast<int>(li));
         if (!u) continue;
         const int n = leaf.array_size * leaf.columns;
-        for (int k = 0; k < n && leaf.local_slot + k < static_cast<int>(ESPGPU_VM_CONSTS); k++) {
-            std::memcpy(c[leaf.local_slot + k], p.storage[static_cast<size_t>(u->storage + k)].data(), 16);
+        for (int k = 0; k < n && leaf.local_slot + k < fs.uniform_slot_count; k++) {
+            un[static_cast<size_t>(leaf.local_slot + k)] = p.storage[static_cast<size_t>(u->storage + k)];
         }
     }
-    int count = fp.uniform_slots;
-    for (const auto &cs : fp.consts) {
-        if (cs.slot < static_cast<int>(ESPGPU_VM_CONSTS)) {
-            std::memcpy(c[cs.slot], cs.v.data(), 16);
-            count = std::max(count, cs.slot + 1);
-        }
-    }
+    const int count = std::min<int>(fp.const_slots, static_cast<int>(ESPGPU_VM_CONSTS));
+    if (count <= 0) return 0;
+    glsl::fragment_consts(fs, reinterpret_cast<const float(*)[4]>(un.data()), c);
+    return count;
+}
+
+/** 常量寄存器只下发和设备镜像不同的那一段 */
+void upload_consts(const float (*c)[4], int count)
+{
+    Device &d = device();
     if (count <= 0) return;
-    if (d.consts_count >= count && std::memcmp(c, d.consts, static_cast<size_t>(count) * 16) == 0) return;
-    espgpu_cmd_set_uniforms(d.dev, 0, static_cast<uint8_t>(count), &c[0][0]);
-    std::memcpy(d.consts, c, static_cast<size_t>(count) * 16);
-    d.consts_count = std::max(d.consts_count, count);
+    int first = -1, last = -1;
+    for (int i = 0; i < count; i++) {
+        if (i >= d.consts_count || std::memcmp(c[i], d.consts[i], 16) != 0) {
+            if (first < 0) first = i;
+            last = i;
+        }
+    }
+    if (first < 0) return;
+    espgpu_cmd_set_uniforms(d.dev, static_cast<uint8_t>(first), static_cast<uint8_t>(last - first + 1), &c[first][0]);
+    std::memcpy(d.consts[first], c[first], static_cast<size_t>(last - first + 1) * 16);
+    /* 镜像只在 [0, consts_count) 连续有效 */
+    if (first <= std::max(0, d.consts_count)) d.consts_count = std::max(d.consts_count, last + 1);
 }
 
 /** 程序 uniform 的第 slot 槽（按 VS local 槽取） */
@@ -663,7 +675,8 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
 
     /* 1. 索引 */
     std::vector<uint32_t> idx;
-    uint32_t lo = static_cast<uint32_t>(first), hi = static_cast<uint32_t>(first + count - 1);
+    uint32_t lo = static_cast<uint32_t>(first);
+    uint32_t hi = static_cast<uint32_t>(first) + static_cast<uint32_t>(count) - 1u; /* 无符号：不会有符号溢出 */
     if (indexed) {
         int isz;
         switch (itype) {
@@ -704,8 +717,22 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
             hi = std::max(hi, v);
         }
     }
-    const uint32_t nv = hi - lo + 1;
-    if (nv > 4u * 1024 * 1024) return set_error(GL_OUT_OF_MEMORY);
+    /* 顶点表：默认是连续区间 [lo, hi]；索引很稀疏时（大 VBO 里画一小块）只取用到的顶点 */
+    std::vector<uint32_t> vlist;
+    uint64_t nv64 = static_cast<uint64_t>(hi) - lo + 1;
+    if (indexed && nv64 > 2u * static_cast<uint64_t>(count) + 64u) {
+        vlist = idx;
+        std::sort(vlist.begin(), vlist.end());
+        vlist.erase(std::unique(vlist.begin(), vlist.end()), vlist.end());
+        for (auto &v : idx) v = static_cast<uint32_t>(std::lower_bound(vlist.begin(), vlist.end(), v) - vlist.begin());
+        nv64 = vlist.size();
+        lo = 0;
+    } else if (indexed) {
+        for (auto &v : idx) v -= lo;
+    }
+    if (nv64 > 4u * 1024 * 1024) return set_error(GL_OUT_OF_MEMORY);
+    const uint32_t nv = static_cast<uint32_t>(nv64);
+    auto vid = [&](uint32_t v) { return vlist.empty() ? lo + v : vlist[v]; };
 
     /* 2. 属性来源 */
     std::vector<Fetch> fetch(vs.inputs.size());
@@ -733,9 +760,44 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
         }
     }
 
-    /* 3. 设备顶点布局：POSITION + 片元要的每个 varying 槽，全部 F32 */
+    /* 3. 片元常量表（VM 常量 / 内置模式的常量色都从这里取） */
+    if (fp.program) {
+        /* 隐藏 uniform：gl_FragCoord.xy = v6.xy * (kx, ky) + (bx, by)（见编译器 make_fragcoord） */
+        for (const auto &u : p.link.uniforms) {
+            if (u.name != "@fragcoord") continue;
+            auto &v = p.storage[static_cast<size_t>(u.storage)];
+            if (d.target_tex == 0) {
+                const float sy = static_cast<float>(c->win_h) / static_cast<float>(d.height);
+                v = {static_cast<float>(c->win_w) / static_cast<float>(d.width), -sy, 0.0f, static_cast<float>(c->win_h)};
+            } else {
+                v = {1.0f, 1.0f, 0.0f, 0.0f};
+            }
+        }
+    }
+    float consts[ESPGPU_VM_CONSTS][4] = {};
+    const int nconsts = frag_consts(p, consts);
+    /* 内置模式：颜色里与片元无关的因子 K（逐分量连乘） */
+    float K[4] = {1, 1, 1, 1};
+    if (!fp.program) {
+        for (int slot : fp.color_slots) {
+            if (slot < 0 || slot >= nconsts) continue;
+            for (int k = 0; k < 4; k++) K[k] *= consts[slot][k];
+        }
+    }
+    const bool scale_color = !fp.program && fp.color_input >= 0 && (K[0] != 1 || K[1] != 1 || K[2] != 1 || K[3] != 1);
+
+    /* 4. 设备顶点流：POSITION + 片元要的每个 varying 槽 */
     const bool tnl = vp.tnl;
-    const int pos_comps = tnl ? vp.pos_components : 4;
+    struct Stream {
+        uint8_t slot = 0;
+        int comps = 4;
+        uint8_t type = ESPGPU_TYPE_F32;
+        uint8_t norm = 0;
+        int tsize = 4;
+        const Fetch *raw = nullptr; /* 非空：按源格式原样拷贝（T&L 直通） */
+        std::vector<float> f;       /* 否则：nv × comps 个 float */
+    };
+    std::vector<Stream> streams;
     struct Out {
         int slot;
         int comps;
@@ -750,54 +812,90 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
         o.vs_out = p.link.vs_out_for_fs_in[static_cast<size_t>(fs_in)];
         outs.push_back(o);
     }
-    espgpu_vertex_layout_t layout{};
-    int off = 0;
-    auto add_attr = [&](uint8_t slot, int comps) {
-        espgpu_vertex_attrib_t &at = layout.attribs[layout.attrib_count++];
-        at.slot = slot;
-        at.type = ESPGPU_TYPE_F32;
-        at.components = static_cast<uint8_t>(comps);
-        at.normalized = 0;
-        at.offset = static_cast<uint16_t>(off);
-        at.frac_bits = 0;
-        off += comps * 4;
-    };
-    add_attr(ESPGPU_ATTR_POSITION, pos_comps);
-    for (const auto &o : outs) {
-        if (layout.attrib_count >= ESPGPU_MAX_VERTEX_ATTRIBS) break;
-        add_attr(static_cast<uint8_t>(o.slot), o.comps);
-    }
-    layout.stride = static_cast<uint16_t>(off);
-    layout.index_type = 0;
-    const int stride_f = off / 4;
+    if (outs.size() + 1 > ESPGPU_MAX_VERTEX_ATTRIBS) outs.resize(ESPGPU_MAX_VERTEX_ATTRIBS - 1);
 
-    /* 4. 顶点数据 */
-    std::vector<float> verts(static_cast<size_t>(nv) * stride_f);
+    /* 源格式能否原样交给设备（设备的整数解码与 GLES 3.0 一致；半精度设备不认） */
+    auto raw_ok = [&](const Fetch &f, uint8_t slot, int need, Stream &st) {
+        if (!f.base) return false;
+        uint8_t t;
+        int ts;
+        switch (f.type) {
+        case GL_BYTE: t = ESPGPU_TYPE_I8; ts = 1; break;
+        case GL_UNSIGNED_BYTE: t = ESPGPU_TYPE_U8; ts = 1; break;
+        case GL_SHORT: t = ESPGPU_TYPE_I16; ts = 2; break;
+        case GL_UNSIGNED_SHORT: t = ESPGPU_TYPE_U16; ts = 2; break;
+        case GL_INT: t = ESPGPU_TYPE_I32; ts = 4; break;
+        case GL_UNSIGNED_INT: t = ESPGPU_TYPE_U32; ts = 4; break;
+        case GL_FLOAT: t = ESPGPU_TYPE_F32; ts = 4; break;
+        case GL_FIXED: t = ESPGPU_TYPE_FIXED16_16; ts = 4; break;
+        default: return false;
+        }
+        /* 分量不足时设备的缺省值：POSITION / TEXCOORD = (0,0,0,1) 与 GL 相同；COLOR 缺省 1、NORMAL (0,0,1,0) 只在缺 w / 不缺时一致 */
+        if (f.size < need) {
+            if (slot == ESPGPU_ATTR_NORMAL) return false;
+            if (slot == ESPGPU_ATTR_COLOR && f.size < 3) return false;
+        }
+        /* 整个顶点范围都在缓冲内 */
+        const uint32_t vmax = vlist.empty() ? hi : vlist.back();
+        if (f.limit != SIZE_MAX &&
+            static_cast<uint64_t>(vmax) * static_cast<uint64_t>(f.stride) + static_cast<uint64_t>(ts) * f.size > f.limit) {
+            return false;
+        }
+        st.raw = &f;
+        st.type = t;
+        st.tsize = ts;
+        st.norm = f.normalized ? 1 : 0;
+        st.comps = std::min(f.size, need);
+        return true;
+    };
+    auto float_stream = [&](uint8_t slot, int comps) {
+        Stream st;
+        st.slot = slot;
+        st.comps = comps;
+        st.f.resize(static_cast<size_t>(nv) * static_cast<size_t>(comps));
+        return st;
+    };
+
     if (tnl) {
-        for (uint32_t v = 0; v < nv; v++) {
-            float *dst = &verts[static_cast<size_t>(v) * stride_f];
-            float tmp[4];
-            fetch[static_cast<size_t>(vp.pos_input)].get(lo + v, tmp);
-            for (int k = 0; k < pos_comps; k++) dst[k] = tmp[k];
-            int o2 = pos_comps;
-            for (const auto &o : outs) {
-                const int in = o.vs_out >= 0 ? vp.varying_input[static_cast<size_t>(o.vs_out)] : -1;
-                if (in >= 0) fetch[static_cast<size_t>(in)].get(lo + v, tmp);
-                else tmp[0] = tmp[1] = tmp[2] = tmp[3] = 0;
-                for (int k = 0; k < o.comps; k++) dst[o2 + k] = tmp[k];
-                o2 += o.comps;
+        Stream ps;
+        ps.slot = ESPGPU_ATTR_POSITION;
+        const Fetch &pf = fetch[static_cast<size_t>(vp.pos_input)];
+        if (!raw_ok(pf, ESPGPU_ATTR_POSITION, vp.pos_components, ps)) {
+            ps = float_stream(ESPGPU_ATTR_POSITION, vp.pos_components);
+            for (uint32_t v = 0; v < nv; v++) {
+                float t[4];
+                pf.get(vid(v), t);
+                for (int k = 0; k < ps.comps; k++) ps.f[static_cast<size_t>(v) * ps.comps + k] = t[k];
             }
+        }
+        streams.push_back(std::move(ps));
+        for (const auto &o : outs) {
+            const int in = o.vs_out >= 0 ? vp.varying_input[static_cast<size_t>(o.vs_out)] : -1;
+            const bool is_color = o.slot == ESPGPU_ATTR_COLOR && !fp.program;
+            Stream st;
+            st.slot = static_cast<uint8_t>(o.slot);
+            /* 内置模式的顶点色：源已是单字节类型才原样转发，否则走 float 再压成 U8（见下） */
+            if (in >= 0 && !(is_color && scale_color) && raw_ok(fetch[static_cast<size_t>(in)], st.slot, o.comps, st) &&
+                (!is_color || st.tsize == 1)) {
+                streams.push_back(std::move(st));
+                continue;
+            }
+            st = float_stream(static_cast<uint8_t>(o.slot), o.comps);
+            for (uint32_t v = 0; v < nv; v++) {
+                float t[4] = {0, 0, 0, 0};
+                if (in >= 0) fetch[static_cast<size_t>(in)].get(vid(v), t);
+                for (int k = 0; k < o.comps; k++) st.f[static_cast<size_t>(v) * o.comps + k] = is_color ? t[k] * K[k] : t[k];
+            }
+            streams.push_back(std::move(st));
         }
         /* MVP = U0 * U1 * ...（GL 列主序）→ 设备行主序 */
         float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
         for (int ui : vp.mvp_uniforms) {
-            const glsl::UniformLeaf &leaf = vs.uniforms[static_cast<size_t>(ui)];
             const glsl::ProgramUniform *pu = nullptr;
             for (const auto &u : p.link.uniforms) {
                 if (u.vs_leaf == ui) pu = &u;
             }
             if (!pu) continue;
-            (void)leaf;
             float col[16];
             for (int cc = 0; cc < 4; cc++)
                 for (int r = 0; r < 4; r++) col[cc * 4 + r] = p.storage[static_cast<size_t>(pu->storage + cc)][static_cast<size_t>(r)];
@@ -808,25 +906,88 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
             for (int cc = 0; cc < 4; cc++) row[r * 4 + cc] = m[cc * 4 + r];
         send_mvp(row);
     } else {
+        /* 主机执行顶点着色器：整批一次，只依赖 uniform 的子表达式只算一次 */
         std::vector<std::array<float, 4>> un;
         vs_uniform_slots(p, un);
-        std::vector<std::array<float, 4>> in(std::max<size_t>(1, vs.inputs.size()));
-        std::vector<std::array<float, 4>> var(std::max<size_t>(1, vs.outputs.size()));
+        const size_t nin = vs.inputs.size();
+        const size_t nout = 1 + vs.outputs.size();
+        std::vector<std::array<float, 4>> in(std::max<size_t>(1, static_cast<size_t>(nv) * nin));
+        std::vector<std::array<float, 4>> res(static_cast<size_t>(nv) * nout);
         for (uint32_t v = 0; v < nv; v++) {
-            for (size_t i = 0; i < vs.inputs.size(); i++) fetch[i].get(lo + v, in[i].data());
-            float pos[4];
-            glsl::run_vertex(vs, reinterpret_cast<const float(*)[4]>(in.data()),
-                             reinterpret_cast<const float(*)[4]>(un.data()), pos,
-                             reinterpret_cast<float(*)[4]>(var.data()));
-            float *dst = &verts[static_cast<size_t>(v) * stride_f];
-            std::memcpy(dst, pos, 16);
-            int o2 = 4;
-            for (const auto &o : outs) {
-                for (int k = 0; k < o.comps; k++) dst[o2 + k] = o.vs_out >= 0 ? var[static_cast<size_t>(o.vs_out)][static_cast<size_t>(k)] : 0.0f;
-                o2 += o.comps;
+            for (size_t i = 0; i < nin; i++) fetch[i].get(vid(v), in[static_cast<size_t>(v) * nin + i].data());
+        }
+        glsl::run_vertex_batch(vs, reinterpret_cast<const float(*)[4]>(un.data()), nv,
+                               reinterpret_cast<const float(*)[4]>(in.data()), reinterpret_cast<float(*)[4]>(res.data()));
+        /* 裁剪坐标：整批 w 都是 1（2D）就只发 xyz，z 也都是 0 就只发 xy（设备补 z=0 w=1） */
+        bool w1 = true, z0 = true;
+        for (uint32_t v = 0; v < nv; v++) {
+            const auto &pos = res[static_cast<size_t>(v) * nout];
+            w1 = w1 && pos[3] == 1.0f;
+            z0 = z0 && pos[2] == 0.0f;
+        }
+        Stream ps = float_stream(ESPGPU_ATTR_POSITION, w1 ? (z0 ? 2 : 3) : 4);
+        for (uint32_t v = 0; v < nv; v++) {
+            for (int k = 0; k < ps.comps; k++) ps.f[static_cast<size_t>(v) * ps.comps + k] = res[static_cast<size_t>(v) * nout][static_cast<size_t>(k)];
+        }
+        streams.push_back(std::move(ps));
+        for (const auto &o : outs) {
+            const bool is_color = o.slot == ESPGPU_ATTR_COLOR && !fp.program;
+            Stream st = float_stream(static_cast<uint8_t>(o.slot), o.comps);
+            for (uint32_t v = 0; v < nv; v++) {
+                for (int k = 0; k < o.comps; k++) {
+                    const float x = o.vs_out >= 0 ? res[static_cast<size_t>(v) * nout + 1 + static_cast<size_t>(o.vs_out)][static_cast<size_t>(k)] : 0.0f;
+                    st.f[static_cast<size_t>(v) * o.comps + k] = is_color ? x * K[k] : x;
+                }
             }
+            streams.push_back(std::move(st));
         }
         send_mvp(nullptr);
+    }
+    /* 内置模式的顶点色设备最终按 8 位用：值都在 [0,1] 就按 U8 归一化发（16 → 4 字节/顶点） */
+    for (auto &st : streams) {
+        if (st.raw || st.slot != ESPGPU_ATTR_COLOR || fp.program) continue;
+        bool in01 = true;
+        for (float x : st.f) in01 = in01 && x >= 0.0f && x <= 1.0f;
+        if (!in01) continue;
+        st.type = ESPGPU_TYPE_U8;
+        st.norm = 1;
+        st.tsize = 1;
+    }
+
+    espgpu_vertex_layout_t layout{};
+    int off = 0;
+    for (const auto &st : streams) {
+        espgpu_vertex_attrib_t &at = layout.attribs[layout.attrib_count++];
+        at.slot = st.slot;
+        at.type = st.type;
+        at.components = static_cast<uint8_t>(st.comps);
+        at.normalized = st.norm;
+        at.offset = static_cast<uint16_t>(off);
+        at.frac_bits = 0;
+        off += st.comps * st.tsize;
+    }
+    layout.stride = static_cast<uint16_t>(off);
+    layout.index_type = 0;
+    const size_t stride = static_cast<size_t>(off);
+    std::vector<uint8_t> verts(static_cast<size_t>(nv) * stride);
+    {
+        size_t so = 0;
+        for (const auto &st : streams) {
+            const size_t bytes = static_cast<size_t>(st.comps) * st.tsize;
+            if (st.raw) {
+                const Fetch &f = *st.raw;
+                for (uint32_t v = 0; v < nv; v++) {
+                    std::memcpy(&verts[v * stride + so], f.base + static_cast<size_t>(vid(v)) * f.stride, bytes);
+                }
+            } else if (st.type == ESPGPU_TYPE_U8) {
+                for (uint32_t v = 0; v < nv; v++) {
+                    for (int k = 0; k < st.comps; k++) verts[v * stride + so + k] = to8(st.f[static_cast<size_t>(v) * st.comps + k]);
+                }
+            } else {
+                for (uint32_t v = 0; v < nv; v++) std::memcpy(&verts[v * stride + so], &st.f[static_cast<size_t>(v) * st.comps], bytes);
+            }
+            so += bytes;
+        }
     }
 
     /* 5. 纹理 */
@@ -874,20 +1035,9 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
         ext.depth_bias = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, -c->poly_units * 4.0f - c->poly_factor * 4.0f)));
     }
     if (fp.program) {
-        /* 隐藏 uniform：gl_FragCoord 的换算系数（见编译器 make_fragcoord） */
-        for (const auto &u : p.link.uniforms) {
-            if (u.name != "@fragcoord") continue;
-            auto &v = p.storage[static_cast<size_t>(u.storage)];
-            if (d.target_tex == 0) {
-                v = {static_cast<float>(c->win_w) / static_cast<float>(d.width),
-                     static_cast<float>(c->win_h) / static_cast<float>(d.height), static_cast<float>(d.height), -1.0f};
-            } else {
-                v = {1.0f, 1.0f, 0.0f, 1.0f};
-            }
-        }
         pipe.shade_mode = ESPGPU_SHADE_PROGRAM;
         ext.program_id = static_cast<uint8_t>(ensure_program(p));
-        upload_consts(p);
+        upload_consts(consts, nconsts);
         pipe.alpha_test = 0;
         pipe.alpha_func = ESPGPU_CMP_ALWAYS;
     } else {
@@ -895,28 +1045,16 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
         pipe.alpha_test = fp.alpha_test;
         pipe.alpha_func = fp.alpha_func;
         pipe.alpha_ref = fp.alpha_ref;
-        /* 常量色：uniform 或白 */
-        uint8_t col[4] = {255, 255, 255, 255};
-        bool need = fp.color_white;
-        if (fp.color_uniform_slot >= 0) {
-            for (size_t li = 0; li < fs.uniforms.size(); li++) {
-                const auto &leaf = fs.uniforms[li];
-                if (leaf.is_sampler || fp.color_uniform_slot < leaf.local_slot ||
-                    fp.color_uniform_slot >= leaf.local_slot + leaf.array_size * leaf.columns) {
-                    continue;
-                }
-                const glsl::ProgramUniform *pu = fs_uniform(p, static_cast<int>(li));
-                if (!pu) break;
-                const auto &v = p.storage[static_cast<size_t>(pu->storage + fp.color_uniform_slot - leaf.local_slot)];
-                for (int k = 0; k < 4; k++) col[k] = to8(v[static_cast<size_t>(k)]);
-                break;
+        /* 没有顶点色时颜色 = 常量色 K（COLOR 命令）；TEX 模式不用颜色 */
+        const bool need = fp.color_input < 0 && (fp.color_white || !fp.color_slots.empty());
+        if (need) {
+            uint8_t col[4];
+            for (int k = 0; k < 4; k++) col[k] = to8(K[k]);
+            if (!d.color_valid || std::memcmp(col, d.color, 4) != 0) {
+                espgpu_cmd_color(d.dev, col[0], col[1], col[2], col[3]);
+                std::memcpy(d.color, col, 4);
+                d.color_valid = true;
             }
-            need = true;
-        }
-        if (need && (!d.color_valid || std::memcmp(col, d.color, 4) != 0)) {
-            espgpu_cmd_color(d.dev, col[0], col[1], col[2], col[3]);
-            std::memcpy(d.color, col, 4);
-            d.color_valid = true;
         }
     }
     if (!d.pipe_valid || std::memcmp(&pipe, &d.pipe, sizeof(pipe)) != 0 || std::memcmp(&ext, &d.pipe_ext, sizeof(ext)) != 0) {
@@ -936,16 +1074,15 @@ void draw(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *ind
     if (indexed) {
         if (nv <= 65536) {
             std::vector<uint16_t> i16(idx.size());
-            for (size_t i = 0; i < idx.size(); i++) i16[i] = static_cast<uint16_t>(idx[i] - lo);
-            espgpu_cmd_draw(d.dev, prim, verts.data(), nv, static_cast<uint32_t>(stride_f * 4), i16.data(),
+            for (size_t i = 0; i < idx.size(); i++) i16[i] = static_cast<uint16_t>(idx[i]);
+            espgpu_cmd_draw(d.dev, prim, verts.data(), nv, static_cast<uint32_t>(stride), i16.data(),
                             static_cast<uint32_t>(i16.size()), 1);
         } else {
-            for (auto &v : idx) v -= lo;
-            espgpu_cmd_draw(d.dev, prim, verts.data(), nv, static_cast<uint32_t>(stride_f * 4), idx.data(),
+            espgpu_cmd_draw(d.dev, prim, verts.data(), nv, static_cast<uint32_t>(stride), idx.data(),
                             static_cast<uint32_t>(idx.size()), 2);
         }
     } else {
-        espgpu_cmd_draw(d.dev, prim, verts.data(), nv, static_cast<uint32_t>(stride_f * 4), nullptr, 0, 0);
+        espgpu_cmd_draw(d.dev, prim, verts.data(), nv, static_cast<uint32_t>(stride), nullptr, 0, 0);
     }
 }
 
@@ -989,9 +1126,21 @@ void swap_buffers()
     espgpu_cmd_present(d.dev, 500);
     d.frame_counter++;
 
-    /* 等这一帧回来（有上限，避免设备卡住时拖死应用） */
+    /*
+     * 节奏：允许一帧在路上。等的是上一次 PRESENT 的那一帧，这样应用准备第 N+1 帧的命令时
+     * 设备还在光栅 / 编码 / 回传第 N 帧（设备侧本来就是双槽流水），而不是每帧串行地
+     * "主机提交 → 设备算完 → 回传完" 再开始下一帧。ESPGPU_GLES_SYNC=1 恢复逐帧同步。
+     * 等待有上限，避免设备卡住时拖死应用。
+     */
     const int wait_ms = c->swap_interval > 0 ? 200 : 30;
-    espgpu_wait_frame(d.dev, before, wait_ms);
+    if (d.sync_swap) {
+        espgpu_wait_frame(d.dev, before, wait_ms);
+        d.inflight = false;
+    } else {
+        if (d.inflight) espgpu_wait_frame(d.dev, d.inflight_before, wait_ms);
+        d.inflight_before = before;
+        d.inflight = true;
+    }
 
     if (c->hwnd) {
         RECT rc;
@@ -1080,20 +1229,35 @@ void read_pixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum t
         return set_error(GL_INVALID_OPERATION);
     }
     if (c->read_fbo) warn_once("glReadPixels from an FBO (returns the last presented frame)");
+    if (w == 0 || h == 0) return;
     uint8_t *dst = static_cast<uint8_t *>(out);
+    const int row_px = c->pack_row_length > 0 ? c->pack_row_length : w;
+    const int align = std::max(1, c->pack_alignment);
+    const size_t row_bytes = (static_cast<size_t>(row_px) * 4 + align - 1) / align * align;
     if (c->pixel_pack_buffer) {
         auto it = c->sh->buffers.find(c->pixel_pack_buffer);
         if (it == c->sh->buffers.end()) return set_error(GL_INVALID_OPERATION);
-        dst = it->second.data.data() + reinterpret_cast<uintptr_t>(out);
+        /* PBO：写入范围必须在缓冲内 */
+        const size_t off = reinterpret_cast<uintptr_t>(out);
+        const size_t need = (static_cast<size_t>(c->pack_skip_rows) + static_cast<size_t>(h) - 1) * row_bytes +
+                            (static_cast<size_t>(c->pack_skip_pixels) + static_cast<size_t>(w)) * 4;
+        if (it->second.mapped || off > it->second.data.size() || need > it->second.data.size() - off) {
+            return set_error(GL_INVALID_OPERATION);
+        }
+        dst = it->second.data.data() + off;
+    } else if (!dst) {
+        return;
     }
-    /* 设备只在 PRESENT 时回传帧：这里读的是上一帧（与 SwapBuffers 之后读截图的常见用法一致） */
+    /* 设备只在 PRESENT 时回传帧：这里读的是最近一次呈现的帧（SwapBuffers 之后读截图的常见用法）。
+     * SwapBuffers 允许一帧在路上，先把它等回来 */
+    if (d.ok && d.inflight) {
+        espgpu_wait_frame(d.dev, d.inflight_before, 500);
+        d.inflight = false;
+    }
     std::vector<uint8_t> frame(static_cast<size_t>(d.width) * d.height * 4);
     int fw = 0, fh = 0;
     uint32_t fid = 0;
     const bool have = d.ok && espgpu_frame_snapshot_bgra(d.dev, frame.data(), frame.size(), 0, &fw, &fh, &fid) == 0;
-    const int row_px = c->pack_row_length > 0 ? c->pack_row_length : w;
-    const int align = std::max(1, c->pack_alignment);
-    const size_t row_bytes = (static_cast<size_t>(row_px) * 4 + align - 1) / align * align;
     for (int j = 0; j < h; j++) {
         uint8_t *row = dst + static_cast<size_t>(j + c->pack_skip_rows) * row_bytes + static_cast<size_t>(c->pack_skip_pixels) * 4;
         for (int i = 0; i < w; i++) {

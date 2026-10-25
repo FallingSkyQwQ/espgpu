@@ -2,7 +2,8 @@
  * dag.cpp — 运算语义、DAG 解释执行（顶点着色器）、VM 参考解释器、反汇编
  *
  * eval_op 是唯一的数值语义来源：编译期常量折叠、主机端顶点着色器执行、
- * VM 参考解释器都调用它，保证三者结果一致。
+ * VM 参考解释器都调用它，保证三者结果一致。边界情况（除零、负数开方 / 对数 / 幂、
+ * smoothstep 两端相等）逐条照抄 firmware/core/vm.c，折叠与否结果都和设备相同。
  */
 
 #include "internal.h"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace espgpu::glsl {
@@ -27,12 +29,13 @@ void eval_op(uint8_t op, const float a[4], const float b[4], const float c[4], f
         return;
     }
     case ESPGPU_VM_RCP: {
-        const float v = 1.0f / a[0];
+        const float v = a[0] != 0.0f ? 1.0f / a[0] : 0.0f;
         d[0] = d[1] = d[2] = d[3] = v;
         return;
     }
     case ESPGPU_VM_RSQ: {
-        const float v = 1.0f / std::sqrt(std::fabs(a[0]));
+        const float s = std::fabs(a[0]);
+        const float v = s > 0.0f ? 1.0f / std::sqrt(s) : 0.0f;
         d[0] = d[1] = d[2] = d[3] = v;
         return;
     }
@@ -47,13 +50,13 @@ void eval_op(uint8_t op, const float a[4], const float b[4], const float c[4], f
         case ESPGPU_VM_SUB: r = x - y; break;
         case ESPGPU_VM_MUL: r = x * y; break;
         case ESPGPU_VM_MAD: r = x * y + z; break;
-        case ESPGPU_VM_DIV: r = x / y; break;
-        case ESPGPU_VM_MIN: r = std::min(x, y); break;
-        case ESPGPU_VM_MAX: r = std::max(x, y); break;
-        case ESPGPU_VM_SQRT: r = std::sqrt(x); break;
+        case ESPGPU_VM_DIV: r = y != 0.0f ? x / y : 0.0f; break;
+        case ESPGPU_VM_MIN: r = x < y ? x : y; break;
+        case ESPGPU_VM_MAX: r = x > y ? x : y; break;
+        case ESPGPU_VM_SQRT: r = std::sqrt(std::fabs(x)); break;
         case ESPGPU_VM_EXP2: r = std::exp2(x); break;
-        case ESPGPU_VM_LOG2: r = std::log2(x); break;
-        case ESPGPU_VM_POW: r = std::pow(x, y); break;
+        case ESPGPU_VM_LOG2: r = x > 0.0f ? std::log2(x) : -126.0f; break;
+        case ESPGPU_VM_POW: r = std::pow(x < 0.0f ? 0.0f : x, y); break;
         case ESPGPU_VM_FRC: r = x - std::floor(x); break;
         case ESPGPU_VM_FLR: r = std::floor(x); break;
         case ESPGPU_VM_ABS: r = std::fabs(x); break;
@@ -64,15 +67,16 @@ void eval_op(uint8_t op, const float a[4], const float b[4], const float c[4], f
         case ESPGPU_VM_LRP: r = y + x * (z - y); break;
         case ESPGPU_VM_CMP: r = x < 0 ? y : z; break;
         case ESPGPU_VM_SEL: r = x != 0 ? y : z; break;
-        case ESPGPU_VM_CLAMP: r = std::min(std::max(x, y), z); break;
+        case ESPGPU_VM_CLAMP: r = x < y ? y : (x > z ? z : x); break;
         case ESPGPU_VM_SIN: r = std::sin(x); break;
         case ESPGPU_VM_COS: r = std::cos(x); break;
-        case ESPGPU_VM_MOD: r = x - y * std::floor(x / y); break;
+        case ESPGPU_VM_MOD: r = y != 0.0f ? x - y * std::floor(x / y) : 0.0f; break;
         case ESPGPU_VM_SIGN: r = x > 0 ? 1.0f : (x < 0 ? -1.0f : 0.0f); break;
         case ESPGPU_VM_STEP: r = x >= y ? 1.0f : 0.0f; break;
         case ESPGPU_VM_SMOOTH: {
-            float t = (z - x) / (y - x);
-            t = std::min(std::max(t, 0.0f), 1.0f);
+            const float dd = y - x;
+            float t = dd != 0.0f ? (z - x) / dd : (z >= y ? 1.0f : 0.0f);
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
             r = t * t * (3.0f - 2.0f * t);
             break;
         }
@@ -82,28 +86,28 @@ void eval_op(uint8_t op, const float a[4], const float b[4], const float c[4], f
     }
 }
 
-/* ── 顶点着色器解释执行 ─────────────────────────────────────────── */
+/* ── 顶点着色器解释执行 / 主机预计算 ───────────────────────────── */
 
 namespace {
 
-void gather(const Operand &o, const std::vector<std::array<float, 4>> &val, float out[4])
+using Vals = std::vector<std::array<float, 4>>;
+
+inline void gather(const Operand &o, const Vals &val, float out[4])
 {
     for (int i = 0; i < 4; i++) {
         const Scalar &s = o.s[std::min<int>(i, o.n - 1)];
         out[i] = val[static_cast<size_t>(s.node)][s.comp];
     }
+    if (o.neg) {
+        for (int i = 0; i < 4; i++) out[i] = -out[i];
+    }
 }
 
-} // namespace
-
-void run_vertex(const Shader &vs, const float (*inputs)[4], const float (*uniforms)[4],
-                float out_pos[4], float (*out_var)[4])
+/** 按拓扑序求值一串节点（Const / Uniform / Attrib / Op） */
+void eval_nodes(const Dag &d, const std::vector<int> &order, const float (*inputs)[4], const float (*uniforms)[4],
+                Vals &val)
 {
-    const Dag &d = *vs.dag;
-    thread_local std::vector<std::array<float, 4>> val;
-    if (val.size() < d.nodes.size()) val.resize(d.nodes.size());
-
-    for (int id : d.live_order) {
+    for (int id : order) {
         const Node &n = d.nodes[static_cast<size_t>(id)];
         std::array<float, 4> &r = val[static_cast<size_t>(id)];
         switch (n.kind) {
@@ -115,31 +119,77 @@ void run_vertex(const Shader &vs, const float (*inputs)[4], const float (*unifor
             for (int i = 0; i < 4; i++) r[static_cast<size_t>(i)] = uniforms[n.index][i];
             break;
         case NK::Op: {
-            float a[4] = {0, 0, 0, 0}, b[4] = {0, 0, 0, 0}, c[4] = {0, 0, 0, 0};
-            if (n.nargs > 0) gather(n.a[0], val, a);
+            float a[4], b[4] = {0, 0, 0, 0}, c[4] = {0, 0, 0, 0};
+            gather(n.a[0], val, a);
             if (n.nargs > 1) gather(n.a[1], val, b);
             if (n.nargs > 2) gather(n.a[2], val, c);
             eval_op(n.op, a, b, c, r.data());
+            if (n.flags & ESPGPU_VM_F_SAT) {
+                for (float &x : r) x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+            }
             break;
         }
         default: r = {0, 0, 0, 0}; break;
         }
     }
+}
 
-    auto fetch = [&](const Operand &o, float *dst, int n) {
-        for (int i = 0; i < n; i++) {
-            if (i < o.n) {
-                const Scalar &s = o.s[i];
-                dst[i] = val[static_cast<size_t>(s.node)][s.comp];
-            } else {
-                dst[i] = i == 3 ? 1.0f : 0.0f;
-            }
+inline float scalar_of(const Vals &val, const Operand &o, int i)
+{
+    const Scalar &s = o.s[i];
+    const float v = val[static_cast<size_t>(s.node)][s.comp];
+    return o.neg ? -v : v;
+}
+
+} // namespace
+
+void run_vertex_batch(const Shader &vs, const float (*uniforms)[4], size_t n, const float (*inputs)[4],
+                      float (*out)[4])
+{
+    const Dag &d = *vs.dag;
+    thread_local Vals val;
+    if (val.size() < d.nodes.size()) val.resize(d.nodes.size());
+    eval_nodes(d, d.pre_order, nullptr, uniforms, val); /* 只依赖 uniform 的部分：整批一次 */
+
+    const size_t nin = vs.inputs.size();
+    const size_t nout = 1 + d.var_out.size();
+    for (size_t v = 0; v < n; v++) {
+        eval_nodes(d, d.live_order, inputs + v * nin, uniforms, val);
+        float(*o)[4] = out + v * nout;
+        for (int i = 0; i < 4; i++) o[0][i] = i < d.position.n ? scalar_of(val, d.position, i) : (i == 3 ? 1.0f : 0.0f);
+        for (size_t j = 0; j < d.var_out.size(); j++) {
+            const Operand &vo = d.var_out[j];
+            for (int i = 0; i < 4; i++) o[1 + j][i] = i < vo.n ? scalar_of(val, vo, i) : (i == 3 ? 1.0f : 0.0f);
         }
-    };
-    fetch(d.position, out_pos, 4);
-    for (size_t j = 0; j < d.var_out.size(); j++) {
-        fetch(d.var_out[j], out_var[j], 4);
-        for (int i = d.var_out[j].n; i < 4; i++) out_var[j][i] = i == 3 ? 1.0f : 0.0f;
+    }
+}
+
+void run_vertex(const Shader &vs, const float (*inputs)[4], const float (*uniforms)[4],
+                float out_pos[4], float (*out_var)[4])
+{
+    const size_t nout = 1 + vs.dag->var_out.size();
+    thread_local std::vector<std::array<float, 4>> tmp;
+    tmp.resize(nout);
+    run_vertex_batch(vs, uniforms, 1, inputs, reinterpret_cast<float(*)[4]>(tmp.data()));
+    std::memcpy(out_pos, tmp[0].data(), 16);
+    for (size_t j = 1; j < nout; j++) std::memcpy(out_var[j - 1], tmp[j].data(), 16);
+}
+
+void fragment_consts(const Shader &fs, const float (*uniforms)[4], float (*c)[4])
+{
+    const FragmentPlan &fp = fs.frag;
+    const Dag &d = *fs.dag;
+    for (int i = 0; i < fp.uniform_slots && i < fp.const_slots; i++) std::memcpy(c[i], uniforms[i], 16);
+    if (d.xslots.empty()) return;
+    thread_local Vals val;
+    if (val.size() < d.nodes.size()) val.resize(d.nodes.size());
+    eval_nodes(d, d.pre_order, nullptr, uniforms, val);
+    for (size_t j = 0; j < d.xslots.size(); j++) {
+        float *dst = c[static_cast<size_t>(fp.uniform_slots) + j];
+        for (int k = 0; k < 4; k++) {
+            const PreLane &l = d.xslots[j][static_cast<size_t>(k)];
+            dst[k] = l.node < 0 ? l.k : val[static_cast<size_t>(l.node)][l.comp];
+        }
     }
 }
 

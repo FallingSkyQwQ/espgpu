@@ -23,3 +23,8 @@ endif()
 add_executable(glsl-tests tests/glsl_tests.cpp)
 target_link_libraries(glsl-tests PRIVATE espgpu_glsl)
 target_include_directories(glsl-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# 有设备核心库时与固件 VM（firmware/core/vm.c）做差分
+if(TARGET espgpu_core)
+    target_link_libraries(glsl-tests PRIVATE espgpu_core)
+    target_compile_definitions(glsl-tests PRIVATE GLSL_TESTS_FIRMWARE_VM=1)
+endif()
