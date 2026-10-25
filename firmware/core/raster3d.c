@@ -1180,55 +1180,75 @@ GP_INLINE int px_depth(const pxs_t *k, uint32_t Z, uint32_t dZ, const uint16_t *
  * 合成一遍：中间值留在寄存器里，省掉 trb / tga 在栈上的来回存取和每遍重算 ix[j]。
  * 运算顺序与多遍版本完全相同，输出逐位一致。
  */
+/**
+ * 一个片元：取样 → 常量色调制 → 雾 → 输出 RGB565。
+ * 单独成 inline 函数是为了让 px_fused_n 手动两像素展开时两次调用互相独立：
+ * Xtensa 是顺序流水，一个像素的链（取样依赖 → 乘 → 乘）不展开就只能干等。
+ */
+GP_INLINE uint32_t px_fused_px(const pxs_t *k, int kind, int i, const px_seg_t *sg, int32_t U,
+                               int32_t dU, int32_t V, int32_t dV)
+{
+    const uint32_t mu = k->mu, mv = k->mv;
+    const int tw = k->tw, th = k->th;
+    int iu = (int)((uint32_t)((U + (uint32_t)i * dU) >> 16) & mu);
+    int iv = (int)((uint32_t)((V + (uint32_t)i * dV) >> 16) & mv);
+    if ((unsigned)iu >= (unsigned)tw) iu = px_wrap(iu, tw, k->wu);
+    if ((unsigned)iv >= (unsigned)th) iv = px_wrap(iv, th, k->wv);
+    const uint32_t ti = (uint32_t)(iv * tw + iu);
+    uint32_t rb, g;
+    if (kind == PK_565) {
+        const uint32_t p = k->px[ti];
+        rb = rb_of565(p);
+        g = g_of565(p);
+    } else {
+        const uint32_t v = k->idx[ti];
+        if (k->px) {
+            const uint32_t p = k->px[v]; /* 调色板 */
+            rb = rb_of565(p);
+            g = g_of565(p);
+        } else {
+            rb = (v << 16) | v;
+            g = v;
+        }
+    }
+    if (k->cgray) {
+        rb = mul_rb(rb, k->cr);
+        g = gp_mul8(g, k->cr);
+    } else {
+        rb = (gp_mul8(rb >> 16, k->cr) << 16) | gp_mul8(rb & 255u, k->cb);
+        g = gp_mul8(g, k->cg);
+    }
+    if (k->fog) {
+        const uint32_t f = ((sg->F + (uint32_t)i * sg->dF) >> 8) & 255u;
+        rb = mul_rb(rb, f) + k->fog_rbt[f];
+        g = gp_mul8(g, f) + k->fog_gt[f];
+    }
+    return pack_rbg(rb, g);
+}
+
 GP_INLINE uint32_t px_fused_n(const pxs_t *k, int kind, const px_seg_t *sg, uint16_t *cp,
                               uint16_t *dp, int n, const uint8_t *ix, const uint16_t *zz,
                               int32_t U, int32_t dU, int32_t V, int32_t dV, bool dense)
 {
-    const uint32_t mu = k->mu, mv = k->mv;
-    const int tw = k->tw, th = k->th;
-    const uint32_t cr = k->cr, cg = k->cg, cb = k->cb;
-    const bool gray = k->cgray != 0;
-    const uint32_t F = sg->F, dF = sg->dF;
-    const bool fog = k->fog != 0, zw = k->zwrite != 0;
-    const uint32_t *frt = k->fog_rbt;
-    const uint8_t *fgt = k->fog_gt;
-    for (int j = 0; j < n; j++) {
-        /* 整段的像素都通过深度时没有压缩，下标直接是 j（省掉 ix 的间接访存） */
-        const int i = dense ? j : ix[j];
-        int iu = (int)((uint32_t)((U + (uint32_t)i * dU) >> 16) & mu);
-        int iv = (int)((uint32_t)((V + (uint32_t)i * dV) >> 16) & mv);
-        if ((unsigned)iu >= (unsigned)tw) iu = px_wrap(iu, tw, k->wu);
-        if ((unsigned)iv >= (unsigned)th) iv = px_wrap(iv, th, k->wv);
-        const uint32_t ti = (uint32_t)(iv * tw + iu);
-        uint32_t rb, g;
-        if (kind == PK_565) {
-            const uint32_t p = k->px[ti];
-            rb = rb_of565(p);
-            g = g_of565(p);
-        } else {
-            const uint32_t v = k->idx[ti];
-            if (k->px) {
-                const uint32_t p = k->px[v]; /* 调色板 */
-                rb = rb_of565(p);
-                g = g_of565(p);
-            } else {
-                rb = (v << 16) | v;
-                g = v;
+    const bool zw = k->zwrite != 0;
+    int j = 0;
+    /* 两像素展开：两次取样 / 调制 / 雾 / 打包互不依赖，流水线能交错起来 */
+    if (dense) {
+        for (; j + 1 < n; j += 2) {
+            const uint32_t c0 = px_fused_px(k, kind, j, sg, U, dU, V, dV);
+            const uint32_t c1 = px_fused_px(k, kind, j + 1, sg, U, dU, V, dV);
+            cp[j] = (uint16_t)c0;
+            cp[j + 1] = (uint16_t)c1;
+            if (zw) {
+                dp[j] = zz[j];
+                dp[j + 1] = zz[j + 1];
             }
         }
-        if (gray) {
-            rb = mul_rb(rb, cr);
-            g = gp_mul8(g, cr);
-        } else {
-            rb = (gp_mul8(rb >> 16, cr) << 16) | gp_mul8(rb & 255u, cb);
-            g = gp_mul8(g, cg);
-        }
-        if (fog) {
-            const uint32_t f = ((F + (uint32_t)i * dF) >> 8) & 255u;
-            rb = mul_rb(rb, f) + frt[f];
-            g = gp_mul8(g, f) + fgt[f];
-        }
-        cp[i] = (uint16_t)pack_rbg(rb, g);
+    }
+    for (; j < n; j++) {
+        /* 整段的像素都通过深度时没有压缩，下标直接是 j（省掉 ix 的间接访存） */
+        const int i = dense ? j : ix[j];
+        cp[i] = (uint16_t)px_fused_px(k, kind, i, sg, U, dU, V, dV);
         if (zw) {
             dp[i] = zz[j];
         }
@@ -1551,7 +1571,7 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
 }
 
 /** 能否走像素管线快速路径：能则填好 k、返回取样方式（PK_*），否则 -1 */
-static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k, gp_worker_t *w)
+GP_HOT static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k, gp_worker_t *w)
 {
 #ifdef GP_TEST_NO_PX
     return -1; /* 测试用：强制走通用路径，与快速路径逐像素对比 */
