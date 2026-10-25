@@ -6,7 +6,9 @@
 
 #include "internal.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -120,6 +122,10 @@ espgpu_device_t *espgpu_open(int index, char *err, size_t err_cap)
         log_msg(LOG_INFO, "device info: fw %u.%u.%u, %ux%u max, psram %uMB, caps 0x%04X",
                 info.fw_major, info.fw_minor, info.fw_patch, info.max_width, info.max_height,
                 info.psram_mb, info.capabilities);
+        dev->info = info;
+        dev->have_info = true;
+        /* 设备声明能解 LZ 才压缩下行，老固件照旧发原文 */
+        dev->compress = (info.capabilities & ESPGPU_CAP_LZ) != 0;
     }
 
     return dev;
@@ -168,6 +174,8 @@ int espgpu_get_info(espgpu_device_t *dev, espgpu_device_info_t *info, int timeou
         return st != ESPGPU_OK ? st : -1;
     }
     memcpy(info, resp.data(), sizeof(*info));
+    dev->info = *info;
+    dev->have_info = true;
     return 0;
 }
 
@@ -179,10 +187,13 @@ int espgpu_get_stats(espgpu_device_t *dev, espgpu_stats_t *stats, int timeout_ms
     std::vector<uint8_t> resp;
     const int st = link_ctrl(dev, ESPGPU_CTRL_GET_STATS, 0, 0, nullptr, 0, resp,
                              static_cast<DWORD>(timeout_ms));
-    if (st != ESPGPU_OK || resp.size() < sizeof(*stats)) {
+    /* 老固件的 stats 只到 seq_gaps：缺的追加字段按 0 处理 */
+    constexpr size_t kLegacySize = offsetof(espgpu_stats_t, tex_resident);
+    if (st != ESPGPU_OK || resp.size() < kLegacySize) {
         return st != ESPGPU_OK ? st : -1;
     }
-    memcpy(stats, resp.data(), sizeof(*stats));
+    memset(stats, 0, sizeof(*stats));
+    memcpy(stats, resp.data(), std::min(resp.size(), sizeof(*stats)));
     return 0;
 }
 

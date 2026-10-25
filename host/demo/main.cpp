@@ -182,6 +182,7 @@ int main(int argc, char **argv)
 
     long max_frames = 0;
     bool stress_scroll = false;
+    int drawcalls = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             max_frames = atol(argv[++i]);
@@ -189,6 +190,9 @@ int main(int argc, char **argv)
             /* 全屏滚动：每帧每个像素都变，差分压缩完全失效，
              * 用来测链路上限，不代表真实负载。 */
             stress_scroll = true;
+        } else if (strcmp(argv[i], "--drawcalls") == 0 && i + 1 < argc) {
+            /* M2 验收：N 个小精灵，每个一次独立 drawcall（绑定 + 状态 + 绘制） */
+            drawcalls = atoi(argv[++i]);
         }
     }
 
@@ -217,7 +221,8 @@ int main(int argc, char **argv)
     espgpu_cmd_upload_texture(dev, 2, 48, 48, ESPGPU_FMT_RGBA4444, sprite.data());
     espgpu_cmd_present(dev, 1000);
 
-    printf("espgpu-demo: %ux%u @ %d fps, Ctrl+C to stop\n", kWidth, kHeight, kTargetFps);
+    printf("espgpu-demo: %ux%u @ %d fps, %d extra drawcalls, Ctrl+C to stop\n", kWidth, kHeight,
+           kTargetFps, drawcalls);
     printf("open espgpu-panel.exe and switch to the Viewer page\n");
 
     std::vector<espgpu_vertex2d_t> verts;
@@ -286,6 +291,26 @@ int main(int argc, char **argv)
                                     ESPGPU_WRAP_CLAMP, 1, 8);
             espgpu_cmd_bind_texture(dev, 2, ESPGPU_FILTER_LINEAR, ESPGPU_WRAP_CLAMP);
             espgpu_cmd_draw_quads(dev, verts.data(), static_cast<uint32_t>(verts.size() / 4));
+            verts.clear();
+        }
+
+        /* 2b. drawcall 压力：N 个 8x8 精灵绕圈，每个单独设置状态与纹理 */
+        for (int i = 0; i < drawcalls; i++) {
+            const float a = angle * 0.5f + static_cast<float>(i) * 0.0125f * 6.2831853f;
+            const float r = 20.0f + static_cast<float>(i % 50) * 1.6f;
+            const float cx = kWidth * 0.5f + std::cos(a) * r * 1.6f;
+            const float cy = kHeight * 0.5f + std::sin(a) * r;
+            float x[4] = {cx - 4, cx + 4, cx + 4, cx - 4};
+            float y[4] = {cy - 4, cy - 4, cy + 4, cy + 4};
+            const bool spr = (i & 1) != 0;
+            const float tw = spr ? 48.0f : 16.0f;
+            float u[4] = {0, tw, tw, 0};
+            float v[4] = {0, 0, tw, tw};
+            push_quad(verts, x, y, u, v, 0xFFFF);
+            espgpu_cmd_set_pipeline(dev, spr ? ESPGPU_BLEND_ALPHA : ESPGPU_BLEND_NONE,
+                                    ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT, spr ? 1 : 0, 8);
+            espgpu_cmd_bind_texture(dev, spr ? 2 : 1, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT);
+            espgpu_cmd_draw_quads(dev, verts.data(), 1);
             verts.clear();
         }
 

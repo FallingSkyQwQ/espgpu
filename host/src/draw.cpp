@@ -14,12 +14,9 @@
 
 using namespace espgpu;
 
-namespace {
+namespace espgpu {
 
-/* 留出余量给命令头，保证任何一条 push 之后都还塞得进一个完整 Chunk */
-constexpr size_t kFlushThreshold = 24 * 1024;
-
-int flush(espgpu_device *dev, int timeout_ms)
+int cmd_flush(espgpu_device *dev, int timeout_ms)
 {
     if (dev->cmd_buf.empty()) {
         return 0;
@@ -35,16 +32,20 @@ int flush(espgpu_device *dev, int timeout_ms)
     return rc;
 }
 
-void push(espgpu_device *dev, uint8_t op, const void *body, uint16_t size)
+void cmd_push(espgpu_device *dev, uint8_t op, uint8_t flags, const void *body, uint32_t size)
 {
-    if (dev->cmd_buf.size() + sizeof(espgpu_cmd_t) + size > kFlushThreshold) {
-        flush(dev, 500);
+    if (size > kCmdMaxBody) {
+        log_msg(LOG_ERROR, "command 0x%02X body too large (%u), dropped", op, size);
+        return;
+    }
+    if (dev->cmd_buf.size() + sizeof(espgpu_cmd_t) + size > kCmdFlushThreshold) {
+        cmd_flush(dev, 500);
     }
 
     espgpu_cmd_t cmd{};
     cmd.op = op;
-    cmd.flags = 0;
-    cmd.size = size;
+    cmd.flags = flags;
+    cmd.size = static_cast<uint16_t>(size);
 
     const auto *p = reinterpret_cast<const uint8_t *>(&cmd);
     dev->cmd_buf.insert(dev->cmd_buf.end(), p, p + sizeof(cmd));
@@ -54,6 +55,22 @@ void push(espgpu_device *dev, uint8_t op, const void *body, uint16_t size)
         dev->cmd_buf.insert(dev->cmd_buf.end(), b, b + size);
     }
 }
+
+} // namespace espgpu
+
+namespace {
+
+inline void push(espgpu_device *dev, uint8_t op, const void *body, uint16_t size)
+{
+    cmd_push(dev, op, 0, body, size);
+}
+
+inline int flush(espgpu_device *dev, int timeout_ms)
+{
+    return cmd_flush(dev, timeout_ms);
+}
+
+constexpr size_t kFlushThreshold = kCmdFlushThreshold;
 
 } // namespace
 
@@ -110,7 +127,8 @@ int espgpu_cmd_upload_texture(espgpu_device_t *dev, uint32_t id, uint16_t width,
 
     const uint32_t total = static_cast<uint32_t>(width) * height * 2;
     /* 每个分片留出上传头 + 命令头的空间 */
-    const uint32_t max_frag = static_cast<uint32_t>(kFlushThreshold) - 64;
+    const uint32_t max_frag =
+        static_cast<uint32_t>(kCmdMaxBody - sizeof(espgpu_upload_texture_t));
     const auto *src = static_cast<const uint8_t *>(pixels);
 
     uint32_t off = 0;

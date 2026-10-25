@@ -9,6 +9,8 @@
 
 #include "internal.h"
 
+#include "espgpu_lz.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -132,6 +134,16 @@ void dispatch(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8_t *
             memcpy(&ev, payload, sizeof(ev));
             log_msg(LOG_DEBUG, "event kind=%u code=%u value=%u arg=%u", ev.kind, ev.code,
                     ev.value, ev.arg);
+            std::lock_guard<std::mutex> lk(dev->evt_mu);
+            if (ev.kind == ESPGPU_EVT_FENCE) {
+                dev->last_fence = ev.arg;
+                dev->have_fence = true;
+            }
+            dev->events.push_back(ev);
+            while (dev->events.size() > 1024) {
+                dev->events.pop_front();
+            }
+            dev->evt_cv.notify_all();
         }
         break;
     case ESPGPU_CHUNK_LOG:
@@ -227,6 +239,8 @@ void reader_main(espgpu_device *dev)
             if (dev->running.load()) {
                 log_msg(LOG_ERROR, "bulk IN failed, marking device offline");
                 dev->connected = false;
+                { std::lock_guard<std::mutex> lk(dev->frame_mu); dev->frame_cv.notify_all(); }
+                { std::lock_guard<std::mutex> lk(dev->evt_mu); dev->evt_cv.notify_all(); }
             }
             break;
         }
@@ -267,18 +281,37 @@ int link_send_chunk_iov(espgpu_device *dev, uint8_t type, uint8_t flags, const v
     hdr.seq = seq++;
     hdr.length = static_cast<uint16_t>(total);
     hdr.type = type;
-    hdr.flags = static_cast<uint8_t>(flags & ~ESPGPU_F_CRC);
+    hdr.flags = static_cast<uint8_t>(flags & ~(ESPGPU_F_CRC | ESPGPU_F_LZ));
 
     /* 头和载荷拼成一次写，避免设备端看到半截 Chunk */
     std::vector<uint8_t> frame;
     frame.resize(sizeof(hdr) + total);
-    memcpy(frame.data(), &hdr, sizeof(hdr));
     if (n0) {
         memcpy(frame.data() + sizeof(hdr), p0, n0);
     }
     if (n1) {
         memcpy(frame.data() + sizeof(hdr) + n0, p1, n1);
     }
+
+    /* 下行压缩（PLAN §2 账本：命令流是 24fps 的主要带宽开销）。
+     * 只压 CMD / DATA；压不动就发原文。载荷 = u32 原长 + LZ4 block。 */
+    if (dev->compress.load() && total >= 256 &&
+        (type == ESPGPU_CHUNK_CMD || type == ESPGPU_CHUNK_DATA)) {
+        std::lock_guard<std::mutex> lk(dev->write_mu);
+        dev->lz_table.resize(size_t(1) << ESPGPU_LZ_HASH_BITS);
+        dev->lz_buf.resize(4 + espgpu_lz_bound(total));
+        const size_t clen = espgpu_lz_encode(frame.data() + sizeof(hdr), total,
+                                             dev->lz_buf.data() + 4, dev->lz_buf.size() - 4,
+                                             dev->lz_table.data());
+        if (clen > 0 && clen + 4 < total) {
+            memcpy(dev->lz_buf.data(), &total, 4);
+            hdr.flags |= ESPGPU_F_LZ;
+            hdr.length = static_cast<uint16_t>(clen + 4);
+            frame.resize(sizeof(hdr) + clen + 4);
+            memcpy(frame.data() + sizeof(hdr), dev->lz_buf.data(), clen + 4);
+        }
+    }
+    memcpy(frame.data(), &hdr, sizeof(hdr));
 
     if (!usb_write(dev, frame.data(), frame.size(), timeout_ms)) {
         return -1;
@@ -367,10 +400,18 @@ void link_stop(espgpu_device *dev)
     if (dev->reader.joinable()) {
         dev->reader.join();
     }
-    /* 唤醒所有还在等待响应的控制请求 */
+    /* 唤醒所有还在等待响应的控制请求、帧和 fence */
     {
         std::lock_guard<std::mutex> lk(dev->ctrl_mu);
         dev->ctrl_cv.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> lk(dev->frame_mu);
+        dev->frame_cv.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> lk(dev->evt_mu);
+        dev->evt_cv.notify_all();
     }
 }
 

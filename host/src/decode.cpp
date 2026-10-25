@@ -178,6 +178,7 @@ int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_
     dev->prev.swap(dev->cur);
     dev->frame_id = dev->cur_frame_id;
     dev->frame_ready = true;
+    dev->frame_cv.notify_all();
 
     const auto t1 = clock::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

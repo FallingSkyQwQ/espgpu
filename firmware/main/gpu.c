@@ -1070,6 +1070,7 @@ esp_err_t espgpu_gpu_init(void)
 
     g_gpu.frame_codec = ESPGPU_CODEC_DELTA_RLE;
     g_gpu.command_mode = false;
+    g_gpu.frame_id = 1; /* 0 留给主机表示"还没有帧" */
 
     g_gpu.mode.width = g_gpu.fb.width;
     g_gpu.mode.height = g_gpu.fb.height;

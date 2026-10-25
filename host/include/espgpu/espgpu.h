@@ -239,7 +239,10 @@ ESPGPU_API int espgpu_cmd_flush(espgpu_device_t *dev, int timeout_ms);
 /** 阻塞等待设备回 FENCE 事件且 value 达到（>=）给定值。0 = 成功。 */
 ESPGPU_API int espgpu_wait_fence(espgpu_device_t *dev, uint32_t value, int timeout_ms);
 
-/** 阻塞等待帧号 > after_frame_id 的帧解码完成。返回 1 = 有新帧，0 = 超时，<0 = 出错。 */
+/**
+ * 阻塞等待帧号 > after_frame_id 的帧解码完成。返回 1 = 有新帧，0 = 超时，<0 = 出错。
+ * 设备帧号从 1 开始，espgpu_frame_id() 返回 0 表示还没收到过帧。
+ */
 ESPGPU_API int espgpu_wait_frame(espgpu_device_t *dev, uint32_t after_frame_id, int timeout_ms);
 
 /** 上传 / 删除设备端缓冲（DATA chunk，自动分片）。 */
@@ -283,6 +286,9 @@ ESPGPU_API int espgpu_set_codec(espgpu_device_t *dev, int codec, int timeout_ms)
 ESPGPU_API int espgpu_log_subscribe(espgpu_device_t *dev, int level, int timeout_ms);
 
 ESPGPU_API int espgpu_soft_reset(espgpu_device_t *dev, int timeout_ms);
+
+/** 要求设备下一帧发非差分关键帧（主机显示花屏时手动重同步）。 */
+ESPGPU_API int espgpu_request_keyframe(espgpu_device_t *dev, int timeout_ms);
 
 /** OTA 进度回调：done / total 字节。返回 false 取消。 */
 typedef bool (*espgpu_progress_fn)(uint32_t done, uint32_t total, void *user);

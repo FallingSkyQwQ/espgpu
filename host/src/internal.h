@@ -17,6 +17,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -61,6 +62,24 @@ int link_send_chunk_iov(espgpu_device *dev, uint8_t type, uint8_t flags, const v
 int link_ctrl(espgpu_device *dev, uint16_t op, uint32_t a0, uint32_t a1, const void *data,
               uint16_t len, std::vector<uint8_t> &resp, DWORD timeout_ms);
 
+/* ── 命令缓冲（draw.cpp） ─────────────────────────────────────────── */
+
+/** 单条命令体上限：留出余量，保证任何一条 push 之后都还塞得进一个完整 Chunk */
+constexpr size_t kCmdFlushThreshold = 24 * 1024;
+constexpr size_t kCmdMaxBody = kCmdFlushThreshold - 64;
+
+void cmd_push(espgpu_device *dev, uint8_t op, uint8_t flags, const void *body, uint32_t size);
+int cmd_flush(espgpu_device *dev, int timeout_ms);
+
+/* ── 软件模拟器（emulator.cpp） ──────────────────────────────────── */
+
+constexpr const char *kEmulatorPath = "emulator://espgpu";
+bool emulator_enabled();
+bool emu_open(espgpu_device *dev, std::string &err);
+void emu_close(espgpu_device *dev);
+bool emu_write(espgpu_device *dev, const void *data, size_t len, DWORD timeout_ms);
+int emu_read(espgpu_device *dev, void *buf, DWORD cap, DWORD timeout_ms, DWORD *got);
+
 /* ── 解码 ─────────────────────────────────────────────────────────── */
 
 int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_t raw_len,
@@ -70,8 +89,11 @@ int frame_decode(espgpu_device *dev, const uint8_t *enc, size_t enc_len, uint32_
 
 /* ── 设备对象 ─────────────────────────────────────────────────────── */
 
+struct EmuState;
+
 struct espgpu_device {
     HANDLE file = INVALID_HANDLE_VALUE;
+    EmuState *emu = nullptr;    /**< 非空 = 软件模拟器，不走 WinUSB */
     WINUSB_INTERFACE_HANDLE winusb = nullptr;
     UCHAR ep_out = 0;
     UCHAR ep_in = 0;
@@ -117,6 +139,24 @@ struct espgpu_device {
 
     /* M2：命令批量缓冲 */
     std::vector<uint8_t> cmd_buf;
+
+    /* M3+：设备能力、压缩、事件、同步 */
+    espgpu_device_info_t info{};
+    bool have_info = false;
+    std::atomic<bool> compress{false};
+    std::vector<uint8_t> lz_buf;
+    std::vector<uint32_t> lz_table;
+    uint8_t layout_index_type = 1;   /**< 最近一次发出的 VERTEX_LAYOUT 的索引类型 */
+    uint16_t layout_stride = 0;
+
+    std::mutex evt_mu;
+    std::condition_variable evt_cv;
+    std::deque<espgpu_event_t> events;
+    uint32_t last_fence = 0;
+    bool have_fence = false;
+
+    std::condition_variable frame_cv; /**< 与 frame_mu 配合 */
+    std::vector<uint8_t> blit_buf;
 
     /* 统计 */
     std::mutex stats_mu;
