@@ -751,8 +751,9 @@ static void draw_line(draw_ctx_t *dc, uint32_t i0, uint32_t i1)
     const float hw = (dc->c->ext.line_width ? (float)dc->c->ext.line_width : 1.0f) * 0.5f;
     dx /= len;
     dy /= len;
-    /* 法向偏移半个线宽，两端各延长半个像素，让端点像素被覆盖 */
-    emit_quad(dc, &wa, &wb, -dy * hw, dx * hw, dx * 0.5f, dy * 0.5f);
+    /* 法向偏移半个线宽，长度方向不延长：配合 top-left 规则得到 GL 的半开线段
+     * （起点像素画、终点像素不画），线带的连接点不会被画两次（混合时可见） */
+    emit_quad(dc, &wa, &wb, -dy * hw, dx * hw, 0.0f, 0.0f);
     dc->c->st_prims++;
 }
 
@@ -916,7 +917,7 @@ void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data
             uint32_t a = LOADI(k), b = LOADI(k + 1);
             if (VALID(a) && VALID(b)) draw_line(&dc, a, b);
         }
-        if (d->prim == ESPGPU_PRIM_LINE_LOOP && count > 2) {
+        if (d->prim == ESPGPU_PRIM_LINE_LOOP && count >= 2) { /* GL：两个顶点也闭合 */
             uint32_t a = LOADI(count - 1), b = LOADI(0);
             if (VALID(a) && VALID(b)) draw_line(&dc, a, b);
         }

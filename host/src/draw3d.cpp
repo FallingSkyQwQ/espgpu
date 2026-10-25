@@ -64,7 +64,7 @@ uint8_t expand_prim(uint8_t prim, uint32_t count, std::vector<uint32_t> &seq,
         for (uint32_t k = 0; k + 1 < count; k++) {
             seq.insert(seq.end(), {at(k), at(k + 1)});
         }
-        if (prim == ESPGPU_PRIM_LINE_LOOP && count > 2) {
+        if (prim == ESPGPU_PRIM_LINE_LOOP && count >= 2) { /* 与设备一致：两个顶点也闭合 */
             seq.insert(seq.end(), {at(count - 1), at(0)});
         }
         return ESPGPU_PRIM_LINES;
