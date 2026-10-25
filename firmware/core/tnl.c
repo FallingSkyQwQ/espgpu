@@ -40,7 +40,7 @@ static void fetch_init(fetch_t *f, const espgpu_vertex_attrib_t *a)
     f->scale = a->frac_bits ? 1.0f / (float)(1u << (a->frac_bits & 31)) : 1.0f;
 }
 
-static void fetch_attr(const uint8_t *base, const fetch_t *f, float out[4])
+GP_HOT static void fetch_attr(const uint8_t *base, const fetch_t *f, float out[4])
 {
     const espgpu_vertex_attrib_t *a = f->a;
     const uint8_t *p = base + a->offset;
@@ -438,7 +438,7 @@ static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_vce_t *o)
     }
 }
 
-static const gp_vce_t *get_vertex(draw_ctx_t *dc, uint32_t index)
+GP_HOT static const gp_vce_t *get_vertex(draw_ctx_t *dc, uint32_t index)
 {
     gpu_core_t *c = dc->c;
     gp_vce_t *e = &c->vcache[index & (GP_VCACHE - 1)];
@@ -473,7 +473,7 @@ static void lerp_vtx(const draw_ctx_t *dc, const gp_cvtx_t *a, const gp_cvtx_t *
 }
 
 /** Sutherland–Hodgman，返回输出顶点数（最多 3 + N_PLANES） */
-static int clip_poly(const draw_ctx_t *dc, uint32_t mask, gp_cvtx_t *buf_a, gp_cvtx_t *buf_b,
+GP_HOT static int clip_poly(const draw_ctx_t *dc, uint32_t mask, gp_cvtx_t *buf_a, gp_cvtx_t *buf_b,
                      int n, gp_cvtx_t **out)
 {
     gp_cvtx_t *in = buf_a;
@@ -602,7 +602,7 @@ static void bin_tri(gpu_core_t *c, const gp_tri_t *t, uint32_t off)
     c->pending = true;
 }
 
-bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const gp_wvtx_t *v2,
+GP_HOT bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const gp_wvtx_t *v2,
                   const gp_olayout_t *ol, const float *flat_col, bool cull_enabled)
 {
     const uint32_t cy0 = gp_cycles();
@@ -836,7 +836,7 @@ static void emit_tri(draw_ctx_t *dc, const gp_wvtx_t *a, const gp_wvtx_t *b, con
 /* ── 图元 ─────────────────────────────────────────────────────────── */
 
 /** prov = 激发顶点的索引（平面着色时取它的颜色） */
-static void draw_triangle(draw_ctx_t *dc, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t prov)
+GP_HOT static void draw_triangle(draw_ctx_t *dc, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t prov)
 {
     float pcol[4];
     const float *flat = NULL;
@@ -1009,7 +1009,7 @@ static void draw_point(draw_ctx_t *dc, uint32_t i0)
 
 /* ── DRAW ─────────────────────────────────────────────────────────── */
 
-void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data,
+GP_HOT void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data,
                uint32_t inline_len)
 {
     if (!c->layout_valid) {
