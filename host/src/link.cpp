@@ -11,6 +11,7 @@
 
 #include "espgpu_lz.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,19 @@ uint64_t now_us()
 
 /* ── 帧分片重组 ──────────────────────────────────────────────────── */
 
+/** 一帧编码数据的上限：frag_count 是 u8，每片不超过一个 Chunk */
+constexpr size_t kMaxFrameEnc = size_t(255) * ESPGPU_CHUNK_MAX_PAYLOAD;
+
+/** 设备的参考帧已经前进而主机没跟上：作废主机参考帧，后续差分帧丢弃直到关键帧 */
+void invalidate_ref(espgpu_device *dev)
+{
+    {
+        std::lock_guard<std::mutex> lk(dev->frame_mu);
+        dev->ref_valid = false;
+    }
+    dev->need_keyframe = true;
+}
+
 void on_frame_chunk(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8_t *payload)
 {
     if (hdr.length < sizeof(espgpu_frame_hdr_t)) {
@@ -46,22 +60,37 @@ void on_frame_chunk(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uin
     const uint32_t data_len = hdr.length - static_cast<uint32_t>(sizeof(fh));
 
     if (fh.flags & ESPGPU_FF_FIRST) {
+        if (dev->cur_frag_count != 0) {
+            /* 上一帧的 LAST 没到（丢片 / 失步）：那一帧算丢 */
+            {
+                std::lock_guard<std::mutex> lk(dev->stats_mu);
+                dev->stats.frames_dropped++;
+            }
+            invalidate_ref(dev);
+        }
         dev->cur_frame_id = fh.frame_id;
         dev->cur_raw_len = fh.raw_len;
         dev->cur_frag_count = fh.frag_count;
         dev->cur_frag_expect = 0;
         dev->cur_broken = false;
         dev->enc.clear();
-        dev->enc.reserve(fh.raw_len);
+        /* 头没有 CRC：长度字段不可信，别按它分配几 GB */
+        dev->enc.reserve(std::min<size_t>(fh.total_enc, kMaxFrameEnc));
     }
 
-    if (fh.frame_id != dev->cur_frame_id || fh.frag_index != dev->cur_frag_expect) {
+    if (fh.frame_id != dev->cur_frame_id || fh.frag_index != dev->cur_frag_expect ||
+        dev->enc.size() + data_len > kMaxFrameEnc) {
         /* 分片顺序错了或者中间丢了：这一帧作废，等下一个 FIRST */
+        if (!dev->cur_broken) {
+            std::lock_guard<std::mutex> lk(dev->stats_mu);
+            dev->stats.fragments_lost++;
+        }
         dev->cur_broken = true;
-        dev->stats.fragments_lost++;
     }
 
-    dev->enc.insert(dev->enc.end(), data, data + data_len);
+    if (!dev->cur_broken) {
+        dev->enc.insert(dev->enc.end(), data, data + data_len);
+    }
     dev->cur_frag_expect = static_cast<uint8_t>(fh.frag_index + 1);
 
     if (fh.flags & ESPGPU_FF_LAST) {
@@ -75,13 +104,17 @@ void on_frame_chunk(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uin
                 dev->need_keyframe = true;
             }
         } else {
-            std::lock_guard<std::mutex> lk(dev->stats_mu);
-            dev->stats.frames_dropped++;
-            dev->stats.fragments_lost++;
-            dev->need_keyframe = true;
+            {
+                std::lock_guard<std::mutex> lk(dev->stats_mu);
+                dev->stats.frames_dropped++;
+                dev->stats.fragments_lost++;
+            }
+            invalidate_ref(dev);
         }
         dev->enc.clear();
         dev->cur_broken = false;
+        dev->cur_frag_count = 0; /* 没有进行中的帧 */
+        dev->cur_frag_expect = 0;
     }
 }
 
@@ -114,6 +147,7 @@ void on_clut(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8_t *p
     }
     std::lock_guard<std::mutex> lk(dev->frame_mu);
     memcpy(dev->clut, payload, sizeof(dev->clut));
+    dev->clut_dirty = true;
 }
 
 void dispatch(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8_t *payload)
@@ -239,6 +273,7 @@ void reader_main(espgpu_device *dev)
             if (dev->running.load()) {
                 log_msg(LOG_ERROR, "bulk IN failed, marking device offline");
                 dev->connected = false;
+                { std::lock_guard<std::mutex> lk(dev->ctrl_mu); dev->ctrl_cv.notify_all(); }
                 { std::lock_guard<std::mutex> lk(dev->frame_mu); dev->frame_cv.notify_all(); }
                 { std::lock_guard<std::mutex> lk(dev->evt_mu); dev->evt_cv.notify_all(); }
             }
@@ -265,6 +300,16 @@ void reader_main(espgpu_device *dev)
 
 /* ── 发送 ─────────────────────────────────────────────────────────── */
 
+ApiRef::ApiRef(espgpu_device *d) : dev(d)
+{
+    dev->users.fetch_add(1);
+}
+
+ApiRef::~ApiRef()
+{
+    dev->users.fetch_sub(1);
+}
+
 int link_send_chunk_iov(espgpu_device *dev, uint8_t type, uint8_t flags, const void *p0,
                         uint32_t n0, const void *p1, uint32_t n1, DWORD timeout_ms)
 {
@@ -272,19 +317,24 @@ int link_send_chunk_iov(espgpu_device *dev, uint8_t type, uint8_t flags, const v
     if (total > ESPGPU_CHUNK_MAX_PAYLOAD) {
         return -1;
     }
-
-    static std::atomic<uint16_t> seq{0};
+    ApiRef ref(dev);
+    if (!dev->running.load()) {
+        return -1; /* 正在关闭 */
+    }
 
     espgpu_chunk_hdr_t hdr{};
     hdr.magic = ESPGPU_MAGIC_H2D;
     hdr.version = ESPGPU_PROTO_VERSION;
-    hdr.seq = seq++;
     hdr.length = static_cast<uint16_t>(total);
     hdr.type = type;
     hdr.flags = static_cast<uint8_t>(flags & ~(ESPGPU_F_CRC | ESPGPU_F_LZ));
 
+    /* 整个组包 + 写都在 write_mu 里：seq 在线上严格递增，缓冲复用不再每包分配 */
+    std::lock_guard<std::mutex> lk(dev->write_mu);
+    hdr.seq = dev->tx_seq++;
+
     /* 头和载荷拼成一次写，避免设备端看到半截 Chunk */
-    std::vector<uint8_t> frame;
+    std::vector<uint8_t> &frame = dev->tx_buf;
     frame.resize(sizeof(hdr) + total);
     if (n0) {
         memcpy(frame.data() + sizeof(hdr), p0, n0);
@@ -292,28 +342,34 @@ int link_send_chunk_iov(espgpu_device *dev, uint8_t type, uint8_t flags, const v
     if (n1) {
         memcpy(frame.data() + sizeof(hdr) + n0, p1, n1);
     }
+    const uint8_t *out = frame.data();
+    size_t out_len = frame.size();
 
     /* 下行压缩（PLAN §2 账本：命令流是 24fps 的主要带宽开销）。
-     * 只压 CMD / DATA；压不动就发原文。载荷 = u32 原长 + LZ4 block。 */
+     * 只压 CMD / DATA；压不动就发原文。载荷 = u32 原长 + LZ4 block。
+     * lz_buf 布局 = [chunk 头][u32 原长][LZ4 block]，压成功就直接把它写出去。 */
     if (dev->compress.load() && total >= 256 &&
         (type == ESPGPU_CHUNK_CMD || type == ESPGPU_CHUNK_DATA)) {
-        std::lock_guard<std::mutex> lk(dev->write_mu);
+        constexpr size_t kPre = sizeof(hdr) + 4;
         dev->lz_table.resize(size_t(1) << ESPGPU_LZ_HASH_BITS);
-        dev->lz_buf.resize(4 + espgpu_lz_bound(total));
+        dev->lz_buf.resize(kPre + espgpu_lz_bound(total));
         const size_t clen = espgpu_lz_encode(frame.data() + sizeof(hdr), total,
-                                             dev->lz_buf.data() + 4, dev->lz_buf.size() - 4,
-                                             dev->lz_table.data());
+                                             dev->lz_buf.data() + kPre,
+                                             dev->lz_buf.size() - kPre, dev->lz_table.data());
         if (clen > 0 && clen + 4 < total) {
-            memcpy(dev->lz_buf.data(), &total, 4);
             hdr.flags |= ESPGPU_F_LZ;
             hdr.length = static_cast<uint16_t>(clen + 4);
-            frame.resize(sizeof(hdr) + clen + 4);
-            memcpy(frame.data() + sizeof(hdr), dev->lz_buf.data(), clen + 4);
+            memcpy(dev->lz_buf.data() + sizeof(hdr), &total, 4);
+            memcpy(dev->lz_buf.data(), &hdr, sizeof(hdr));
+            out = dev->lz_buf.data();
+            out_len = kPre + clen;
         }
     }
-    memcpy(frame.data(), &hdr, sizeof(hdr));
+    if (out == frame.data()) {
+        memcpy(frame.data(), &hdr, sizeof(hdr));
+    }
 
-    if (!usb_write(dev, frame.data(), frame.size(), timeout_ms)) {
+    if (!usb_write(dev, out, out_len, timeout_ms)) {
         return -1;
     }
     return 0;
@@ -325,11 +381,36 @@ int link_send_chunk(espgpu_device *dev, uint8_t type, uint8_t flags, const void 
     return link_send_chunk_iov(dev, type, flags, payload, len, nullptr, 0, timeout_ms);
 }
 
+void link_service_keyframe(espgpu_device *dev)
+{
+    if (!dev->need_keyframe.load()) {
+        return;
+    }
+    /* 等关键帧期间每个被丢的差分帧都会再置位一次：限速，别每帧都发 */
+    const uint64_t now = now_ms();
+    if (now - dev->last_kf_req_ms.load() < 100) {
+        return;
+    }
+    if (!dev->need_keyframe.exchange(false)) {
+        return;
+    }
+    dev->last_kf_req_ms = now;
+    /* 不等响应（响应到达时 seq 不在 pending 里，只打一条 debug 日志）：
+     * 这里在 PRESENT / poll 路径上，阻塞等一个往返会直接掉帧 */
+    espgpu_ctrl_req_t req{};
+    req.op = ESPGPU_CTRL_REQUEST_KEYFRAME;
+    req.seq = dev->next_seq++;
+    if (link_send_chunk(dev, ESPGPU_CHUNK_CTRL, 0, &req, sizeof(req), 100) != 0) {
+        dev->need_keyframe = true;
+    }
+}
+
 /* ── 控制请求 ─────────────────────────────────────────────────────── */
 
 int link_ctrl(espgpu_device *dev, uint16_t op, uint32_t a0, uint32_t a1, const void *data,
               uint16_t len, std::vector<uint8_t> &resp, DWORD timeout_ms)
 {
+    ApiRef ref(dev);
     const uint16_t seq = dev->next_seq++;
 
     std::vector<uint8_t> payload(sizeof(espgpu_ctrl_req_t) + len);
@@ -357,15 +438,21 @@ int link_ctrl(espgpu_device *dev, uint16_t op, uint32_t a0, uint32_t a1, const v
     }
 
     std::unique_lock<std::mutex> lk(dev->ctrl_mu);
-    const bool ok = dev->ctrl_cv.wait_for(
-        lk, std::chrono::milliseconds(timeout_ms), [&] {
-            auto it = dev->pending.find(seq);
-            return it != dev->pending.end() && it->second.done;
-        });
+    bool done = false;
+    dev->ctrl_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] {
+        auto it = dev->pending.find(seq);
+        done = it != dev->pending.end() && it->second.done;
+        /* 断线 / 关闭时立即返回，不要让调用者白等满超时 */
+        return done || !dev->running.load() || !dev->connected.load();
+    });
 
-    if (!ok) {
+    if (!done) {
         dev->pending.erase(seq);
-        log_msg(LOG_WARN, "control op 0x%04X timed out after %d ms", op, timeout_ms);
+        if (!dev->running.load() || !dev->connected.load()) {
+            return -1;
+        }
+        log_msg(LOG_WARN, "control op 0x%04X timed out after %lu ms", op,
+                static_cast<unsigned long>(timeout_ms));
         return -2;
     }
 
@@ -397,6 +484,8 @@ void link_start(espgpu_device *dev)
 void link_stop(espgpu_device *dev)
 {
     dev->running = false;
+    /* 取消挂着的 bulk 读写：接收线程和卡在 usb_write 里的调用者立刻返回 */
+    usb_abort(dev);
     if (dev->reader.joinable()) {
         dev->reader.join();
     }

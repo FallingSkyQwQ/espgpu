@@ -7,6 +7,7 @@
 
 #include "internal.h"
 
+#include <algorithm>
 #include <cstring>
 
 using namespace espgpu;
@@ -174,6 +175,9 @@ int espgpu_cmd_draw(espgpu_device_t *dev, uint8_t prim, const void *verts, uint3
     index_type = index_type == 2 ? 2 : 1;
     const uint32_t isz = index_type == 2 ? 4u : 2u;
     const auto *vb = static_cast<const uint8_t *>(verts);
+    if (indices != nullptr && index_count == 0) {
+        return 0; /* glDrawElements(count = 0)：什么都不画（发 index_count=0 会被设备当成非索引绘制） */
+    }
 
     /* 快速路径：一条命令放得下且索引类型与布局一致 */
     const uint64_t one = sizeof(espgpu_draw_t) + uint64_t(vertex_count) * stride +
@@ -197,43 +201,114 @@ int espgpu_cmd_draw(espgpu_device_t *dev, uint8_t prim, const void *verts, uint3
         return 0;
     }
 
-    /* 拆批：展开成列表图元、去索引，每批按图元边界切 */
+    /* 拆批：先展开成列表图元（strip / fan / loop → 列表），每批按图元边界切 */
     std::vector<uint32_t> seq;
     const uint8_t base = expand_prim(prim, indices ? index_count : vertex_count, seq, indices,
                                      index_type);
     const uint32_t group = prim_group(base);
-    const uint32_t per_batch_verts =
-        static_cast<uint32_t>((kCmdMaxBody - sizeof(espgpu_draw_t)) / stride) / group * group;
-    if (per_batch_verts == 0) {
+    const size_t budget = kCmdMaxBody - sizeof(espgpu_draw_t);
+
+    if (indices == nullptr && base == prim) {
+        /* 非索引的列表图元：直接按顶点切，没有任何重复数据 */
+        const uint32_t per_batch_verts =
+            static_cast<uint32_t>(budget / stride) / group * group;
+        if (per_batch_verts == 0) {
+            return -1;
+        }
+        std::vector<uint8_t> body;
+        uint32_t done = 0;
+        while (done + group <= vertex_count) {
+            uint32_t n = std::min(vertex_count - done, per_batch_verts);
+            n -= n % group;
+            espgpu_draw_t d{};
+            d.prim = base;
+            d.source = ESPGPU_VSRC_INLINE;
+            d.vertex_count = static_cast<uint16_t>(n);
+            body.resize(sizeof(d) + size_t(n) * stride);
+            memcpy(body.data(), &d, sizeof(d));
+            memcpy(body.data() + sizeof(d), vb + size_t(done) * stride, size_t(n) * stride);
+            cmd_push(dev, ESPGPU_OP_DRAW, ESPGPU_DRAWF_3D, body.data(),
+                     static_cast<uint32_t>(body.size()));
+            done += n;
+        }
+        return 0;
+    }
+
+    /* 索引绘制 / 展开过的拓扑：每批重新编号成局部索引，只带这一批用到的顶点。
+     * 以前是整批去索引（每个三角形 3 个完整顶点），共享顶点的网格要多发 3–5 倍字节，
+     * 而 USB 正是瓶颈。输出索引类型跟随当前 VERTEX_LAYOUT（设备按它解释索引）。 */
+    const size_t oisz = dev->layout_index_type == 2 ? 4u : 2u;
+    if (size_t(group) * (stride + oisz) > budget) {
         return -1;
     }
+    std::vector<uint32_t> stamp(vertex_count, 0); /* stamp[v] == epoch → v 已在本批 */
+    std::vector<uint32_t> local(vertex_count, 0);
+    uint32_t epoch = 1;
+    std::vector<uint8_t> vbuf;
+    std::vector<uint8_t> ibuf;
     std::vector<uint8_t> body;
-    size_t done = 0;
-    while (done + group <= seq.size()) {
-        size_t n = seq.size() - done;
-        if (n > per_batch_verts) {
-            n = per_batch_verts;
+    uint32_t nverts = 0;
+    uint32_t nidx = 0;
+
+    auto flush_batch = [&] {
+        if (nidx == 0) {
+            return;
         }
-        n -= n % group;
         espgpu_draw_t d{};
         d.prim = base;
         d.source = ESPGPU_VSRC_INLINE;
-        d.vertex_count = static_cast<uint16_t>(n);
-        body.resize(sizeof(d) + n * stride);
+        d.vertex_count = static_cast<uint16_t>(nverts);
+        d.index_count = static_cast<uint16_t>(nidx);
+        body.resize(sizeof(d) + vbuf.size() + ibuf.size());
         memcpy(body.data(), &d, sizeof(d));
-        uint8_t *dst = body.data() + sizeof(d);
-        for (size_t k = 0; k < n; k++) {
-            const uint32_t vi = seq[done + k];
-            if (vi < vertex_count) {
-                memcpy(dst + k * stride, vb + size_t(vi) * stride, stride);
-            } else {
-                memset(dst + k * stride, 0, stride);
-            }
-        }
+        memcpy(body.data() + sizeof(d), vbuf.data(), vbuf.size());
+        memcpy(body.data() + sizeof(d) + vbuf.size(), ibuf.data(), ibuf.size());
         cmd_push(dev, ESPGPU_OP_DRAW, ESPGPU_DRAWF_3D, body.data(),
                  static_cast<uint32_t>(body.size()));
-        done += n;
+        vbuf.clear();
+        ibuf.clear();
+        nverts = 0;
+        nidx = 0;
+        epoch++;
+    };
+
+    for (size_t k = 0; k + group <= seq.size(); k += group) {
+        /* 设备对越界索引的语义是丢掉整个图元（tnl.c 的 VALID），这里保持一致 */
+        bool valid = true;
+        for (uint32_t j = 0; j < group; j++) {
+            valid = valid && seq[k + j] < vertex_count;
+        }
+        if (!valid) {
+            continue;
+        }
+        /* 这个图元会新增多少个顶点（组内重复的只算一次） */
+        uint32_t fresh = 0;
+        for (uint32_t j = 0; j < group; j++) {
+            const uint32_t v = seq[k + j];
+            bool dup = stamp[v] == epoch;
+            for (uint32_t q = 0; q < j && !dup; q++) {
+                dup = seq[k + q] == v;
+            }
+            fresh += dup ? 0u : 1u;
+        }
+        if (nidx != 0 && vbuf.size() + ibuf.size() + size_t(fresh) * stride +
+                                 size_t(group) * oisz > budget) {
+            flush_batch();
+        }
+        for (uint32_t j = 0; j < group; j++) {
+            const uint32_t v = seq[k + j];
+            if (stamp[v] != epoch) {
+                stamp[v] = epoch;
+                local[v] = nverts++;
+                vbuf.insert(vbuf.end(), vb + size_t(v) * stride, vb + size_t(v + 1) * stride);
+            }
+            const uint32_t li = local[v];
+            ibuf.insert(ibuf.end(), reinterpret_cast<const uint8_t *>(&li),
+                        reinterpret_cast<const uint8_t *>(&li) + oisz); /* 小端：低 2 字节即 u16 */
+            nidx++;
+        }
     }
+    flush_batch();
     return 0;
 }
 
@@ -295,6 +370,9 @@ int espgpu_cmd_upload_texture_ex(espgpu_device_t *dev, uint32_t id, uint16_t wid
     const unsigned bpp = fmt_bpp(format);
     if (dev == nullptr || pixels == nullptr || width == 0 || height == 0 || bpp == 0) {
         return -1;
+    }
+    if (uint64_t(width) * height * bpp > 0xFFFFFFFFu) {
+        return -1; /* total_len 是 u32 */
     }
     const uint32_t total = static_cast<uint32_t>(width) * height * bpp;
     const uint32_t max_frag =
@@ -490,16 +568,18 @@ int espgpu_wait_fence(espgpu_device_t *dev, uint32_t value, int timeout_ms)
     if (dev == nullptr) {
         return -1;
     }
+    ApiRef ref(dev);
     cmd_flush(dev, 500);
     std::unique_lock<std::mutex> lk(dev->evt_mu);
-    const bool ok = dev->evt_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] {
-        return !dev->connected.load() ||
-               (dev->have_fence && static_cast<int32_t>(dev->last_fence - value) >= 0);
+    bool ok = false;
+    dev->evt_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms), [&] {
+        ok = dev->have_fence && static_cast<int32_t>(dev->last_fence - value) >= 0;
+        return ok || !dev->connected.load() || !dev->running.load();
     });
-    if (!dev->connected.load()) {
-        return -1;
+    if (ok) {
+        return 0;
     }
-    return ok ? 0 : -2;
+    return (!dev->connected.load() || !dev->running.load()) ? -1 : -2;
 }
 
 int espgpu_wait_frame(espgpu_device_t *dev, uint32_t after_frame_id, int timeout_ms)
@@ -507,15 +587,18 @@ int espgpu_wait_frame(espgpu_device_t *dev, uint32_t after_frame_id, int timeout
     if (dev == nullptr) {
         return -1;
     }
+    ApiRef ref(dev);
+    link_service_keyframe(dev);
     std::unique_lock<std::mutex> lk(dev->frame_mu);
-    const bool ok = dev->frame_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] {
-        return !dev->connected.load() ||
-               (dev->frame_id != 0 && static_cast<int32_t>(dev->frame_id - after_frame_id) > 0);
+    bool ok = false;
+    dev->frame_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms), [&] {
+        ok = dev->frame_id != 0 && static_cast<int32_t>(dev->frame_id - after_frame_id) > 0;
+        return ok || !dev->connected.load() || !dev->running.load();
     });
-    if (!dev->connected.load()) {
-        return -1;
+    if (ok) {
+        return 1;
     }
-    return ok ? 1 : 0;
+    return (!dev->connected.load() || !dev->running.load()) ? -1 : 0;
 }
 
 int espgpu_buffer_upload(espgpu_device_t *dev, uint32_t id, const void *data, uint32_t len)

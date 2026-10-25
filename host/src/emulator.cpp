@@ -10,6 +10,7 @@
 
 #include "internal.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@ struct EmuState {
     std::mutex mu;
     std::condition_variable cv_in;
     std::condition_variable cv_out;
+    std::condition_variable cv_space; /**< in 有空位了（模拟 USB 背压） */
     std::vector<uint8_t> in;
     std::vector<uint8_t> out;
     size_t out_off = 0;
@@ -52,6 +54,12 @@ namespace espgpu {
 namespace {
 
 constexpr uint32_t kTexBudget = 4u * 1024u * 1024u;
+
+/* 真设备有 USB 背压；模拟器没有的话，应用提交得比核心渲染快时 in 会无限增长、
+ * 延迟无限增大。in 超过上限时 emu_write 阻塞（最多 timeout_ms）。 */
+constexpr size_t kInCap = 1u << 20;
+/* 接收线程跟不上时（比如调试器停住），out 超过上限就丢帧而不是无限攒内存 */
+constexpr size_t kOutCap = 16u << 20;
 
 void core_log(int level, const char *msg)
 {
@@ -151,6 +159,12 @@ void on_present(void *user, const uint16_t *px, uint16_t w, uint16_t h)
         count = 1;
     }
     std::lock_guard<std::mutex> lk(e->mu);
+    if (e->out.size() - e->out_off > kOutCap || count > 255) {
+        /* 模拟器只发 RLE 关键帧，丢一帧不会破坏后续帧 */
+        e->frame_id++;
+        e->stats.frames_dropped++;
+        return;
+    }
     uint32_t off = 0;
     for (uint32_t f = 0; f < count; f++) {
         const uint32_t n = std::min(frag_cap, total - off);
@@ -334,6 +348,7 @@ void emu_main(EmuState *e)
             buf.insert(buf.end(), e->in.begin(), e->in.end());
             e->in.clear();
         }
+        e->cv_space.notify_all();
 
         size_t off = 0;
         for (;;) {
@@ -448,6 +463,7 @@ void emu_close(espgpu_device *dev)
     }
     e->cv_in.notify_all();
     e->cv_out.notify_all();
+    e->cv_space.notify_all();
     if (e->th.joinable()) {
         e->th.join();
     }
@@ -458,11 +474,13 @@ void emu_close(espgpu_device *dev)
 
 bool emu_write(espgpu_device *dev, const void *data, size_t len, DWORD timeout_ms)
 {
-    (void)timeout_ms;
     EmuState *e = dev->emu;
     {
-        std::lock_guard<std::mutex> lk(e->mu);
-        if (e->stop) {
+        std::unique_lock<std::mutex> lk(e->mu);
+        const bool room = e->cv_space.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] {
+            return e->stop || !dev->running.load() || e->in.size() < kInCap;
+        });
+        if (e->stop || !dev->running.load() || !room) {
             return false;
         }
         const auto *p = static_cast<const uint8_t *>(data);
@@ -476,8 +494,9 @@ int emu_read(espgpu_device *dev, void *buf, DWORD cap, DWORD timeout_ms, DWORD *
 {
     EmuState *e = dev->emu;
     std::unique_lock<std::mutex> lk(e->mu);
-    e->cv_out.wait_for(lk, std::chrono::milliseconds(timeout_ms),
-                       [&] { return e->stop || e->out_off < e->out.size(); });
+    e->cv_out.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] {
+        return e->stop || !dev->running.load() || e->out_off < e->out.size();
+    });
     if (e->stop) {
         return -1;
     }
@@ -497,6 +516,18 @@ int emu_read(espgpu_device *dev, void *buf, DWORD cap, DWORD timeout_ms, DWORD *
     }
     *got = static_cast<DWORD>(n);
     return 1;
+}
+
+void emu_abort(espgpu_device *dev)
+{
+    EmuState *e = dev->emu;
+    if (e == nullptr) {
+        return;
+    }
+    /* 等待者的谓词里都看 dev->running；加锁再通知，避免丢唤醒 */
+    std::lock_guard<std::mutex> lk(e->mu);
+    e->cv_out.notify_all();
+    e->cv_space.notify_all();
 }
 
 } // namespace espgpu

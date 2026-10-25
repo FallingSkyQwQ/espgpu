@@ -47,9 +47,12 @@ struct PendingCtrl {
 bool usb_enumerate(std::vector<std::string> &paths);
 bool usb_open(espgpu_device *dev, const std::string &path, std::string &err);
 void usb_close(espgpu_device *dev);
+/** 调用者必须持有 dev->write_mu（link_send_chunk_iov 负责）。 */
 bool usb_write(espgpu_device *dev, const void *data, size_t len, DWORD timeout_ms);
 /** 返回 1=读到数据，0=超时，-1=错误 */
 int usb_read(espgpu_device *dev, void *buf, DWORD cap, DWORD timeout_ms, DWORD *got);
+/** 取消两个管道上挂着的传输（关闭时让阻塞的读写立即返回）。 */
+void usb_abort(espgpu_device *dev);
 
 /* ── 链路层 ───────────────────────────────────────────────────────── */
 
@@ -61,6 +64,17 @@ int link_send_chunk_iov(espgpu_device *dev, uint8_t type, uint8_t flags, const v
                         uint32_t n0, const void *p1, uint32_t n1, DWORD timeout_ms);
 int link_ctrl(espgpu_device *dev, uint16_t op, uint32_t a0, uint32_t a1, const void *data,
               uint16_t len, std::vector<uint8_t> &resp, DWORD timeout_ms);
+/** need_keyframe 置位时发一个不等响应的 REQUEST_KEYFRAME（限速）。只在应用线程调用。 */
+void link_service_keyframe(espgpu_device *dev);
+
+/** 阻塞型公开调用的引用计数：espgpu_close 等它们全部退出后才释放设备。 */
+struct ApiRef {
+    explicit ApiRef(espgpu_device *d);
+    ~ApiRef();
+    ApiRef(const ApiRef &) = delete;
+    ApiRef &operator=(const ApiRef &) = delete;
+    espgpu_device *dev;
+};
 
 /* ── 命令缓冲（draw.cpp） ─────────────────────────────────────────── */
 
@@ -79,6 +93,7 @@ bool emu_open(espgpu_device *dev, std::string &err);
 void emu_close(espgpu_device *dev);
 bool emu_write(espgpu_device *dev, const void *data, size_t len, DWORD timeout_ms);
 int emu_read(espgpu_device *dev, void *buf, DWORD cap, DWORD timeout_ms, DWORD *got);
+void emu_abort(espgpu_device *dev);
 
 /* ── 解码 ─────────────────────────────────────────────────────────── */
 
@@ -108,13 +123,15 @@ struct espgpu_device {
     std::vector<uint8_t> rx;
     size_t rx_off = 0;
 
-    /* 帧状态 */
+    /* 帧状态（decode.cpp 头注释说明了参考帧不变式） */
     std::mutex frame_mu;
-    std::vector<uint8_t> enc;   /* 当前帧的编码数据（所有分片拼接） */
-    std::vector<uint8_t> cur;   /* 解码后的当前帧，设备像素格式 */
-    std::vector<uint8_t> prev;  /* 差分参考帧，设备像素格式 */
+    std::vector<uint8_t> enc;   /* 当前帧的编码数据（所有分片拼接），只有接收线程碰 */
+    std::vector<uint8_t> prev;  /* INDEX8 / R8 的参考帧（索引）；RGB565 直接用 rgb565 */
     std::vector<uint16_t> rgb565;
     std::vector<uint8_t> rgba;
+    bool ref_valid = false;     /**< 参考帧与设备 shadow 一致，可以应用差分帧 */
+    bool clut_dirty = true;     /**< clut 改过，INDEX8 需要整帧重新查表 */
+    uint32_t clut_rgba[256] = {};
     int width = 0;
     int height = 0;
     uint8_t format = 0;
@@ -134,8 +151,13 @@ struct espgpu_device {
     std::map<uint16_t, espgpu::PendingCtrl> pending;
     std::atomic<uint16_t> next_seq{1};
 
-    /* 写串行化：控制请求和命令流共用同一条 OUT 端点 */
+    /* 写串行化：控制请求和命令流共用同一条 OUT 端点。
+     * write_mu 同时保护 tx_buf / tx_seq / lz_buf / lz_table。 */
     std::mutex write_mu;
+    std::vector<uint8_t> tx_buf;
+    uint16_t tx_seq = 0;
+    std::atomic<int> users{0};          /**< ApiRef 计数 */
+    std::atomic<uint64_t> last_kf_req_ms{0};
 
     /* M2：命令批量缓冲 */
     std::vector<uint8_t> cmd_buf;

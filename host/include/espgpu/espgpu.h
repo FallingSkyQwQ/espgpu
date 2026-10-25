@@ -8,6 +8,10 @@
  *   - espgpu_open() 会起一个后台接收线程，持续从 bulk IN 读数据并解码帧。
  *   - espgpu_poll() 只做状态检查，不阻塞；帧数据由后台线程准备好。
  *   - espgpu_get_xxx / espgpu_set_xxx 是同步调用，内部有超时。
+ *   - espgpu_cmd_* 共用一个主机侧命令缓冲，不加锁：同一时刻只能有一个线程提交命令。
+ *   - espgpu_close() 会唤醒其他线程里正阻塞在控制请求 / espgpu_wait_fence /
+ *     espgpu_wait_frame 上的调用（它们返回 -1），并等它们退出后才释放设备；
+ *     close 返回之后（或与之并发地新发起）任何对该 dev 的调用都是未定义行为。
  */
 
 #pragma once
@@ -109,7 +113,7 @@ ESPGPU_API const uint8_t *espgpu_frame_rgba(espgpu_device_t *dev);
 ESPGPU_API int espgpu_frame_snapshot(espgpu_device_t *dev, uint8_t *dst, size_t cap,
                                      int *out_w, int *out_h, uint32_t *out_frame_id);
 
-/** 最近一帧的 RGB565 数据（原始格式）。 */
+/** 最近一帧的 RGB565 数据（原始格式）。与 espgpu_frame_rgba() 一样是内部缓冲，后台线程会原地更新。 */
 ESPGPU_API const uint16_t *espgpu_frame_rgb565(espgpu_device_t *dev);
 
 ESPGPU_API int espgpu_frame_width(espgpu_device_t *dev);
@@ -240,7 +244,8 @@ ESPGPU_API int espgpu_cmd_fence(espgpu_device_t *dev, uint32_t value);
 /** 把已攒的命令立刻发出（不加 PRESENT）。 */
 ESPGPU_API int espgpu_cmd_flush(espgpu_device_t *dev, int timeout_ms);
 
-/** 阻塞等待设备回 FENCE 事件且 value 达到（>=）给定值。0 = 成功。 */
+/** 阻塞等待设备回 FENCE 事件且 value 达到（>=，按 u32 回绕比较）给定值。
+ *  0 = 成功，-2 = 超时，-1 = 断线 / 正在关闭。 */
 ESPGPU_API int espgpu_wait_fence(espgpu_device_t *dev, uint32_t value, int timeout_ms);
 
 /**

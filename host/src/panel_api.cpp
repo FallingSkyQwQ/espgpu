@@ -6,6 +6,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 using namespace espgpu;
@@ -24,23 +25,41 @@ int simple_ctrl(espgpu_device *dev, uint16_t op, uint32_t a0, int timeout_ms)
 /** 标准 CRC-32（zlib / esp_rom_crc32_le 兼容） */
 uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n)
 {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
+    /* 函数内静态对象的初始化是线程安全的（两个设备同时 OTA 也不会读到半张表） */
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
         for (uint32_t i = 0; i < 256; i++) {
             uint32_t c = i;
             for (int k = 0; k < 8; k++) {
                 c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
             }
-            table[i] = c;
+            t[i] = c;
         }
-        init = true;
-    }
+        return t;
+    }();
     crc = ~crc;
     while (n--) {
         crc = table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
     }
     return ~crc;
+}
+
+/** RGBA -> BGRA。调用者持有 frame_mu。按 u32 交换 R / B（编译器能向量化）。 */
+void copy_bgra_locked(const espgpu_device *dev, uint8_t *dst, size_t pitch)
+{
+    const int w = dev->width;
+    const int h = dev->height;
+    const uint8_t *src = dev->rgba.data();
+    for (int y = 0; y < h; y++) {
+        uint8_t *d = dst + pitch * static_cast<size_t>(y);
+        const uint8_t *s = src + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; x++) {
+            uint32_t v;
+            memcpy(&v, s + x * 4, 4);
+            v = (v & 0x0000FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu) | 0xFF000000u;
+            memcpy(d + x * 4, &v, 4);
+        }
+    }
 }
 
 } // namespace
@@ -92,8 +111,10 @@ int espgpu_ota_flash(espgpu_device_t *dev, const void *image, size_t len, const 
 
     std::vector<uint8_t> resp;
     const char *ver = version ? version : "";
+    /* 版本串只是附带信息；别让超长字符串把控制 Chunk 撑爆（或 u16 截断） */
+    const size_t ver_len = std::min<size_t>(strlen(ver), 64);
     int st = link_ctrl(dev, ESPGPU_CTRL_OTA_BEGIN, static_cast<uint32_t>(len), 0, ver,
-                       static_cast<uint16_t>(strlen(ver)), resp, 5000);
+                       static_cast<uint16_t>(ver_len), resp, 5000);
     if (st != ESPGPU_OK) {
         log_msg(LOG_ERROR, "ota begin failed: %d", st);
         return st;
@@ -161,17 +182,7 @@ int espgpu_frame_snapshot_bgra(espgpu_device_t *dev, uint8_t *dst, size_t cap, s
     if (pitch < static_cast<size_t>(w) * 4 || cap < pitch * (h - 1) + static_cast<size_t>(w) * 4) {
         return -1;
     }
-    const uint8_t *src = dev->rgba.data();
-    for (int y = 0; y < h; y++) {
-        uint8_t *d = dst + pitch * y;
-        const uint8_t *s = src + static_cast<size_t>(y) * w * 4;
-        for (int x = 0; x < w; x++) {
-            d[x * 4 + 0] = s[x * 4 + 2];
-            d[x * 4 + 1] = s[x * 4 + 1];
-            d[x * 4 + 2] = s[x * 4 + 0];
-            d[x * 4 + 3] = 255;
-        }
-    }
+    copy_bgra_locked(dev, dst, pitch);
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     if (out_frame_id) *out_frame_id = dev->frame_id;
@@ -185,19 +196,21 @@ int espgpu_blit_to_hdc(espgpu_device_t *dev, void *hdc_ptr, int dst_w, int dst_h
     }
     HDC hdc = static_cast<HDC>(hdc_ptr);
 
+    /* 尺寸读取和拷贝放在同一次加锁里：分两次的话中间换了分辨率就会拷贝失败丢一帧 */
     int w = 0, h = 0;
     {
         std::lock_guard<std::mutex> lk(dev->frame_mu);
         w = dev->width;
         h = dev->height;
+        if (w > 0 && h > 0 && dev->rgba.size() >= static_cast<size_t>(w) * h * 4) {
+            dev->blit_buf.resize(static_cast<size_t>(w) * h * 4);
+            copy_bgra_locked(dev, dev->blit_buf.data(), static_cast<size_t>(w) * 4);
+        } else {
+            w = h = 0;
+        }
     }
     if (w <= 0 || h <= 0) {
         PatBlt(hdc, 0, 0, dst_w, dst_h, BLACKNESS);
-        return -1;
-    }
-    dev->blit_buf.resize(static_cast<size_t>(w) * h * 4);
-    if (espgpu_frame_snapshot_bgra(dev, dev->blit_buf.data(), dev->blit_buf.size(), 0, &w, &h,
-                                   nullptr) != 0) {
         return -1;
     }
 

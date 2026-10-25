@@ -1,8 +1,10 @@
 # Configure and build the Windows host side inside an MSVC environment.
-# Usage:  .\tools\build-host.ps1 [-Config default|debug] [-Clean]
+# Usage:  .\tools\build-host.ps1 [-Config default|debug] [-Clean] [-Test]
+#   -Test  run ctest afterwards (core rasterizer smoke test + espgpu.dll emulator end-to-end test)
 param(
     [string]$Config = "default",
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Test
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,7 +17,11 @@ $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.e
 if (-not (Test-Path $vswhere)) {
     throw "vswhere.exe not found. Install Visual Studio Build Tools with the C++ workload."
 }
-$vsPath = & $vswhere -latest -products * -property installationPath
+# Only accept an installation that actually has the x64 C++ toolset
+$vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsPath) {
+    throw "No Visual Studio installation with the C++ x64 toolset (VC.Tools.x86.x64) found."
+}
 Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64" | Out-Null
 
@@ -41,6 +47,14 @@ if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 
 & $cmake --build $buildDir
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+if ($Test) {
+    $ctest = "ctest"
+    $cmakeDir = Split-Path $cmake -Parent
+    if ($cmakeDir -and (Test-Path (Join-Path $cmakeDir "ctest.exe"))) { $ctest = Join-Path $cmakeDir "ctest.exe" }
+    & $ctest --test-dir $buildDir --output-on-failure
+    if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+}
 
 Write-Host ""
 Write-Host "Build complete: $buildDir" -ForegroundColor Green

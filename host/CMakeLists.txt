@@ -5,7 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    add_compile_options(/W4 /permissive- /utf-8 /Zc:__cplusplus /MP)
+    # /permissive- 与 /Zc:__cplusplus 只对 C++ 有意义；firmware/core 的 C 文件也走这里
+    add_compile_options(/W4 /utf-8 /MP
+        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 endif()
 
@@ -53,7 +56,12 @@ add_library(espgpu_core STATIC
     ${ESPGPU_CORE_DIR}/raster2d.c
     ${ESPGPU_CORE_DIR}/port_host.c)
 target_include_directories(espgpu_core PUBLIC ${ESPGPU_CORE_DIR} ${ESPGPU_SHARED_DIR})
-set_target_properties(espgpu_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+set_target_properties(espgpu_core PROPERTIES POSITION_INDEPENDENT_CODE ON
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
+if(MSVC)
+    # C11 柔性数组成员（core_internal.h）在 MSVC 下仍报 C4200
+    target_compile_options(espgpu_core PRIVATE /wd4200)
+endif()
 
 # ── espgpu.dll — 设备接口层 ─────────────────────────────────────────
 add_library(espgpu SHARED
@@ -73,6 +81,9 @@ target_compile_definitions(espgpu PRIVATE ESPGPU_BUILD_DLL)
 # MinGW 默认会加 lib 前缀；前端和文档都按 espgpu.dll 找它
 set_target_properties(espgpu PROPERTIES PREFIX "")
 target_link_libraries(espgpu PRIVATE espgpu_core winusb setupapi gdi32)
+if(NOT MSVC)
+    target_compile_options(espgpu PRIVATE -Wall -Wextra)
+endif()
 
 # ── espgpu-panel.exe — 控制面板 / 帧查看器（Material 3 风格） ───────
 add_subdirectory(panel)
@@ -90,6 +101,12 @@ if(NOT MSVC)
 endif()
 enable_testing()
 add_test(NAME core COMMAND espgpu-core-test WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+# ── espgpu-emu-test.exe — espgpu.dll 端到端测试（软件模拟器，不需要硬件） ──
+add_executable(espgpu-emu-test tests/emu_test.cpp)
+target_link_libraries(espgpu-emu-test PRIVATE espgpu)
+add_test(NAME emu COMMAND espgpu-emu-test)
+set_tests_properties(emu PROPERTIES ENVIRONMENT "ESPGPU_EMULATOR=1")
 
 # ── espgpu-demo.exe — M2 的 2D 渲染演示 ─────────────────────────────
 add_executable(espgpu-demo
@@ -109,6 +126,9 @@ add_subdirectory(glsl)    # GLSL ES 3.0 编译器（静态库）
 add_subdirectory(gles3)   # libGLESv2.dll + libEGL.dll + GLES demo
 
 # 让 exe 能从输出目录直接找到 DLL
+add_custom_command(TARGET espgpu-emu-test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-emu-test>)
 add_custom_command(TARGET espgpu-bench POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-bench>)

@@ -136,7 +136,17 @@ void espgpu_close(espgpu_device_t *dev)
     if (dev == nullptr) {
         return;
     }
+    /* 其他线程可能正阻塞在 link_ctrl / wait_fence / wait_frame / usb_write 里：
+     * link_stop 置 running=false、取消管道并唤醒所有条件变量，这里再等它们全部退出，
+     * 否则 delete 之后它们醒来就是 use-after-free。 */
     link_stop(dev);
+    while (dev->users.load() != 0) {
+        usb_abort(dev);
+        { std::lock_guard<std::mutex> lk(dev->ctrl_mu); dev->ctrl_cv.notify_all(); }
+        { std::lock_guard<std::mutex> lk(dev->frame_mu); dev->frame_cv.notify_all(); }
+        { std::lock_guard<std::mutex> lk(dev->evt_mu); dev->evt_cv.notify_all(); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     usb_close(dev);
     delete dev;
 }
@@ -217,6 +227,7 @@ int espgpu_set_clut(espgpu_device_t *dev, const uint16_t *clut, int timeout_ms)
     {
         std::lock_guard<std::mutex> lk(dev->frame_mu);
         memcpy(dev->clut, clut, sizeof(dev->clut));
+        dev->clut_dirty = true;
     }
     std::vector<uint8_t> resp;
     return link_ctrl(dev, ESPGPU_CTRL_SET_CLUT, 0, 0, clut, 256 * sizeof(uint16_t), resp,
@@ -251,12 +262,8 @@ int espgpu_poll(espgpu_device_t *dev, int timeout_ms)
 
     update_window(dev);
 
-    /* 解码失败后主动要求一帧关键帧，让差分参考帧重新对齐 */
-    if (dev->need_keyframe.load()) {
-        dev->need_keyframe = false;
-        std::vector<uint8_t> resp;
-        link_ctrl(dev, ESPGPU_CTRL_REQUEST_KEYFRAME, 0, 0, nullptr, 0, resp, 500);
-    }
+    /* 解码失败后主动要求一帧关键帧，让差分参考帧重新对齐（不等响应，不卡 UI 线程） */
+    link_service_keyframe(dev);
 
     std::lock_guard<std::mutex> lk(dev->frame_mu);
     if (dev->frame_ready && dev->frame_id != dev->last_polled_frame) {

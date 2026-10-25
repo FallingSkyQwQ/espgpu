@@ -25,6 +25,8 @@ int cmd_flush(espgpu_device *dev, int timeout_ms)
         dev->cmd_buf.clear();
         return -1;
     }
+    /* 差分参考帧失步时在这里顺带要关键帧（GL 前端不调 espgpu_poll） */
+    link_service_keyframe(dev);
     const int rc = link_send_chunk(dev, ESPGPU_CHUNK_CMD, 0, dev->cmd_buf.data(),
                                    static_cast<uint32_t>(dev->cmd_buf.size()),
                                    static_cast<DWORD>(timeout_ms));
@@ -125,6 +127,9 @@ int espgpu_cmd_upload_texture(espgpu_device_t *dev, uint32_t id, uint16_t width,
         return -1;
     }
 
+    if (uint64_t(width) * height * 2 > 0xFFFFFFFFu) {
+        return -1; /* total_len 是 u32 */
+    }
     const uint32_t total = static_cast<uint32_t>(width) * height * 2;
     /* 每个分片留出上传头 + 命令头的空间 */
     const uint32_t max_frag =
@@ -164,7 +169,7 @@ int espgpu_cmd_upload_texture(espgpu_device_t *dev, uint32_t id, uint16_t width,
 int espgpu_cmd_draw_quads(espgpu_device_t *dev, const espgpu_vertex2d_t *verts,
                           uint32_t quad_count)
 {
-    if (dev == nullptr || verts == nullptr || quad_count == 0) {
+    if (dev == nullptr || verts == nullptr || quad_count == 0 || quad_count > 0x3FFFFFFFu) {
         return -1;
     }
 
