@@ -21,10 +21,75 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace espgl {
 
 namespace {
+
+/**
+ * ESPGPU_GL_DUMP=<path>：到指定帧（ESPGPU_GL_DUMP_FRAME，默认 90）时把设备回传的
+ * 帧存成 24 位 BMP。窗口被遮住 / 用 CopyFromScreen 抓不到 GL 画面时，用它确认
+ * 设备侧光栅器的真实输出（截图来自设备，不是主机窗口）。
+ */
+void maybe_dump_frame(espgpu_device_t *dev)
+{
+    static const char *s_path = nullptr;
+    static int s_frame = -1;
+    static bool s_init = false;
+    if (!s_init) {
+        s_init = true;
+        s_path = getenv("ESPGPU_GL_DUMP");
+        const char *n = getenv("ESPGPU_GL_DUMP_FRAME");
+        s_frame = n ? atoi(n) : 90;
+    }
+    if (!s_path || !*s_path || static_cast<int>(g_sh.frame) != s_frame) {
+        return;
+    }
+    const int w = espgpu_frame_width(dev);
+    const int h = espgpu_frame_height(dev);
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+    if (espgpu_frame_snapshot(dev, rgba.data(), rgba.size(), nullptr, nullptr, nullptr) != 0) {
+        return;
+    }
+    const int row_bytes = (w * 3 + 3) & ~3;
+    const int data_size = row_bytes * h;
+    const int file_size = 54 + data_size;
+    FILE *f = nullptr;
+    if (fopen_s(&f, s_path, "wb") != 0 || f == nullptr) {
+        return;
+    }
+    uint8_t hdr[54] = {0};
+    hdr[0] = 'B';
+    hdr[1] = 'M';
+    memcpy(&hdr[2], &file_size, 4);
+    const int off = 54;
+    memcpy(&hdr[10], &off, 4);
+    const int dib = 40;
+    memcpy(&hdr[14], &dib, 4);
+    memcpy(&hdr[18], &w, 4);
+    memcpy(&hdr[22], &h, 4);
+    const uint16_t planes = 1, bpp = 24;
+    memcpy(&hdr[26], &planes, 2);
+    memcpy(&hdr[28], &bpp, 2);
+    memcpy(&hdr[34], &data_size, 4);
+    fwrite(hdr, 1, sizeof(hdr), f);
+    std::vector<uint8_t> row(row_bytes, 0);
+    for (int y = h - 1; y >= 0; y--) {
+        for (int x = 0; x < w; x++) {
+            const uint8_t *p = rgba.data() + (static_cast<size_t>(y) * w + x) * 4;
+            row[static_cast<size_t>(x) * 3 + 0] = p[2]; /* B */
+            row[static_cast<size_t>(x) * 3 + 1] = p[1]; /* G */
+            row[static_cast<size_t>(x) * 3 + 2] = p[0]; /* R */
+        }
+        fwrite(row.data(), 1, row.size(), f);
+    }
+    fclose(f);
+    log_line("frame %u dumped to %s (%dx%d)", static_cast<unsigned>(g_sh.frame), s_path, w, h);
+}
 
 bool g_warned_disconnect = false;
 bool g_dev_lost = false; /* 掉线后旧设备已关、新设备还没打开 */
@@ -273,6 +338,7 @@ void device_present(Context *c)
     }
 
     g_sh.frame++;
+    maybe_dump_frame(dev);
 
     /* ESPGPU_GL_LOG=1 时每 60 帧记一条设备侧 profile，便于在真机上定位瓶颈 */
     static bool s_perf_log = false;
@@ -308,6 +374,8 @@ void device_present(Context *c)
             log_line("perf: px rows %u segs %u tested %u | seg setup %.1f pixel %.1f ms",
                      ds.px_rows, ds.px_segs, ds.px_tested, ds.t_px_seg_us / 1000.0,
                      ds.t_px_pix_us / 1000.0);
+            log_line("perf: tex %u KB in %u (%u evict)", ds.tex_bytes / 1024, ds.tex_resident,
+                     ds.tex_evictions);
             s_perf_t0 = now2;
             s_perf_f0 = g_sh.frame;
         }
