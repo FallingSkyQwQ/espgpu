@@ -527,6 +527,9 @@ struct Shared {
     uint64_t tex_used = 0;
     uint64_t frame = 1;
     uint32_t last_frame_id = 0;
+    /** 上一帧已提交但还没确认回传：下一次 PRESENT 前先把它等掉，避免设备慢时无限排队 */
+    bool inflight = false;
+    uint32_t inflight_before = 0;
     uint32_t fence = 0;
     LARGE_INTEGER qpf{}, next_frame_qpc{};
     bool compress = true;

@@ -473,9 +473,11 @@ int main(int argc, char **argv)
         espgpu_cmd_present(dev, 1000);
         frames++;
 
-        /* 帧同步：等这一帧回来再画，最多等一个帧周期多一点（背压，PLAN R5） */
-        espgpu_wait_frame(dev, last_id, 1000 / fps + 30);
-        last_id = espgpu_frame_id(dev);
+        /* 帧同步：等这一帧回来再画。设备慢时（3D 目前只有几 fps）必须等足够久，
+         * 否则每秒塞 24 帧、设备端排队越来越长，GET_STATS 会排在几千帧之后超时。 */
+        if (espgpu_wait_frame(dev, last_id, 2000) == 1) {
+            last_id = espgpu_frame_id(dev);
+        }
         espgpu_poll(dev, 0);
 
         RECT cr;

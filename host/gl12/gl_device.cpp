@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace espgl {
 
@@ -114,6 +115,7 @@ void try_reopen()
     g_sh.dc_owner = nullptr;
     g_sh.bind_epoch++;
     g_sh.last_frame_id = espgpu_frame_id(dev);
+    g_sh.inflight = false;
     g_warned_disconnect = false;
     log_line("device reconnected");
 }
@@ -197,26 +199,38 @@ void device_present(Context *c)
         }
         return;
     }
-    flush_pending(c);
     espgpu_device_t *dev = g_sh.dev;
-
     if (!espgpu_is_connected(dev)) {
         if (!g_warned_disconnect) {
             log_line("device disconnected; frames are dropped until it comes back");
             g_warned_disconnect = true;
         }
+        g_sh.inflight = false;
         try_reopen();
         g_sh.frame++;
         return;
     }
 
+    /* 背压：设备比目标帧率慢时（Doom 在 320x200 上可能只有几 fps），
+     * 只等一个帧周期会让主机每秒塞进几十帧，命令在设备端越排越多，
+     * 控制请求和画面延迟都跟着崩。提交下一帧之前先把上一帧等掉；
+     * 等待有上限（默认至少 1 s），设备真的卡住时最多多排一帧，不会无限增长。 */
+    const int bp_ms = g_wait_ms > 1000 ? g_wait_ms : 1000;
+    if (g_sh.inflight) {
+        if (espgpu_wait_frame(dev, g_sh.inflight_before, bp_ms) == 1) {
+            g_sh.last_frame_id = espgpu_frame_id(dev);
+        }
+        g_sh.inflight = false;
+    }
+
+    flush_pending(c);
+    const uint32_t before = espgpu_frame_id(dev);
     espgpu_cmd_present(dev, 1000);
+    g_sh.inflight_before = before;
+    g_sh.inflight = true;
 
     /* 帧周期 */
     const LONGLONG period = g_sh.qpf.QuadPart / g_sh.fps;
-    if (espgpu_wait_frame(dev, g_sh.last_frame_id, g_wait_ms) == 1) {
-        g_sh.last_frame_id = espgpu_frame_id(dev);
-    }
 
     /* 节流：按截止时间睡，落后太多就重新对齐，避免追帧 */
     LARGE_INTEGER now;
@@ -254,6 +268,42 @@ void device_present(Context *c)
     }
 
     g_sh.frame++;
+
+    /* ESPGPU_GL_LOG=1 时每 60 帧记一条设备侧 profile，便于在真机上定位瓶颈 */
+    static bool s_perf_log = false;
+    static bool s_perf_log_init = false;
+    static LARGE_INTEGER s_perf_t0{};
+    static uint64_t s_perf_f0 = 0;
+    if (!s_perf_log_init) {
+        s_perf_log = getenv("ESPGPU_GL_LOG") && !strcmp(getenv("ESPGPU_GL_LOG"), "1");
+        s_perf_log_init = true;
+    }
+    if (s_perf_log && g_sh.frame % 60 == 0) {
+        LARGE_INTEGER now2;
+        QueryPerformanceCounter(&now2);
+        if (s_perf_t0.QuadPart == 0) {
+            s_perf_t0 = now2;
+            s_perf_f0 = g_sh.frame;
+        } else {
+            const double secs = static_cast<double>(now2.QuadPart - s_perf_t0.QuadPart) /
+                                static_cast<double>(g_sh.qpf.QuadPart);
+            espgpu_stats_t ds{};
+            espgpu_link_stats_t ls{};
+            espgpu_get_stats(dev, &ds, 1500);
+            espgpu_get_link_stats(dev, &ls);
+            const double fps = secs > 0 ? (g_sh.frame - s_perf_f0) / secs : 0.0;
+            log_line("perf: %.1f fps | vtx %.1f clip %.1f setup %.1f bin %.1f tile %.1f io %.1f "
+                     "enc %.1f usb %.1f ms | tiles fill %u fast %u px %u gen %u passes %u "
+                     "px=%u | up %.0f KB/s",
+                     fps, ds.t_vtx_us / 1000.0, ds.t_clip_us / 1000.0, ds.t_setup_us / 1000.0,
+                     ds.t_bin_us / 1000.0, ds.t_tile_us / 1000.0, ds.t_tile_io_us / 1000.0,
+                     ds.t_encode_us / 1000.0, ds.t_usb_us / 1000.0, ds.tris_fill, ds.tris_fast,
+                     ds.tris_px, ds.tris_generic, ds.raster_passes, ds.fill_pixels, ls.in_kbps);
+            s_perf_t0 = now2;
+            s_perf_f0 = g_sh.frame;
+        }
+    }
+
     device_poll_events();
 }
 

@@ -102,6 +102,37 @@ HUD，开雾 `gl_fog 1`、按纹理排序，命令流经真实 `firmware/core` �
 降低 `ESPGPU_FPS` 到 20，或把设备分辨率降到 `256x160`。`ESPGPU_GL_DEBUG_PLAN=1`（配合
 `ESPGPU_GL_LOG=1`）会把每个批次的顶点数 / 布局写进 `espgpu-gl.log`，用来查哪类几何最占带宽。
 
+## 真机实测（2026-10-25）
+
+**能跑通的组合**：PrBoom-Plus 2.6.66（ucrt64）+ Freedoom Phase 2（`freedoom2.wad`，免费 IWAD，
+MAP01 与 DOOM2 的调用面一致）。
+
+```powershell
+# 游戏目录里放 opengl32.dll / espgpu.dll，然后：
+.\tools\doom\run-dsda.ps1 `
+  -DoomDir C:\tmp\doom-test\prboom\prboom-plus-2666-ucrt64 `
+  -Exe prboom-plus.exe -Iwad C:\tmp\doom-test\freedoom\freedoom-0.13.0\freedoom2.wad
+```
+
+实测（320x200，fw 0.2.0，`ESPGPU_GL_LOG=1` 每 60 帧输出设备侧 profile）：
+
+| 分辨率 | 帧率 | vtx | setup+bin | **tile 光栅** | encode | USB |
+|---|---:|---:|---:|---:|---:|---:|
+| 320x200 | **9.0 fps** | 4.4 ms | 4.3 ms | **142 ms** | 3.2 ms | 0.2 ms |
+| 160x120 | **16.9 fps** | 4.3 ms | 4.1 ms | **52 ms** | 1.0 ms | 0.2 ms |
+
+- 画面正确（墙 / 地板 / 精灵 / HUD），GL 调用清单 56 个入口全部已实现，
+  `python tools/doom/gen_coverage.py espgpu-gltrace.txt` 的「未实现」为空。
+- **24 fps 目标未达到**，瓶颈是 tile 光栅（`t_tile_us`），不是 USB 或 T&L；
+  160x120 能到约 17 fps。详见 issue #2。
+- `gl_fog 0` 只省约 2%（142 → 139 ms），不是雾的问题。
+- 关掉 `ESPGPU_GL_LOG` 时没有每帧 profile 开销。
+
+> **DSDA-Doom 0.30.1 不行**：它在 `gld_InitOpenGL()` 里硬性要求
+> `GL_ARB_shader_objects` / `GL_ARB_vertex_shader` / `GL_ARB_fragment_shader`，
+> 我们报告 GL 1.2 会直接报 `Insufficient support for shader objects`。
+> 需要改 DSDA 源码或等它提供兼容模式；当前用 PrBoom-Plus 2.6.66。
+
 ## 已知缺口 / 风险
 
 - **模板缓冲**：设备没有。依赖模板的天空 / 门户 / 镜子效果会缺失（`gl_use_stencil 0`）。
@@ -115,8 +146,8 @@ HUD，开雾 `gl_fog 1`、按纹理排序，命令流经真实 `firmware/core` �
 - **重排**：不透明且深度测试写深度的批次会按状态重排合并，深度完全相同的共面面片（`GL_LEQUAL` 下）谁覆盖谁
   可能与提交顺序不同。Doom 本身没有这类贴花。
 - **RGBA 纹理超过 256 色**：退回 RGBA4444，颜色只有 4 位精度（Doom 自身纹理不会触发）。
-- **DSDA-Doom 新版本若强制 GL 2.0 / GLSL**：我们报告的是 `1.2`，会被拒绝。届时改用 prboom-plus
-  2.6.x，或在 trace 里确认它要求的具体能力。
+- **DSDA-Doom 新版本强制 GL 2.0 / GLSL**（0.30.1 已确认）：我们报告的是 `1.2`，会被拒绝。当前用
+  PrBoom-Plus 2.6.66；改 DSDA 源码去掉 `gld_InitOpenGL()` 的 shader 检查也可以试。
 - **设备是 tile 延迟渲染**时，同一帧内删除 / 重传已被前面绘制引用的纹理需要设备先把分箱冲掉；
   主机侧 LRU 只在万不得已时才换出本帧用过的纹理。
 - 每进程只能一个程序打开设备（WinUSB 独占）：游戏运行时 `espgpu-panel` 连不上设备。

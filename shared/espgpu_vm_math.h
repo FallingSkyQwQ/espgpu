@@ -122,7 +122,7 @@ ESPGPU_VM_FN float espgpu_vm_sin_poly(float r)
  * 取 1/π 从第 E-1 位起的 64 位窗口 W，则 (M·W) mod 2^64 = (x/π mod 4)·2^62（更高的位贡献 4 的整数倍）。
  * 截断误差 < M·2^-62 ≤ 2^-38 周期。cos 用 x/π - 1/2，与快速路径同一套奇偶规则。
  */
-static inline ESPGPU_VM_NOINLINE float espgpu_vm_trig_big(float x, int is_cos)
+static ESPGPU_VM_NOINLINE float espgpu_vm_trig_big(float x, int is_cos)
 {
     static const uint32_t k_inv_pi[9] = {
         0u, /* 第 -31..0 位：1/π < 1，全 0 */
