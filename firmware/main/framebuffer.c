@@ -9,9 +9,12 @@
  *     c & 0x80 == 0 : 字面游程，像素数 = c + 1，范围 [1, 128]，
  *                后接 count * bpp 字节的原始像素
  *
- * 最坏情况（全字面）膨胀为 bpp+1 字节/像素，所以输出缓冲按 size + size/bpp 分配。
+ * 最坏情况约为 size * (1 + 1/(128*bpp))（每 128 个字面像素一个控制字节；游程只会更小），
+ * 输出缓冲按 size + size/bpp 分配，余量很大。
  */
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -88,104 +91,293 @@ size_t espgpu_fb_max_encoded(const espgpu_fb_t *fb)
 
 /*
  * RLE 核心，u8 / u16 两个特化版本，避免热循环里的 bpp 分支。
- * ref 非空时对参考帧做异或（差分模式）。
+ *
+ * 输出字节流与最初的「逐像素 LOAD()」实现逐字节一致（主机解码器不用改，
+ * 等价性由差分测试覆盖）。相对原实现的改动都是为了 Xtensa（顺序执行、无分支预测）：
+ *   - delta / upd 是编译期常量，三种组合各展开一份，热循环里没有 `ref ?` 判断
+ *   - 字面量扫描用滑动窗口：每个像素只算一次 cur^ref（原来每像素 4~6 次），
+ *     边扫描边写出，不再回头重新 LOAD 一遍
+ *   - 游程扫描一次比较 32 位（u16 两像素 / u8 四像素）；差分帧里大片「没变」的
+ *     零游程基本只剩访存
+ *   - upd：差分时顺手把 cur 写回 ref（PSRAM 里的 shadow），省掉之后整帧
+ *     memcpy 的一次 PSRAM 读 + 写；零游程（未变像素）不写，对应的 cache 行不会变脏
  */
 
-IRAM_ATTR static size_t rle_u8(const uint8_t *cur, const uint8_t *ref, uint8_t *out, size_t cap,
-                     size_t count)
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "rle word compare assumes little-endian"
+#endif
+
+typedef uint32_t __attribute__((may_alias)) rle_u32a_t;
+
+#define RLE_MAX_RUN 129u
+#define RLE_MAX_LIT 128u
+
+static inline __attribute__((always_inline)) bool rle_aligned4(const void *p)
 {
-#define LOAD(i) (ref ? (uint8_t)(cur[i] ^ ref[i]) : cur[i])
-    size_t o = 0;
-    size_t i = 0;
-    while (i < count) {
-        uint8_t v = LOAD(i);
-        size_t run = 1;
-        while (i + run < count && run < 129 && LOAD(i + run) == v) {
-            run++;
-        }
-        if (run >= 2) {
-            if (o + 2 > cap) {
-                return 0;
-            }
-            out[o++] = (uint8_t)(0x80 | (run - 2));
-            out[o++] = v;
-            i += run;
-            continue;
-        }
-        size_t lit = i;
-        i++;
-        while (i < count && (i - lit) < 128) {
-            if (i + 2 < count && LOAD(i) == LOAD(i + 1) && LOAD(i + 1) == LOAD(i + 2)) {
-                break;
-            }
-            i++;
-        }
-        size_t n = i - lit;
-        if (o + 1 + n > cap) {
-            return 0;
-        }
-        out[o++] = (uint8_t)(n - 1);
-        for (size_t k = 0; k < n; k++) {
-            out[o++] = LOAD(lit + k);
-        }
-    }
-    return o;
-#undef LOAD
+    return ((uintptr_t)p & 3u) == 0;
 }
 
-IRAM_ATTR static size_t rle_u16(const uint8_t *curb, const uint8_t *refb, uint8_t *out, size_t cap,
-                      size_t total_pixels)
+static inline __attribute__((always_inline)) size_t
+rle16_impl(const uint16_t *cur, uint16_t *ref, uint8_t *out, size_t cap, size_t n,
+           const bool delta, const bool upd)
 {
-    const uint16_t *cur = (const uint16_t *)curb;
-    const uint16_t *ref = (const uint16_t *)refb;
+#define L16(j) ((uint16_t)(delta ? (cur[j] ^ ref[j]) : cur[j]))
+    const bool words = rle_aligned4(cur) && (!delta || rle_aligned4(ref));
+    const rle_u32a_t *c32 = (const rle_u32a_t *)(const void *)cur;
+    const rle_u32a_t *r32 = (const rle_u32a_t *)(const void *)ref;
+    uint8_t tmp[1 + 2 * RLE_MAX_LIT];
     size_t o = 0;
     size_t i = 0;
-#define LOAD(i) (uint16_t)(ref ? (cur[i] ^ ref[i]) : cur[i])
-    const size_t count = total_pixels;
-    while (i < count) {
-        uint16_t v = LOAD(i);
-        size_t run = 1;
-        while (i + run < count && run < 129 && LOAD(i + run) == v) {
-            run++;
+
+    while (i < n) {
+        const uint16_t v = L16(i);
+        const size_t end = i + (n - i < RLE_MAX_RUN ? n - i : RLE_MAX_RUN);
+        size_t j = i + 1;
+
+        /* ── 游程：[i, j) 全等于 v ── */
+        if (words) {
+            if ((j & 1u) && j < end) {
+                if (L16(j) != v) {
+                    goto run_done;
+                }
+                j++;
+            }
+            const uint32_t vv = (uint32_t)v * 0x10001u;
+            while (j + 2 <= end) {
+                uint32_t w = c32[j >> 1];
+                if (delta) {
+                    w ^= r32[j >> 1];
+                }
+                if (w != vv) {
+                    if ((uint16_t)w == v) {
+                        j++; /* 小端：低半字是像素 j */
+                    }
+                    goto run_done;
+                }
+                j += 2;
+            }
+            if (j < end && L16(j) == v) {
+                j++;
+            }
+        } else {
+            while (j < end && L16(j) == v) {
+                j++;
+            }
         }
-        if (run >= 2) {
+    run_done:
+        if (j - i >= 2) {
             if (o + 3 > cap) {
                 return 0;
             }
-            out[o++] = (uint8_t)(0x80 | (run - 2));
-            memcpy(out + o, &v, 2);
-            o += 2;
-            i += run;
+            out[o] = (uint8_t)(0x80u | (j - i - 2));
+            memcpy(out + o + 1, &v, 2);
+            o += 3;
+            if (upd && v != 0) {
+                for (size_t k = i; k < j; k++) {
+                    ref[k] = cur[k];
+                }
+            }
+            i = j;
             continue;
         }
-        size_t lit = i;
-        i++;
-        while (i < count && (i - lit) < 128) {
-            if (i + 2 < count && LOAD(i) == LOAD(i + 1) && LOAD(i + 1) == LOAD(i + 2)) {
-                break;
+
+        /* ── 字面量：从 i 开始，到「i 之后第一个三连等」/ 128 个 / 末尾为止 ── */
+        const size_t lit = i;
+        const size_t maxk = n - lit < RLE_MAX_LIT ? n - lit : RLE_MAX_LIT;
+        const bool direct = cap - o >= 1 + 2 * maxk; /* 放得下最长字面量就直接写 */
+        uint8_t *dst = direct ? out + o + 1 : tmp;
+        size_t k = 0;
+        uint16_t a = v;
+#define PUT(px)                                        \
+    do {                                               \
+        memcpy(dst + 2 * k, &a, 2);                    \
+        if (upd) {                                     \
+            ref[px] = cur[px];                         \
+        }                                              \
+        k++;                                           \
+    } while (0)
+        PUT(lit);
+        if (k < maxk) {
+            /* 窗口：a = L(p), b = L(p+1)（p+1 < n 时有效），p = lit + k */
+            a = L16(lit + 1);
+            uint16_t b = lit + 2 < n ? L16(lit + 2) : 0;
+            while (k < maxk) {
+                const size_t p = lit + k;
+                if (p + 2 < n) {
+                    const uint16_t c = L16(p + 2);
+                    if (a == b && b == c) {
+                        break;
+                    }
+                    PUT(p);
+                    a = b;
+                    b = c;
+                } else {
+                    PUT(p);
+                    a = b;
+                }
             }
-            i++;
         }
-        size_t n = i - lit;
-        if (o + 1 + n * 2 > cap) {
-            return 0;
+#undef PUT
+        if (direct) {
+            out[o] = (uint8_t)(k - 1);
+        } else {
+            if (o + 1 + 2 * k > cap) {
+                return 0;
+            }
+            out[o] = (uint8_t)(k - 1);
+            memcpy(out + o + 1, tmp, 2 * k);
         }
-        out[o++] = (uint8_t)(n - 1);
-        for (size_t k = 0; k < n; k++) {
-            uint16_t t = LOAD(lit + k);
-            memcpy(out + o, &t, 2);
-            o += 2;
-        }
+        o += 1 + 2 * k;
+        i = lit + k;
     }
     return o;
-#undef LOAD
+#undef L16
 }
 
-IRAM_ATTR esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes, unsigned bpp,
-                            uint8_t codec, uint8_t *out, size_t cap,
-                            espgpu_fb_encode_result_t *result)
+static inline __attribute__((always_inline)) size_t
+rle8_impl(const uint8_t *cur, uint8_t *ref, uint8_t *out, size_t cap, size_t n,
+          const bool delta, const bool upd)
 {
-    if (cur == NULL || out == NULL) {
+#define L8(j) ((uint8_t)(delta ? (cur[j] ^ ref[j]) : cur[j]))
+    const bool words = rle_aligned4(cur) && (!delta || rle_aligned4(ref));
+    const rle_u32a_t *c32 = (const rle_u32a_t *)(const void *)cur;
+    const rle_u32a_t *r32 = (const rle_u32a_t *)(const void *)ref;
+    uint8_t tmp[1 + RLE_MAX_LIT];
+    size_t o = 0;
+    size_t i = 0;
+
+    while (i < n) {
+        const uint8_t v = L8(i);
+        const size_t end = i + (n - i < RLE_MAX_RUN ? n - i : RLE_MAX_RUN);
+        size_t j = i + 1;
+
+        if (words) {
+            while ((j & 3u) && j < end) {
+                if (L8(j) != v) {
+                    goto run_done;
+                }
+                j++;
+            }
+            const uint32_t vv = (uint32_t)v * 0x01010101u;
+            while (j + 4 <= end) {
+                uint32_t w = c32[j >> 2];
+                if (delta) {
+                    w ^= r32[j >> 2];
+                }
+                w ^= vv;
+                if (w != 0) {
+                    /* 小端：最低的非零字节就是第一个不等的像素 */
+                    j += (unsigned)__builtin_ctz(w) >> 3;
+                    goto run_done;
+                }
+                j += 4;
+            }
+            while (j < end && L8(j) == v) {
+                j++;
+            }
+        } else {
+            while (j < end && L8(j) == v) {
+                j++;
+            }
+        }
+    run_done:
+        if (j - i >= 2) {
+            if (o + 2 > cap) {
+                return 0;
+            }
+            out[o] = (uint8_t)(0x80u | (j - i - 2));
+            out[o + 1] = v;
+            o += 2;
+            if (upd && v != 0) {
+                memcpy(ref + i, cur + i, j - i);
+            }
+            i = j;
+            continue;
+        }
+
+        const size_t lit = i;
+        const size_t maxk = n - lit < RLE_MAX_LIT ? n - lit : RLE_MAX_LIT;
+        const bool direct = cap - o >= 1 + maxk;
+        uint8_t *dst = direct ? out + o + 1 : tmp;
+        size_t k = 0;
+        uint8_t a = v;
+        dst[k++] = a;
+        if (k < maxk) {
+            a = L8(lit + 1);
+            uint8_t b = lit + 2 < n ? L8(lit + 2) : 0;
+            while (k < maxk) {
+                const size_t p = lit + k;
+                if (p + 2 < n) {
+                    const uint8_t c = L8(p + 2);
+                    if (a == b && b == c) {
+                        break;
+                    }
+                    dst[k++] = a;
+                    a = b;
+                    b = c;
+                } else {
+                    dst[k++] = a;
+                    a = b;
+                }
+            }
+        }
+        if (upd) {
+            memcpy(ref + lit, cur + lit, k);
+        }
+        if (direct) {
+            out[o] = (uint8_t)(k - 1);
+        } else {
+            if (o + 1 + k > cap) {
+                return 0;
+            }
+            out[o] = (uint8_t)(k - 1);
+            memcpy(out + o + 1, tmp, k);
+        }
+        o += 1 + k;
+        i = lit + k;
+    }
+    return o;
+#undef L8
+}
+
+/* 三种组合各一份：关键帧 / 只读参考帧 / 参考帧原地更新 */
+IRAM_ATTR static size_t rle16_key(const uint8_t *cur, uint8_t *out, size_t cap, size_t n)
+{
+    return rle16_impl((const uint16_t *)(const void *)cur, NULL, out, cap, n, false, false);
+}
+IRAM_ATTR static size_t rle16_delta(const uint8_t *cur, const uint8_t *ref, uint8_t *out,
+                                    size_t cap, size_t n)
+{
+    return rle16_impl((const uint16_t *)(const void *)cur, (uint16_t *)(uintptr_t)ref, out, cap,
+                      n, true, false);
+}
+IRAM_ATTR static size_t rle16_delta_upd(const uint8_t *cur, uint8_t *ref, uint8_t *out,
+                                        size_t cap, size_t n)
+{
+    return rle16_impl((const uint16_t *)(const void *)cur, (uint16_t *)(void *)ref, out, cap, n,
+                      true, true);
+}
+/* u8 只在测试图案的 INDEX8 模式下用，不是热路径：放 flash，省 IRAM */
+static size_t rle8_key(const uint8_t *cur, uint8_t *out, size_t cap, size_t n)
+{
+    return rle8_impl(cur, NULL, out, cap, n, false, false);
+}
+static size_t rle8_delta(const uint8_t *cur, const uint8_t *ref, uint8_t *out, size_t cap,
+                         size_t n)
+{
+    return rle8_impl(cur, (uint8_t *)(uintptr_t)ref, out, cap, n, true, false);
+}
+static size_t rle8_delta_upd(const uint8_t *cur, uint8_t *ref, uint8_t *out, size_t cap,
+                             size_t n)
+{
+    return rle8_impl(cur, ref, out, cap, n, true, true);
+}
+
+static esp_err_t encode_common(const uint8_t *cur, uint8_t *ref, bool upd, size_t bytes,
+                               unsigned bpp, uint8_t codec, uint8_t *out, size_t cap,
+                               espgpu_fb_encode_result_t *result)
+{
+    if (cur == NULL || out == NULL || (bpp != 1 && bpp != 2)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -200,16 +392,23 @@ IRAM_ATTR esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, si
         break;
 
     case ESPGPU_CODEC_RLE:
-    case ESPGPU_CODEC_DELTA_RLE:
+    case ESPGPU_CODEC_DELTA_RLE: {
+        /* 与原实现一致：RLE 也接受 ref（调用者负责只在差分时传） */
+        const size_t n = bytes / bpp;
         if (bpp == 1) {
-            encoded = rle_u8(cur, ref, out, cap, bytes);
+            encoded = ref == NULL ? rle8_key(cur, out, cap, n)
+                      : upd       ? rle8_delta_upd(cur, ref, out, cap, n)
+                                  : rle8_delta(cur, ref, out, cap, n);
         } else {
-            encoded = rle_u16(cur, ref, out, cap, bytes / 2);
+            encoded = ref == NULL ? rle16_key(cur, out, cap, n)
+                      : upd       ? rle16_delta_upd(cur, ref, out, cap, n)
+                                  : rle16_delta(cur, ref, out, cap, n);
         }
         if (encoded == 0) {
             return ESP_ERR_INVALID_SIZE;
         }
         break;
+    }
 
     default:
         return ESP_ERR_NOT_SUPPORTED;
@@ -220,6 +419,31 @@ IRAM_ATTR esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, si
         result->enc_bytes = (uint32_t)encoded;
     }
     return ESP_OK;
+}
+
+esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes, unsigned bpp,
+                            uint8_t codec, uint8_t *out, size_t cap,
+                            espgpu_fb_encode_result_t *result)
+{
+    return encode_common(cur, (uint8_t *)(uintptr_t)ref, false, bytes, bpp, codec, out, cap,
+                         result);
+}
+
+esp_err_t espgpu_encode_update(const uint8_t *cur, uint8_t *shadow, size_t bytes, unsigned bpp,
+                               uint8_t codec, uint8_t *out, size_t cap,
+                               espgpu_fb_encode_result_t *result)
+{
+    if (shadow == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (codec != ESPGPU_CODEC_DELTA_RLE) {
+        const esp_err_t err = encode_common(cur, NULL, false, bytes, bpp, codec, out, cap, result);
+        if (err == ESP_OK) {
+            memcpy(shadow, cur, bytes);
+        }
+        return err;
+    }
+    return encode_common(cur, shadow, true, bytes, bpp, codec, out, cap, result);
 }
 
 esp_err_t espgpu_fb_encode(espgpu_fb_t *fb, uint8_t codec, uint8_t *out, size_t out_cap,

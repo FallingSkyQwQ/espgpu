@@ -20,7 +20,11 @@ typedef struct {
 
     uint8_t pattern;      /* ESPGPU_PATTERN_*，M1 的测试图案选择 */
     bool streaming;       /* 是否在持续出帧 */
-    volatile bool force_keyframe; /* 模式变更后强制出一帧非差分，让主机重建参考帧 */
+    /* 模式变更后强制出一帧非差分，让主机重建参考帧。
+     * 测试图案模式：呈现任务清零；命令模式：只有命令任务清零（发送任务不写它，
+     * 发送失败走 frame_chain.h 的 fail_seq）。32 位：读-清用原子交换
+     * （Xtensa 的 S32C1I 只有 32 位，1 字节原子操作会变成库函数调用）。 */
+    volatile uint32_t force_keyframe;
 
     /* 模式变更走「挂待办 + 帧边界应用」，避免控制任务和呈现任务抢同一把锁。
      * 呈现任务整帧持有 lock，控制任务如果直接 take 会被饿死（实测 15 秒）。 */
@@ -34,8 +38,7 @@ typedef struct {
     size_t shadow_bytes;
     volatile bool command_mode;    /**< true = 由命令流驱动，停掉测试图案 */
     uint8_t frame_codec;           /**< PRESENT 时使用的编码 */
-    uint32_t frames_since_key;     /**< 距上一个关键帧的帧数，用于兜底重建参考帧 */
-    uint32_t last_delta_bytes;     /**< 上一帧差分编码大小，用于自适应选 RLE */
+    /* 关键帧 / 差分链的簿记见 gpu.c 的 s_chain_*（frame_chain.h） */
 
     uint32_t frame_id;
     uint32_t present_period_us;

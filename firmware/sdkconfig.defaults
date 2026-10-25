@@ -14,6 +14,14 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=8192
 
+# --- Cache：shadow / 深度 tile / 纹理 / 发送槽都在 PSRAM ---
+# 数据 cache 32 KB -> 64 KB、行 32 B -> 64 B：编码时顺序扫 128 KB 的 shadow、深度 tile
+# 整块拷入拷出，长行减少一半的 cache miss；纹理采样的工作集也更容易留在 cache 里。
+# 代价是多占 32 KB 内部 SRAM（启动日志里 core 的 "screen WxH (internal/psram)"
+# 若变成 psram 就说明内部 SRAM 不够了，回退成 32 KB）。
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
 # --- Flash (16MB) ---
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
@@ -27,7 +35,11 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_TINYUSB_DEBUG_LEVEL=0
 # 单接口 vendor 类：两条 bulk 端点承载全部流量
 CONFIG_TINYUSB_VENDOR_COUNT=1
-CONFIG_TINYUSB_VENDOR_EPSIZE=64
+# EPSIZE 是 vendor 类 IN 传输的单次长度（TinyUSB >= 0.21 的 OUT 仍按 64 字节一包收，
+# 见 usb_device.c 的 #error）。64 时每个 64 字节包都要走一次 ISR -> tud_task ->
+# xfer_cb -> 再起传输；4096 时一次 DMA 传输带 64 个包，tud_task 的开销降到 1/64。
+# esp_tinyusb 的 Kconfig 帮助里也写着这是对吞吐影响最大的参数。
+CONFIG_TINYUSB_VENDOR_EPSIZE=4096
 CONFIG_TINYUSB_VENDOR_RX_BUFSIZE=8192
 CONFIG_TINYUSB_VENDOR_TX_BUFSIZE=8192
 

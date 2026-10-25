@@ -30,7 +30,9 @@
 
 #include "espgpu_lz.h"
 #include "espgpu_proto.h"
+#include "frame_chain.h"
 #include "gpu.h"
+#include "log_fwd.h"
 #include "usb_device.h"
 #include "version.h"
 
@@ -64,6 +66,20 @@ typedef struct {
 static send_slot_t s_slots[SEND_SLOTS];
 static QueueHandle_t s_free_q; /* 可写槽位下标 */
 static QueueHandle_t s_send_q; /* 待发槽位下标 */
+
+static chain_tx_t s_chain_tx;     /* 发送任务写 */
+static chain_prod_t s_chain_prod; /* 命令任务写 */
+
+/* 一帧最多几个分片：frag_index / frag_count 是 u8，主机按 255 片重组。
+ * 不用 ESPGPU_MAX_FRAGMENTS（16）：800x600 RAW 要 30 片，大分辨率下不可压缩的
+ * RLE 帧也会超过 16 片，以前这些帧永远发不出去。 */
+#define FRAME_MAX_FRAGMENTS 255u
+
+/* 读-清 一次完成：避免「读到 false → 别的任务置 true → 这里写 false」丢掉请求 */
+static inline bool take_keyframe_request(void)
+{
+    return __atomic_exchange_n(&g_gpu.force_keyframe, 0u, __ATOMIC_ACQ_REL) != 0;
+}
 
 /* ── OTA ──────────────────────────────────────────────────────────── */
 
@@ -279,7 +295,7 @@ static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_l
     if (frag_count == 0) {
         frag_count = 1;
     }
-    if (frag_count > ESPGPU_MAX_FRAGMENTS) {
+    if (frag_count > FRAME_MAX_FRAGMENTS) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -359,9 +375,11 @@ void espgpu_gpu_present_task(void *arg)
         espgpu_fb_test_pattern(&g_gpu.fb, g_gpu.frame_id, g_gpu.pattern);
         int64_t t1 = esp_timer_get_time();
 
-        /* 模式刚变过就出一帧关键帧，让主机重建差分参考 */
+        /* 模式刚变过就出一帧关键帧，让主机重建差分参考。
+         * 请求在这里就取走；这一帧没发成功再放回去。 */
         uint8_t codec = g_gpu.mode.codec;
-        if (codec == ESPGPU_CODEC_DELTA_RLE && g_gpu.force_keyframe) {
+        const bool key_req = take_keyframe_request();
+        if (codec == ESPGPU_CODEC_DELTA_RLE && key_req) {
             codec = ESPGPU_CODEC_RLE;
         }
 
@@ -372,6 +390,9 @@ void espgpu_gpu_present_task(void *arg)
 
         if (err != ESP_OK) {
             g_gpu.stats.frames_dropped++;
+            if (key_req) {
+                g_gpu.force_keyframe = true;
+            }
             xSemaphoreGive(g_gpu.lock);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -384,10 +405,11 @@ void espgpu_gpu_present_task(void *arg)
 
         if (err == ESP_OK) {
             espgpu_fb_swap(&g_gpu.fb); /* 只有发成功才更新差分参考帧 */
-            g_gpu.force_keyframe = false;
             g_gpu.frame_id++;
             g_gpu.stats.frames_presented++;
         } else {
+            /* 主机至多收到半帧（会丢弃）；参考帧没换，但保险起见下一帧走关键帧 */
+            g_gpu.force_keyframe = true;
             g_gpu.stats.frames_dropped++;
         }
 
@@ -414,20 +436,61 @@ void espgpu_gpu_present_task(void *arg)
 
 /* ── 命令模式：编码 + 交给发送任务 ───────────────────────────────── */
 
+/** 把所有槽位从发送任务手里收回来（换缓冲前调用）。失败时已拿到的会还回去。 */
+static bool own_all_slots(TickType_t wait)
+{
+    int taken[SEND_SLOTS];
+    int n = 0;
+    while (n < SEND_SLOTS && xQueueReceive(s_free_q, &taken[n], wait) == pdTRUE) {
+        n++;
+    }
+    if (n < SEND_SLOTS) {
+        for (int i = 0; i < n; i++) {
+            xQueueSend(s_free_q, &taken[i], 0);
+        }
+        return false;
+    }
+    return true;
+}
+
+static void release_all_slots(void)
+{
+    for (int i = 0; i < SEND_SLOTS; i++) {
+        xQueueSend(s_free_q, &i, 0);
+    }
+}
+
 static bool ensure_slots(size_t raw)
 {
-    const size_t cap = raw + raw / 2 + 64; /* RLE 最坏 (bpp+1)/bpp = 1.5x */
+    const size_t cap = raw + raw / 2 + 64; /* RLE 最坏远小于 1.5x，留足余量 */
+    bool need = false;
     for (int i = 0; i < SEND_SLOTS; i++) {
-        if (s_slots[i].buf && s_slots[i].cap >= cap) {
-            continue;
+        need |= s_slots[i].buf == NULL || s_slots[i].cap < cap;
+    }
+    if (need) {
+        /* 发送任务可能正在读某个槽位：先全部收回再换，否则就是 use-after-free
+         * （SET_MODE 的 drain_sender 最多等 1 秒，USB 卡住时它会放弃） */
+        if (!own_all_slots(pdMS_TO_TICKS(2000))) {
+            ESP_LOGW(TAG, "send slots busy, cannot resize");
+            return false;
         }
-        if (s_slots[i].buf) {
-            heap_caps_free(s_slots[i].buf);
+        bool ok = true;
+        for (int i = 0; i < SEND_SLOTS; i++) {
+            if (s_slots[i].buf && s_slots[i].cap >= cap) {
+                continue;
+            }
+            if (s_slots[i].buf) {
+                heap_caps_free(s_slots[i].buf);
+            }
+            s_slots[i].buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+            s_slots[i].cap = s_slots[i].buf ? cap : 0;
+            if (s_slots[i].buf == NULL) {
+                ESP_LOGE(TAG, "send slot alloc failed (%u)", (unsigned)cap);
+                ok = false;
+            }
         }
-        s_slots[i].buf = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-        s_slots[i].cap = s_slots[i].buf ? cap : 0;
-        if (s_slots[i].buf == NULL) {
-            ESP_LOGE(TAG, "send slot alloc failed (%u)", (unsigned)cap);
+        release_all_slots();
+        if (!ok) {
             return false;
         }
     }
@@ -463,49 +526,35 @@ static void on_core_present(void *user, const uint16_t *pixels, uint16_t w, uint
         return;
     }
 
-    /* 等一个空闲槽位：发送比渲染慢时在这里形成背压 */
+    /* 等一个空闲槽位：发送比渲染慢时在这里形成背压。
+     * 超时丢帧不用关键帧：shadow 没动，主机参考帧仍然和它一致。 */
     int slot = -1;
     if (xQueueReceive(s_free_q, &slot, pdMS_TO_TICKS(500)) != pdTRUE) {
         g_gpu.stats.frames_dropped++;
-        g_gpu.force_keyframe = true; /* 这一帧没发，主机参考帧仍是更早的帧 */
         return;
     }
     send_slot_t *sl = &s_slots[slot];
 
-    uint8_t codec = g_gpu.frame_codec;
-    if (codec == ESPGPU_CODEC_DELTA_RLE) {
-        /* 关键帧：模式切换 / 发送失败 / 周期性兜底 / 上一帧差分效果很差（内容整屏在变，
-         * 这时 RLE 更小 —— bench-results 里 bars 图案 10.2x vs 5.3x 的结论） */
-        if (g_gpu.force_keyframe || g_gpu.frames_since_key >= 60 ||
-            g_gpu.last_delta_bytes > raw / 3) {
-            codec = ESPGPU_CODEC_RLE;
-        }
-    }
+    const bool key_req = take_keyframe_request();
+    const uint8_t codec =
+        chain_pick_codec(&s_chain_prod, &s_chain_tx, g_gpu.frame_codec, key_req, raw);
 
-    /* 关键：只有 DELTA_RLE 才传参考帧。关键帧如果也传了 shadow，
-     * 编码端做了异或而解码端没有，解出来必然是垃圾。 */
-    const uint8_t *ref = (codec == ESPGPU_CODEC_DELTA_RLE) ? g_gpu.shadow : NULL;
+    /* 只有 DELTA_RLE 对 shadow 做差分；编码的同一遍把 shadow 更新成这一帧
+     * （关键帧则编码后整帧拷贝）。主机只会在这一帧之后收到基于它的差分帧 ——
+     * 这一帧要是没发出去，发送任务会断链并丢掉后面的差分帧（frame_chain.h）。 */
     espgpu_fb_encode_result_t res;
     const int64_t t0 = esp_timer_get_time();
-    esp_err_t err = espgpu_encode_raw((const uint8_t *)pixels, ref, raw, 2, codec, sl->buf,
-                                      sl->cap, &res);
+    esp_err_t err = espgpu_encode_update((const uint8_t *)pixels, g_gpu.shadow, raw, 2, codec,
+                                         sl->buf, sl->cap, &res);
     g_gpu.stats.t_encode_us = (uint32_t)(esp_timer_get_time() - t0);
     if (err != ESP_OK) {
+        /* shadow 可能已被部分更新，必须重建参考帧 */
+        g_gpu.force_keyframe = true;
         g_gpu.stats.frames_dropped++;
         xQueueSend(s_free_q, &slot, 0);
         return;
     }
-
-    /* 乐观地更新参考帧：发送失败时发送任务会置 force_keyframe */
-    memcpy(g_gpu.shadow, pixels, raw);
-    if (codec == ESPGPU_CODEC_DELTA_RLE) {
-        g_gpu.last_delta_bytes = res.enc_bytes;
-        g_gpu.frames_since_key++;
-    } else {
-        g_gpu.last_delta_bytes = 0;
-        g_gpu.frames_since_key = 0;
-    }
-    g_gpu.force_keyframe = false;
+    chain_produced(&s_chain_prod, codec, res.enc_bytes);
 
     sl->enc_len = res.enc_bytes;
     sl->raw_len = res.raw_bytes;
@@ -542,23 +591,32 @@ void espgpu_gpu_sender_task(void *arg)
             continue;
         }
         send_slot_t *sl = &s_slots[slot];
+        if (!chain_tx_should_send(&s_chain_tx, sl->codec)) {
+            /* 断链后的差分帧：参考帧主机没有，发了只会花屏 */
+            g_gpu.stats.frames_dropped++;
+            xQueueSend(s_free_q, &slot, portMAX_DELAY);
+            continue;
+        }
         const int64_t t0 = esp_timer_get_time();
         esp_err_t err = send_frame(sl->buf, sl->enc_len, sl->raw_len, sl->codec, sl->w, sl->h,
                                    ESPGPU_FMT_RGB565, sl->frame_id);
         g_gpu.stats.t_usb_us = (uint32_t)(esp_timer_get_time() - t0);
+        /* 先记结果再还槽位：命令任务拿到这个槽位时一定已经看得到 fail_seq */
+        chain_tx_done(&s_chain_tx, sl->codec, err == ESP_OK);
         if (err == ESP_OK) {
             g_gpu.stats.frames_presented++;
         } else {
             g_gpu.stats.frames_dropped++;
-            g_gpu.force_keyframe = true;
         }
+        const uint32_t enc_len = sl->enc_len;
+        const uint32_t raw_len = sl->raw_len;
         xQueueSend(s_free_q, &slot, portMAX_DELAY);
 
         if (++dbg_frames % 30 == 0) {
             ESP_LOGI(TAG, "frame %u: raster %u us  tnl %u us  encode %u us  usb %u us  enc %u/%u B",
-                     (unsigned)dbg_frames, (unsigned)st_raster(), (unsigned)st_tnl(), (unsigned)g_gpu.stats.t_encode_us,
-                     (unsigned)g_gpu.stats.t_usb_us, (unsigned)sl->enc_len,
-                     (unsigned)sl->raw_len);
+                     (unsigned)dbg_frames, (unsigned)st_raster(), (unsigned)st_tnl(),
+                     (unsigned)g_gpu.stats.t_encode_us, (unsigned)g_gpu.stats.t_usb_us,
+                     (unsigned)enc_len, (unsigned)raw_len);
         }
     }
 }
@@ -672,50 +730,33 @@ static uint16_t ota_end(uint32_t crc)
 
 /* ── 日志转发 ─────────────────────────────────────────────────────── */
 
-#define LOG_RING 4096
-static char s_log_ring[LOG_RING];
-static volatile uint32_t s_log_head, s_log_tail;
+static logfwd_ring_t s_log_ring;
 static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile int s_log_level;   /* 0 = 未订阅 */
 static vprintf_like_t s_orig_vprintf;
-static volatile bool s_log_sending;
+static volatile TaskHandle_t s_log_drainer; /* 正在发日志的任务：它自己的日志不再入队 */
 
-static int level_of_line(const char *s)
-{
-    /* esp_log 行首：可能有 ANSI 颜色前缀 "\033[0;31m"，然后是 E/W/I/D/V */
-    if (s[0] == '\033') {
-        const char *m = strchr(s, 'm');
-        if (m) s = m + 1;
-    }
-    switch (s[0]) {
-    case 'E': return 1;
-    case 'W': return 2;
-    case 'I': return 3;
-    case 'D': return 4;
-    case 'V': return 5;
-    default: return 3;
-    }
-}
-
+/* esp_log 的 vprintf 钩子：任意任务上下文（ESP_LOGx 不允许在 ISR 里用；ISR / 早期日志
+ * 走 esp_rom_printf，不经过这里）。原样入队，判级别 / 分行 / 去颜色都在 drain_logs。 */
 static int log_vprintf(const char *fmt, va_list ap)
 {
     va_list ap2;
     va_copy(ap2, ap);
     const int r = s_orig_vprintf ? s_orig_vprintf(fmt, ap) : vprintf(fmt, ap);
-    if (s_log_level > 0 && !s_log_sending) {
+    if (s_log_level > 0 && s_log_drainer != xTaskGetCurrentTaskHandle()) {
         char line[200];
         int n = vsnprintf(line, sizeof(line), fmt, ap2);
-        if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
-        if (n > 0 && level_of_line(line) <= s_log_level) {
-            portENTER_CRITICAL(&s_log_mux);
-            for (int i = 0; i < n; i++) {
-                const uint32_t next = (s_log_head + 1) % LOG_RING;
-                if (next == s_log_tail) {
-                    break; /* 满了丢弃 */
-                }
-                s_log_ring[s_log_head] = line[i];
-                s_log_head = next;
+        if (n > (int)sizeof(line) - 1) {
+            /* 截断了：如果原本以换行结尾，保住换行，否则会和下一行粘在一起 */
+            n = (int)sizeof(line) - 1;
+            const size_t fl = strlen(fmt);
+            if (fl && fmt[fl - 1] == '\n') {
+                line[n - 1] = '\n';
             }
+        }
+        if (n > 0) {
+            portENTER_CRITICAL(&s_log_mux);
+            logfwd_push(&s_log_ring, line, (uint32_t)n); /* 满了整段丢弃 */
             portEXIT_CRITICAL(&s_log_mux);
         }
     }
@@ -728,51 +769,64 @@ void espgpu_log_forward_init(void)
     s_orig_vprintf = esp_log_set_vprintf(log_vprintf);
 }
 
-/** 在命令任务里调用：把积压的日志按行打包发出 */
+/** 在命令任务里调用：把积压的完整日志行逐行发出 */
 static void drain_logs(void)
 {
-    if (s_log_level <= 0 || s_log_head == s_log_tail || !espgpu_usb_ready()) {
+    if (s_log_level <= 0 || logfwd_used(&s_log_ring) == 0 || !espgpu_usb_ready()) {
         return;
     }
     char buf[512];
-    size_t n = 0;
     portENTER_CRITICAL(&s_log_mux);
-    while (s_log_tail != s_log_head && n < sizeof(buf)) {
-        buf[n++] = s_log_ring[s_log_tail];
-        s_log_tail = (s_log_tail + 1) % LOG_RING;
-    }
+    const uint32_t n = logfwd_peek(&s_log_ring, buf, sizeof(buf));
     portEXIT_CRITICAL(&s_log_mux);
 
-    /* 按行发，去掉 ANSI 颜色序列（ESC [ ... m）和回车换行 */
-    s_log_sending = true;
+    /* 只发到最后一个换行；半行留在环里等下次（单行超过 buf 才强制切断） */
+    const uint32_t take = logfwd_complete_prefix(buf, n, sizeof(buf));
+    if (take == 0) {
+        return;
+    }
+    portENTER_CRITICAL(&s_log_mux);
+    logfwd_consume(&s_log_ring, take); /* 只有这里推进 tail，peek 之后不会变 */
+    portEXIT_CRITICAL(&s_log_mux);
+
+    s_log_drainer = xTaskGetCurrentTaskHandle();
     char line[512];
-    size_t ln = 0;
-    for (size_t i = 0; i < n; i++) {
-        const char ch = buf[i];
-        if (ch == '\033') {
-            while (i < n && buf[i] != 'm') {
-                i++;
-            }
+    size_t start = 0;
+    for (size_t i = 0; i <= take; i++) {
+        if (i < take && buf[i] != '\n') {
             continue;
         }
-        if (ch == '\n') {
-            if (ln) {
-                espgpu_usb_send_chunk(ESPGPU_CHUNK_LOG, 0, line, (uint32_t)ln, 20);
-            }
-            ln = 0;
-            continue;
-        }
-        if (ch != '\r' && ln < sizeof(line)) {
-            line[ln++] = ch;
+        const size_t ln = logfwd_clean(line, buf + start, i - start);
+        start = i + 1;
+        if (ln && logfwd_level(line, ln) <= s_log_level) {
+            espgpu_usb_send_chunk(ESPGPU_CHUNK_LOG, 0, line, (uint32_t)ln, 20);
         }
     }
-    if (ln) {
-        espgpu_usb_send_chunk(ESPGPU_CHUNK_LOG, 0, line, (uint32_t)ln, 20);
-    }
-    s_log_sending = false;
+    s_log_drainer = NULL;
 }
 
 /* ── 控制请求 ─────────────────────────────────────────────────────── */
+
+/**
+ * OTA 回滚确认：新固件要等主机真的通过 USB 和我们说上话才算自检通过。
+ * 以前在 app_main 里 USB 起来之前就确认了 —— USB 坏掉的固件恰恰是最需要回滚的。
+ * 没有主机连上就重启（或掉电）会回滚到旧固件，这是有意的。
+ */
+static void confirm_running_app_once(void)
+{
+    static bool s_done;
+    if (s_done) {
+        return;
+    }
+    s_done = true;
+    esp_ota_img_states_t st;
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    if (run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
+        st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "new firmware confirmed by host: %s", esp_err_to_name(err));
+    }
+}
 
 static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint32_t extra_len)
 {
@@ -864,6 +918,10 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         break;
 
     case ESPGPU_CTRL_LOG_SUBSCRIBE:
+        /* 丢掉上次订阅留下的积压，从现在开始转发 */
+        portENTER_CRITICAL(&s_log_mux);
+        s_log_ring.tail = s_log_ring.head;
+        portEXIT_CRITICAL(&s_log_mux);
         s_log_level = (int)(req->arg0 > 5 ? 5 : req->arg0);
         break;
 
@@ -936,11 +994,13 @@ static void handle_cmd_chunk(const uint8_t *data, uint32_t len)
     /* 收到任何 GPU 命令就认为主机接管了渲染，停掉 M1 的测试图案自动出帧。
      * 切换瞬间必须强制关键帧：设备的 shadow 是旧内容，主机参考帧是测试图案。 */
     if (!g_gpu.command_mode) {
-        g_gpu.force_keyframe = true;
         g_gpu.command_mode = true;
         /* 等呈现任务退出当前这一帧，避免两条路径同时发帧 */
         xSemaphoreTake(g_gpu.lock, portMAX_DELAY);
         xSemaphoreGive(g_gpu.lock);
+        /* 必须在握手之后置位：呈现任务那一帧发成功时会清掉之前的请求，
+         * 第一帧命令模式画面就会对着主机的测试图案参考帧做差分 */
+        g_gpu.force_keyframe = true;
     }
 
     gpu_core_exec(g_gpu.core, data, len);
@@ -973,6 +1033,7 @@ void espgpu_gpu_command_task(void *arg)
                 espgpu_ctrl_req_t req;
                 memcpy(&req, s_cmd_buf, sizeof(req));
                 handle_ctrl(&req, s_cmd_buf + sizeof(req), hdr.length - sizeof(req));
+                confirm_running_app_once();
             } else {
                 g_gpu.stats.host_errors++;
             }

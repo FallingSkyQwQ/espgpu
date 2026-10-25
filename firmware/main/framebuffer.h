@@ -88,6 +88,17 @@ esp_err_t espgpu_encode_raw(const uint8_t *cur, const uint8_t *ref, size_t bytes
                             uint8_t codec, uint8_t *out, size_t cap,
                             espgpu_fb_encode_result_t *result);
 
+/**
+ * 同 espgpu_encode_raw，但参考帧就地更新：返回 ESP_OK 时 shadow 的内容等于 cur。
+ *
+ * DELTA_RLE 在编码的同一遍里把变化的像素写回 shadow（省掉单独一遍整帧 memcpy，
+ * 未变的区域不写、cache 行不变脏）；其它 codec 编码后整帧拷贝。
+ * 失败时 shadow 可能已被部分更新 —— 调用者必须把它当作失效（强制下一帧关键帧）。
+ */
+esp_err_t espgpu_encode_update(const uint8_t *cur, uint8_t *shadow, size_t bytes, unsigned bpp,
+                               uint8_t codec, uint8_t *out, size_t cap,
+                               espgpu_fb_encode_result_t *result);
+
 /** 编码后最坏情况的上界，用于分配输出缓冲。 */
 size_t espgpu_fb_max_encoded(const espgpu_fb_t *fb);
 

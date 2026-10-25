@@ -11,7 +11,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $env:PYTHONUTF8 = "1"
-& "C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1" *> $null
+# Dot-source (not "&"): the profile may define functions/aliases (idf.py) that a
+# child scope would drop.
+. "C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1" *> $null
 
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location (Join-Path $root "firmware")
@@ -24,11 +26,16 @@ if (-not (Test-Path "sdkconfig")) {
 idf.py build
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-$args = @("-p", $Port, "flash")
-if ($Monitor) { $args += "monitor" }
-
-if ($Port -eq "") {
+# $args is a PowerShell automatic variable; use our own name. Pass -p only when a
+# port was given ("-p ''" makes idf.py fail instead of auto-detecting).
+$idfArgs = @()
+if ($Port -ne "") {
+    $idfArgs += @("-p", $Port)
+} else {
     Write-Host "Hint: pass -Port COMx if auto-detection fails." -ForegroundColor Yellow
 }
+$idfArgs += "flash"
+if ($Monitor) { $idfArgs += "monitor" }
 
-idf.py @args
+idf.py @idfArgs
+if ($LASTEXITCODE -ne 0) { throw "flash failed" }
