@@ -642,7 +642,14 @@ enum {
     ESPGPU_CODEC_RAW = 0,        /**< 裸数据 */
     ESPGPU_CODEC_RLE = 1,        /**< 逐行 RLE */
     ESPGPU_CODEC_DELTA_RLE = 2,  /**< 与上一帧异或后 RLE */
-    ESPGPU_CODEC_TILE_DELTA = 3, /**< tile 脏标记 + 每 tile 内 RLE */
+    ESPGPU_CODEC_TILE_DELTA = 3, /**< tile 脏标记 + 每 tile 内 RLE（未实现） */
+    /** 有损：BC1 4x4 块 + 块级差分，固定 4:1（320x200 每帧 <= 32.5 KB），见 espgpu_block.h。
+     *  仅 RGB565、仅命令模式。 */
+    ESPGPU_CODEC_BLOCK = 4,
+    /** 只作为模式值（SET_MODE.codec / SET_CODEC），不会出现在帧头里：
+     *  差分帧放得进每帧带宽预算时发无损 DELTA_RLE，放不下（镜头在动）时改发 BLOCK，
+     *  画面静止下来后补一帧无损 RLE 关键帧，静止画面最终是精确的。 */
+    ESPGPU_CODEC_AUTO = 5,
 };
 
 /** 帧分片标志 */
@@ -769,6 +776,8 @@ enum {
     ESPGPU_CAP_CODEC_RLE = 1u << ESPGPU_CODEC_RLE,
     ESPGPU_CAP_CODEC_DELTA_RLE = 1u << ESPGPU_CODEC_DELTA_RLE,
     ESPGPU_CAP_CODEC_TILE_DELTA = 1u << ESPGPU_CODEC_TILE_DELTA,
+    ESPGPU_CAP_CODEC_BLOCK = 1u << ESPGPU_CODEC_BLOCK,
+    ESPGPU_CAP_CODEC_AUTO = 1u << ESPGPU_CODEC_AUTO,
 };
 
 /** 能力位 */
@@ -856,6 +865,19 @@ typedef struct {
     uint32_t buffers_bytes;
     uint32_t lz_in_bytes;     /**< 累计压缩的下行字节（解压前） */
     uint32_t lz_out_bytes;    /**< 解压后 */
+    /* ── 以下为分段 profile（上一帧，命令任务 / 光栅 worker 用 CPU 周期计数换算）；
+     *    旧固件不发，主机按 0 处理 ── */
+    uint32_t t_vtx_us;        /**< 顶点取数 + 变换 + 光照 + 雾 + 投影 */
+    uint32_t t_clip_us;       /**< 齐次裁剪 */
+    uint32_t t_setup_us;      /**< 三角形建立（剔除 / 边函数 / 属性平面 / 写记录），不含分箱 */
+    uint32_t t_bin_us;        /**< 分箱（tile 链表追加） */
+    uint32_t t_tile_us;       /**< tile 内光栅，所有 worker 求和（不含 tile 取入 / 写回） */
+    uint32_t t_tile_io_us;    /**< tile 颜色 / 深度取入与写回，所有 worker 求和 */
+    uint32_t tris_fill;       /**< 三角形×tile：常量色填充路径 */
+    uint32_t tris_fast;       /**< RGB565 纹理 × 常量色路径 */
+    uint32_t tris_px;         /**< 像素管线快速路径（光照 / 雾 / alpha / 混合） */
+    uint32_t tris_generic;    /**< 通用浮点路径（多纹理 / VM / 其它组合） */
+    uint32_t raster_passes;   /**< 光栅遍数（PRESENT 1 次 + arena 满 / FBO / 改纹理引起的刷新） */
 } espgpu_stats_t;
 
 /** EVENT 类型 */

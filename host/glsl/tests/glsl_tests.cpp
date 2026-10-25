@@ -21,6 +21,7 @@
 #include "espgpu_glsl.h"
 #include "espgpu_proto.h"
 #include "internal.h"
+#include "espgpu_vm_math.h"
 
 #if defined(GLSL_TESTS_FIRMWARE_VM)
 /* 与设备同一份 VM 解释器（firmware/core/vm.c）做差分 */
@@ -653,16 +654,24 @@ static bool run_dual(const Shader &s, const Env &e, float out[4], float fw_regs[
         fw_ok = false;
         return kept;
     }
+    prog.ntemps = gp_vm_temps_used(prog.code, prog.count);
     gp_sampler_t smp[ESPGPU_MAX_TEXTURE_UNITS];
     std::memset(smp, 0, sizeof(smp));
     float fo[4];
     const bool fkept = gp_vm_run(&prog, &c[0][0], smp, &v[0][0], fw_regs, fo);
-    if (fkept != kept) fw_ok = false;
-    for (int k = 0; k < 4 && kept && fkept; k++) {
-        if (!(std::fabs(fo[k] - out[k]) <= 1e-5f * (1.0f + std::fabs(out[k])))) fw_ok = false;
+    /* 同一份程序拷到没校验过的地址：解码缓存查不到，走逐条解释的后备路径 */
+    static gp_prog_t wire;
+    std::memcpy(&wire, &prog, sizeof(prog));
+    float wo[4];
+    const bool wkept = gp_vm_run(&wire, &c[0][0], smp, &v[0][0], fw_regs, wo);
+    /* 参考 VM、固件预解码、固件后备三者共用 espgpu_vm_math.h：逐位相同（NaN 视为相等） */
+    auto same = [](float x, float y) { return (x != x && y != y) || std::memcmp(&x, &y, sizeof(float)) == 0; };
+    if (fkept != kept || wkept != kept) fw_ok = false;
+    for (int k = 0; k < 4 && kept && fkept && wkept; k++) {
+        if (!same(fo[k], out[k]) || !same(wo[k], out[k])) fw_ok = false;
     }
-    if (!fw_ok) std::printf("  firmware %d (%g %g %g %g) vs ref %d (%g %g %g %g)\n", fkept, fo[0], fo[1], fo[2], fo[3], kept,
-                            out[0], out[1], out[2], out[3]);
+    if (!fw_ok) std::printf("  firmware %d (%.9g %.9g %.9g %.9g) wire %d (%.9g %.9g %.9g %.9g) vs ref %d (%.9g %.9g %.9g %.9g)\n", fkept,
+                            fo[0], fo[1], fo[2], fo[3], wkept, wo[0], wo[1], wo[2], wo[3], kept, out[0], out[1], out[2], out[3]);
 #else
     (void)fw_regs;
 #endif
@@ -1305,6 +1314,278 @@ static void test_random_expressions()
     std::printf("  random expressions: %d programs checked, %d rejected for size\n", compiled, skipped);
 }
 
+/* ── VM 数学函数（shared/espgpu_vm_math.h）对 libm 双精度的精度与边界语义 ─────── */
+
+static void test_vm_math()
+{
+    auto bits = [](float x) { return espgpu_vm_f2u(x); };
+    auto is_nan = [](float x) { return x != x; };
+    /* sin / cos：绝对误差，含大参数（快速路径上限附近、冷路径 Payne–Hanek、接近 FLT_MAX） */
+    double e_small = 0, e_mid = 0, e_big = 0;
+    bool in_range = true;
+    const int N = 400000;
+    for (int i = 0; i <= N; i++) {
+        const double f = static_cast<double>(i) / N;
+        const float xs[3] = {static_cast<float>(-40.0 + 80.0 * f), static_cast<float>(-1e4 + 2e4 * f),
+                             static_cast<float>(-2.1e5 + 4.2e5 * f)};
+        for (int b = 0; b < 3; b++) {
+            const float x = xs[b];
+            const float sv = espgpu_vm_sin(x), cv = espgpu_vm_cos(x);
+            const double e = std::max(std::fabs(sv - std::sin(static_cast<double>(x))), std::fabs(cv - std::cos(static_cast<double>(x))));
+            double &m = b == 0 ? e_small : b == 1 ? e_mid : e_big;
+            m = std::max(m, e);
+            in_range = in_range && std::fabs(sv) <= 1.0000002f && std::fabs(cv) <= 1.0000002f; /* FMA 求值可能超 1 ulp */
+        }
+    }
+    for (uint32_t u = 0x48000000u; u < 0x7F800000u; u += 0x1357u) { /* |x| ≥ 131072，直到 FLT_MAX */
+        for (int sg = 0; sg < 2; sg++) {
+            const float x = espgpu_vm_u2f(u | (static_cast<uint32_t>(sg) << 31));
+            const double e = std::max(std::fabs(espgpu_vm_sin(x) - std::sin(static_cast<double>(x))),
+                                      std::fabs(espgpu_vm_cos(x) - std::cos(static_cast<double>(x))));
+            e_big = std::max(e_big, e);
+        }
+    }
+    std::printf("  vm sin/cos max abs err: |x|<=40 %.2g  1e4 %.2g  >=2e5 %.2g\n", e_small, e_mid, e_big);
+    CHECK(e_small < 3e-7 && e_mid < 3e-7 && e_big < 1.5e-6);
+    CHECK(in_range);
+    /* 周期性：x 与 x + 2πk 在快速范围内结果几乎相同（误差只来自输入本身的舍入） */
+    {
+        double worst = 0;
+        for (int k = 1; k < 30000; k += 7) {
+            const double x = 0.37 + 2.0 * 3.14159265358979323846 * k;
+            const float xf = static_cast<float>(x);
+            worst = std::max(worst, std::fabs(espgpu_vm_sin(xf) - std::sin(static_cast<double>(xf))));
+        }
+        CHECK(worst < 2e-6);
+    }
+    /* exp2：相对误差（结果为正规数） */
+    double e_exp = 0;
+    for (int i = -1260000; i < 1280000; i += 3) {
+        const float x = static_cast<float>(i) * 1e-4f;
+        const double r = std::exp2(static_cast<double>(x));
+        if (r >= 1.17549435e-38 && r < 3.4e38) e_exp = std::max(e_exp, std::fabs(espgpu_vm_exp2(x) - r) / r);
+    }
+    /* log2：逐个 float 跨步扫描整个正规数范围 */
+    double e_log = 0, e_log1 = 0;
+    for (uint32_t u = 0x00800000u; u < 0x7F800000u; u += 211u) {
+        const float x = espgpu_vm_u2f(u);
+        const double r = std::log2(static_cast<double>(x));
+        const double e = std::fabs(espgpu_vm_log2(x) - r);
+        e_log = std::max(e_log, e / std::max(1.0, std::fabs(r)));
+        if (r != 0 && std::fabs(r) < 1) e_log1 = std::max(e_log1, e / std::fabs(r));
+    }
+    /* pow：相对误差 / (1 + |b·log2 a|) */
+    double e_pow = 0;
+    for (int i = 1; i <= 2000; i++) {
+        for (int j = -400; j <= 400; j += 3) {
+            const float a = static_cast<float>(i) * 0.002f, b = static_cast<float>(j) * 0.02f;
+            const double r = std::pow(static_cast<double>(a), static_cast<double>(b));
+            if (r > 1e-30 && r < 1e30) {
+                e_pow = std::max(e_pow, std::fabs(espgpu_vm_pow(a, b) - r) / r / (1 + std::fabs(b * std::log2(static_cast<double>(a)))));
+            }
+        }
+    }
+    std::printf("  vm exp2 rel %.2g  log2 %.2g (rel near 1: %.2g)  pow %.2g\n", e_exp, e_log, e_log1, e_pow);
+    CHECK(e_exp < 3e-7);
+    CHECK(e_log < 3e-7 && e_log1 < 5e-7);
+    CHECK(e_pow < 4e-7);
+    /* floor / fract 精确（含负数、半整数、2^23 附近） */
+    bool floor_ok = true;
+    for (uint32_t u = 0; u < 0xFF800000u; u += 0x3F1u) {
+        const float x = espgpu_vm_u2f(u);
+        if (is_nan(x)) continue;
+        floor_ok = floor_ok && espgpu_vm_floor(x) == std::floor(x);
+    }
+    CHECK(floor_ok);
+    CHECK(espgpu_vm_floor(-0.5f) == -1.0f && espgpu_vm_floor(-1.0f) == -1.0f && espgpu_vm_floor(8388607.5f) == 8388607.0f);
+    CHECK(espgpu_vm_fract(-0.25f) == 0.75f && espgpu_vm_fract(3.0f) == 0.0f && espgpu_vm_fract(1e30f) == 0.0f);
+    /* 整数输入的精确性：exp2(n)、log2(2^n)、pow(1, y)、pow(x, 0) */
+    bool exact = true;
+    for (int n = -126; n < 128; n++) {
+        exact = exact && espgpu_vm_exp2(static_cast<float>(n)) == std::ldexp(1.0f, n);
+        exact = exact && espgpu_vm_log2(std::ldexp(1.0f, n)) == static_cast<float>(n);
+    }
+    CHECK(exact);
+    /* 边界语义（与头文件注释一致） */
+    const float inf = std::numeric_limits<float>::infinity(), qnan = std::numeric_limits<float>::quiet_NaN();
+    CHECK(is_nan(espgpu_vm_sin(inf)) && is_nan(espgpu_vm_sin(-inf)) && is_nan(espgpu_vm_cos(qnan)) && is_nan(espgpu_vm_cos(-inf)));
+    CHECK(espgpu_vm_sin(0.0f) == 0.0f && espgpu_vm_cos(0.0f) == 1.0f);
+    CHECK(is_nan(espgpu_vm_exp2(qnan)) && espgpu_vm_exp2(128.0f) == inf && espgpu_vm_exp2(inf) == inf);
+    CHECK(espgpu_vm_exp2(-126.5f) == 0.0f && espgpu_vm_exp2(-inf) == 0.0f && bits(espgpu_vm_exp2(-126.0f)) == 0x00800000u);
+    CHECK(espgpu_vm_log2(0.0f) == -126.0f && espgpu_vm_log2(-3.0f) == -126.0f && espgpu_vm_log2(1e-40f) == -126.0f);
+    CHECK(espgpu_vm_log2(qnan) == -126.0f && espgpu_vm_log2(-inf) == -126.0f && espgpu_vm_log2(inf) == inf && espgpu_vm_log2(1.0f) == 0.0f);
+    CHECK(espgpu_vm_pow(0.0f, 2.0f) == 0.0f && espgpu_vm_pow(0.0f, 0.0f) == 1.0f && espgpu_vm_pow(0.0f, -1.0f) == inf);
+    CHECK(espgpu_vm_pow(-2.0f, 3.0f) == 0.0f && espgpu_vm_pow(qnan, 2.0f) == 0.0f && is_nan(espgpu_vm_pow(0.0f, qnan)));
+    CHECK(espgpu_vm_pow(inf, 0.0f) == 1.0f && espgpu_vm_pow(1.0f, inf) == 1.0f && espgpu_vm_pow(1.0f, qnan) == 1.0f);
+    CHECK(espgpu_vm_pow(inf, 2.0f) == inf && espgpu_vm_pow(inf, -2.0f) == 0.0f && espgpu_vm_pow(2.0f, 10.0f) == 1024.0f);
+    CHECK(espgpu_vm_floor(inf) == inf && espgpu_vm_floor(-inf) == -inf && is_nan(espgpu_vm_floor(qnan)) && is_nan(espgpu_vm_fract(inf)));
+    CHECK(espgpu_vm_mod(5.0f, 0.0f) == 0.0f && espgpu_vm_mod(-1.0f, 3.0f) == 2.0f && espgpu_vm_div(1.0f, 0.0f) == 0.0f);
+    CHECK(espgpu_vm_rsq(0.0f) == 0.0f && espgpu_vm_rsq(-4.0f) == 0.5f && espgpu_vm_sqrt(-4.0f) == 2.0f && espgpu_vm_rcp(0.0f) == 0.0f);
+    CHECK(espgpu_vm_smooth(1.0f, 1.0f, 1.0f) == 1.0f && espgpu_vm_smooth(1.0f, 1.0f, 0.5f) == 0.0f);
+    CHECK(is_nan(espgpu_vm_sat(qnan)) && espgpu_vm_sat(-1.0f) == 0.0f && espgpu_vm_sat(2.0f) == 1.0f);
+}
+
+#if defined(GLSL_TESTS_FIRMWARE_VM)
+/* ── 随机 VM 字节码：参考 VM / 固件预解码 / 固件后备 / 固件整段 逐位一致 ─────────── */
+
+extern "C" void gp_vm_forget(const espgpu_vm_insn_t *code);
+extern "C" uint32_t gp_vm_run_span(const gp_prog_t *p, const float *consts, const gp_sampler_t *smp, const float *v0,
+                                   const float *dv, int n, float *regs, float (*out)[4]);
+
+static void test_vm_fuzz()
+{
+    std::mt19937 rng(4242);
+    auto rnd = [&](uint32_t n) { return static_cast<uint32_t>(rng() % n); };
+    static const float specials[] = {0.0f, -0.0f, 1.0f, -1.0f, 0.5f, 3.0f, 1e30f, -1e30f, 1e-30f, 2e5f, -3e6f, 128.0f, -126.0f,
+                                     std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                                     std::numeric_limits<float>::quiet_NaN()};
+    auto value = [&]() {
+        if (rnd(6) == 0) return specials[rnd(sizeof(specials) / sizeof(specials[0]))];
+        return std::uniform_real_distribution<float>(-4.0f, 4.0f)(rng);
+    };
+    auto same = [](float x, float y) { return (x != x && y != y) || std::memcmp(&x, &y, sizeof(float)) == 0; };
+    static gp_prog_t prog, wire; /* prog 经过校验（预解码），wire 没有（后备解释器） */
+    int progs = 0, pixels = 0, bad = 0, killed = 0, spans = 0;
+    for (int t = 0; t < 3000; t++) {
+        const bool prologue = (t & 1) == 0; /* 先把用到的 temp 全写一遍：参考 VM 的 NaN 初值不影响结果 */
+        std::vector<espgpu_vm_insn_t> code;
+        const int ntemp = 1 + static_cast<int>(rnd(6));
+        if (prologue) {
+            for (int r = 0; r < ntemp; r++) {
+                espgpu_vm_insn_t in{};
+                in.op = ESPGPU_VM_MOV;
+                in.dst = ESPGPU_VM_REG(ESPGPU_VM_BANK_TEMP, r);
+                in.mask = 0xF;
+                in.src[0] = in.src[1] = in.src[2] = ESPGPU_VM_REG(ESPGPU_VM_BANK_CONST, r);
+                in.swz[0] = in.swz[1] = in.swz[2] = ESPGPU_VM_SWZ_IDENTITY;
+                code.push_back(in);
+            }
+        }
+        const int n = 1 + static_cast<int>(rnd(30));
+        for (int i = 0; i < n; i++) {
+            espgpu_vm_insn_t in{};
+            do {
+                in.op = static_cast<uint8_t>(1 + rnd(ESPGPU_VM_END - 1));
+            } while (in.op == ESPGPU_VM_KIL && rnd(4) != 0);
+            in.dst = rnd(5) == 0 ? ESPGPU_VM_OUT : ESPGPU_VM_REG(ESPGPU_VM_BANK_TEMP, rnd(static_cast<uint32_t>(ntemp)));
+            in.mask = static_cast<uint8_t>(rnd(16));
+            in.flags = rnd(4) == 0 ? ESPGPU_VM_F_SAT : 0;
+            in.neg = static_cast<uint8_t>(rnd(3) == 0 ? rnd(8) : 0);
+            in.tex_unit = static_cast<uint8_t>(rnd(2));
+            for (int k = 0; k < 3; k++) {
+                switch (rnd(prologue ? 4 : 5)) {
+                case 0: case 4: in.src[k] = ESPGPU_VM_REG(ESPGPU_VM_BANK_TEMP, rnd(static_cast<uint32_t>(ntemp))); break;
+                case 1: in.src[k] = ESPGPU_VM_REG(ESPGPU_VM_BANK_VARYING, rnd(ESPGPU_VM_VARYINGS)); break;
+                case 2: in.src[k] = ESPGPU_VM_REG(ESPGPU_VM_BANK_CONST, rnd(ESPGPU_VM_CONSTS)); break;
+                default: in.src[k] = ESPGPU_VM_REG(ESPGPU_VM_BANK_SPECIAL, rnd(2)); break;
+                }
+                in.swz[k] = rnd(3) == 0 ? ESPGPU_VM_SWZ_IDENTITY : static_cast<uint8_t>(rnd(256));
+            }
+            code.push_back(in);
+        }
+        if (rnd(3) == 0) {
+            espgpu_vm_insn_t e{};
+            e.op = ESPGPU_VM_END;
+            code.insert(code.begin() + static_cast<long>(rnd(static_cast<uint32_t>(code.size()) + 1)), e);
+        }
+        std::memset(&prog, 0, sizeof(prog));
+        prog.count = static_cast<uint16_t>(code.size());
+        prog.valid = 1;
+        std::memcpy(prog.code, code.data(), code.size() * sizeof(espgpu_vm_insn_t));
+        CHECK(gp_vm_validate(prog.code, prog.count));
+        prog.ntemps = gp_vm_temps_used(prog.code, prog.count);
+        std::memcpy(&wire, &prog, sizeof(prog));
+        progs++;
+        gp_sampler_t smp[ESPGPU_MAX_TEXTURE_UNITS];
+        std::memset(smp, 0, sizeof(smp));
+        float regs[ESPGPU_VM_TEMPS * 4];
+        for (float &r : regs) r = std::numeric_limits<float>::quiet_NaN(); /* 设备必须自己清零 */
+        for (int px = 0; px < 8; px++) {
+            float c[ESPGPU_VM_CONSTS][4], v[ESPGPU_VM_VARYINGS][4];
+            for (auto &q : c) for (float &x : q) x = value();
+            for (auto &q : v) for (float &x : q) x = value();
+            float fo[4], wo[4], ro[4];
+            const bool fk = gp_vm_run(&prog, &c[0][0], smp, &v[0][0], regs, fo);
+            const bool wk = gp_vm_run(&wire, &c[0][0], smp, &v[0][0], regs, wo);
+            bool ok = fk == wk;
+            for (int k = 0; k < 4 && ok && fk; k++) ok = same(fo[k], wo[k]);
+            if (prologue) {
+                const bool rk = vm_run(prog.code, prog.count, v, c, tex_one, nullptr, ro);
+                ok = ok && rk == fk;
+                for (int k = 0; k < 4 && ok && fk; k++) ok = same(fo[k], ro[k]);
+            }
+            /* 整段：n 个像素，varying = v0 累加 dv；与逐像素 gp_vm_run 比较（预解码与后备两条路） */
+            if (px == 0) {
+                const int n = 1 + static_cast<int>(rnd(8));
+                float dvv[ESPGPU_VM_VARYINGS][4];
+                for (auto &q : dvv) for (float &x : q) x = rnd(3) == 0 ? 0.0f : value() * 0.125f;
+                float so[8][4], sw[8][4], po[4];
+                const uint32_t km = gp_vm_run_span(&prog, &c[0][0], smp, &v[0][0], &dvv[0][0], n, regs, so);
+                const uint32_t kw = gp_vm_run_span(&wire, &c[0][0], smp, &v[0][0], &dvv[0][0], n, regs, sw);
+                float vv[ESPGPU_VM_VARYINGS][4];
+                std::memcpy(vv, v, sizeof(vv));
+                bool sok = km == kw;
+                for (int i = 0; i < n && sok; i++) {
+                    const bool pk = gp_vm_run(&prog, &c[0][0], smp, &vv[0][0], regs, po);
+                    sok = pk == (((km >> i) & 1u) != 0);
+                    for (int k = 0; k < 4 && sok && pk; k++) sok = same(so[i][k], po[k]) && same(sw[i][k], po[k]);
+                    for (int a = 0; a < static_cast<int>(ESPGPU_VM_VARYINGS); a++)
+                        for (int k = 0; k < 4; k++) vv[a][k] += dvv[a][k];
+                }
+                if (!sok && bad++ < 3) std::printf("  vm span mismatch (prog %d, n %d, mask %x/%x)\n%s", t, n, km, kw,
+                                                   vm_disassemble(prog.code, prog.count).c_str());
+                spans++;
+            }
+            killed += !fk;
+            pixels++;
+            if (!ok && bad++ < 3) {
+                std::printf("  vm fuzz mismatch (prog %d): dec %d (%.9g %.9g %.9g %.9g) wire %d (%.9g %.9g %.9g %.9g)\n%s", t, fk, fo[0], fo[1],
+                            fo[2], fo[3], wk, wo[0], wo[1], wo[2], wo[3], vm_disassemble(prog.code, prog.count).c_str());
+            }
+        }
+    }
+    std::printf("  vm fuzz: %d programs, %d pixels (%d killed), %d spans, %d mismatches\n", progs, pixels, killed, spans, bad);
+    CHECK(bad == 0);
+}
+
+/** 解码缓存：表满时走后备路径、gp_vm_forget 后槽位可复用，结果始终与参考 VM 相同 */
+static void test_vm_cache()
+{
+    Shader s = fs("#version 300 es\nprecision highp float;\nin vec2 vUV;\nuniform float k;\nout vec4 o;\n"
+                  "void main(){ o = vec4(sin(vUV.x * k), cos(vUV.y), fract(vUV.x * 7.0), 1.0); }\n");
+    CHECK(s.ok && s.frag.program);
+    if (!s.ok || !s.frag.program) return;
+    static gp_prog_t progs[48];
+    float c[ESPGPU_VM_CONSTS][4] = {}, v[ESPGPU_VM_VARYINGS][4] = {};
+    const float un[1][4] = {{3.5f, 0, 0, 0}};
+    fragment_consts(s, un, c);
+    for (auto &q : v) for (float &x : q) x = 0.37f;
+    float want[4];
+    vm_run(s.frag.code.data(), s.frag.code.size(), v, c, tex_one, nullptr, want);
+    gp_sampler_t smp[ESPGPU_MAX_TEXTURE_UNITS];
+    std::memset(smp, 0, sizeof(smp));
+    float regs[ESPGPU_VM_TEMPS * 4];
+    bool ok = true;
+    for (int round = 0; round < 3; round++) {
+        for (auto &p : progs) {
+            std::memset(&p, 0, sizeof(p));
+            p.count = static_cast<uint16_t>(s.frag.code.size());
+            p.valid = 1;
+            std::memcpy(p.code, s.frag.code.data(), s.frag.code.size() * sizeof(espgpu_vm_insn_t));
+            ok = ok && gp_vm_validate(p.code, p.count); /* 48 > 表长：后面的走后备 */
+            p.ntemps = gp_vm_temps_used(p.code, p.count);
+        }
+        for (auto &p : progs) {
+            float o[4];
+            ok = ok && gp_vm_run(&p, &c[0][0], smp, &v[0][0], regs, o);
+            for (int k = 0; k < 4; k++) ok = ok && std::memcmp(&o[k], &want[k], sizeof(float)) == 0;
+        }
+        for (auto &p : progs) gp_vm_forget(p.code);
+    }
+    CHECK(ok);
+}
+#endif
+
 int main()
 {
     test_preprocess();
@@ -1315,6 +1596,11 @@ int main()
     test_regressions();
     test_differential();
     test_random_expressions();
+    test_vm_math();
+#if defined(GLSL_TESTS_FIRMWARE_VM)
+    test_vm_fuzz();
+    test_vm_cache();
+#endif
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

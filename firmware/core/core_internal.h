@@ -17,6 +17,24 @@
 extern "C" {
 #endif
 
+/** 强制内联：光栅内核按状态组合实例化，靠常量参数折叠掉分支 */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GP_INLINE static __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define GP_INLINE static inline __attribute__((always_inline))
+#else
+#define GP_INLINE static inline
+#endif
+
+/** 禁止内联：冷路径（越界折回、混合）不要被复制进每个光栅内核，IRAM 有限 */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GP_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define GP_NOINLINE __attribute__((noinline))
+#else
+#define GP_NOINLINE
+#endif
+
 /* ── 尺寸常量 ─────────────────────────────────────────────────────── */
 
 #define GP_TILE_SHIFT 6
@@ -135,6 +153,8 @@ enum {
     GP_TF_TEX1 = 1u << 3,
     GP_TF_FOG = 1u << 4,
     GP_TF_VM = 1u << 5,          /* 属性是 VM varying（归一化纹理坐标） */
+    GP_TF_UNIT = 1u << 6,        /* 颜色属性三个顶点都在 [0,1]（雾因子总在 [0,1]）：三角形内插值
+                                  * 不会越界，像素管线快速路径只在段端点夹取（见 raster3d.c） */
     GP_TF_2D = 1u << 7,          /* 仅用于 olayout：用 2D 管线状态快照 */
 };
 
@@ -198,6 +218,17 @@ typedef struct {
     float a[GP_MAX_ATT];
 } gp_wvtx_t;
 
+/**
+ * 后变换缓存项：裁剪坐标 + outcode + 已投影的窗口坐标（w > 0 时有效）+ 属性（只存一份，
+ * 窗口空间与裁剪空间的属性相同）。不需要裁剪的三角形直接拿缓存项建立，不再逐三角形拷贝 / 投影。
+ */
+typedef struct {
+    uint32_t index;
+    uint32_t oc;        /* 裁剪 outcode（tnl.c 的 N_PLANES 位） */
+    float clip[4];
+    gp_wvtx_t w;
+} gp_vce_t;
+
 /** 本次绘制的属性输出布局 */
 typedef struct {
     uint8_t n;
@@ -215,8 +246,13 @@ typedef struct {
     uint16_t *depth;
     float vm_regs[ESPGPU_VM_TEMPS * 4];
     uint32_t fragments;
-    uint32_t pad;
+    /* 本次 gp_raster_frame 的分段计数（gp_cycles 单位，worker 自己的核上做差） */
+    uint32_t cy_raster;  /* tile 内光栅（不含 tile 取 / 写回） */
+    uint32_t cy_io;      /* tile 颜色 / 深度取入与写回 */
+    uint32_t n_path[4];  /* 走 fill / fast / px / generic 的三角形×tile 数 */
 } gp_worker_t;
+
+enum { GP_PATH_FILL = 0, GP_PATH_FAST, GP_PATH_PX, GP_PATH_GENERIC };
 
 /* ── 核心 ─────────────────────────────────────────────────────────── */
 
@@ -280,10 +316,7 @@ struct gpu_core {
     bool pending;           /* 有未刷新的记录 */
 
     /* 后变换缓存 */
-    struct {
-        uint32_t index;
-        gp_cvtx_t v;
-    } *vcache;
+    gp_vce_t *vcache;
 
     /* 工作区 */
     gp_worker_t workers[GP_MAX_WORKERS];
@@ -302,6 +335,14 @@ struct gpu_core {
     uint32_t last_tris, last_culled, last_bin, last_tnl_us;
     uint32_t last_fill;
     uint32_t st_raster_us, last_raster_us, last_fill_frame;
+
+    /* 分段计时（gp_cycles 单位，按帧累加；PRESENT 时换算成 µs 存进 last_*） */
+    uint64_t cy_vtx, cy_clip, cy_setup, cy_bin, cy_raster, cy_io;
+    uint32_t st_path[4];
+    uint32_t last_vtx_us, last_clip_us, last_setup_us, last_bin_us, last_tile_us, last_io_us;
+    uint32_t last_path[4];
+    uint32_t last_flushes;
+    uint32_t st_flushes;
 };
 
 /* ── 跨文件接口 ───────────────────────────────────────────────────── */
@@ -315,6 +356,8 @@ static inline void *gp_arena_ptr(gpu_core_t *c, uint32_t off)
 void gp_flush(gpu_core_t *c);
 uint32_t gp_snapshot_state(gpu_core_t *c, bool for_2d);
 void gp_bin_record(gpu_core_t *c, uint32_t rec_off, int x0, int y0, int x1, int y1);
+/** 把记录追加到一个 tile 的链表（不置 pending，调用者负责） */
+void gp_bin_tile(gpu_core_t *c, int tile, uint32_t rec_off);
 void gp_bin_clear(gpu_core_t *c, uint8_t flags, uint16_t color, uint16_t depth);
 bool gp_target_need_depth(gpu_core_t *c, gp_target_t *t);
 void gp_send_event(gpu_core_t *c, uint8_t kind, uint16_t value, uint32_t arg);
@@ -325,9 +368,12 @@ const uint8_t *gp_buffer_data(gpu_core_t *c, uint32_t id, uint32_t *len);
 /* tnl.c */
 void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data,
                uint32_t inline_len);
-/** 窗口空间三角形 → 剔除 / 建立 / 分箱。返回 false 表示 arena 满（调用者应刷新后重试）。 */
+/**
+ * 窗口空间三角形 → 剔除 / 建立 / 分箱。返回 false 表示 arena 满（调用者应刷新后重试）。
+ * flat_col：平面着色时激发顶点的颜色（ol->off_color 处的 4 个分量），NULL = 正常插值。
+ */
 bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const gp_wvtx_t *v2,
-                  const gp_olayout_t *ol, uint32_t state_off, bool cull_enabled);
+                  const gp_olayout_t *ol, const float *flat_col, bool cull_enabled);
 
 /* raster2d.c */
 void gp_draw2d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *verts, uint32_t len);
@@ -360,6 +406,14 @@ uint32_t gp_sample(const gp_sampler_t *s, float u, float v);
 bool gp_vm_run(const gp_prog_t *p, const float *consts, const gp_sampler_t *smp, const float *v,
                float *regs, float out[4]);
 bool gp_vm_validate(const espgpu_vm_insn_t *code, uint32_t n);
+/** 程序内存要释放了：丢掉 vm.c 缓存的解码结果（按 code 指针索引）。释放 gp_prog_t 前调用 */
+void gp_vm_forget(const espgpu_vm_insn_t *code);
+/**
+ * 一段 n（1..8）个片元：第 i 个的 varying = v0 累加 i 次 dv（布局同 gp_vm_run 的 v）。
+ * out[i] 为第 i 个的颜色；返回未被 KIL 的片元位掩码（bit i）。结果与逐个调 gp_vm_run 逐位相同。
+ */
+uint32_t gp_vm_run_span(const gp_prog_t *p, const float *consts, const gp_sampler_t *smp,
+                        const float *v0, const float *dv, int n, float *regs, float (*out)[4]);
 /** 程序引用到的最大临时寄存器编号 + 1（validate 通过后调用） */
 uint8_t gp_vm_temps_used(const espgpu_vm_insn_t *code, uint32_t n);
 

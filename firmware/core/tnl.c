@@ -8,6 +8,7 @@
  * 浮点：S3 有单精度 FPU，每帧几千个顶点，全用 float 最省事也最准。
  */
 
+#include <float.h>
 #include <math.h>
 
 #include "core_internal.h"
@@ -22,11 +23,29 @@ static inline float rd_f32(const uint8_t *p)
     return v;
 }
 
-static void fetch_attr(const uint8_t *base, const espgpu_vertex_attrib_t *a, float out[4])
+/**
+ * 归一化 / 定点缩放一律乘倒数（S3 的 FPU 没有除法指令，除法是十几条指令的迭代序列），
+ * 与除法最多差 1 ulp。scale 每次绘制按属性预先算好（fetch_t）。
+ */
+typedef struct {
+    const espgpu_vertex_attrib_t *a;
+    float scale;    /* 非归一化整数的定点缩放 2^-frac_bits */
+    uint8_t n;      /* 分量数 1..4 */
+} fetch_t;
+
+static void fetch_init(fetch_t *f, const espgpu_vertex_attrib_t *a)
 {
+    f->a = a;
+    f->n = (uint8_t)(a->components < 1 ? 1 : (a->components > 4 ? 4 : a->components));
+    f->scale = a->frac_bits ? 1.0f / (float)(1u << (a->frac_bits & 31)) : 1.0f;
+}
+
+static void fetch_attr(const uint8_t *base, const fetch_t *f, float out[4])
+{
+    const espgpu_vertex_attrib_t *a = f->a;
     const uint8_t *p = base + a->offset;
-    const int n = a->components < 1 ? 1 : (a->components > 4 ? 4 : a->components);
-    const float scale = a->frac_bits ? 1.0f / (float)(1u << (a->frac_bits & 31)) : 1.0f;
+    const int n = f->n;
+    const float scale = f->scale;
 
     switch (a->type) {
     case ESPGPU_TYPE_F32:
@@ -35,65 +54,66 @@ static void fetch_attr(const uint8_t *base, const espgpu_vertex_attrib_t *a, flo
     case ESPGPU_TYPE_I8:
         for (int i = 0; i < n; i++) {
             const int8_t v = (int8_t)p[i];
-            out[i] = a->normalized ? (v < -127 ? -1.0f : (float)v / 127.0f) : (float)v * scale;
+            out[i] = a->normalized ? (v < -127 ? -1.0f : (float)v * (1.0f / 127.0f)) : (float)v * scale;
         }
         break;
     case ESPGPU_TYPE_U8:
         for (int i = 0; i < n; i++) {
-            out[i] = a->normalized ? (float)p[i] / 255.0f : (float)p[i] * scale;
+            out[i] = a->normalized ? (float)p[i] * (1.0f / 255.0f) : (float)p[i] * scale;
         }
         break;
     case ESPGPU_TYPE_I16:
         for (int i = 0; i < n; i++) {
             int16_t v;
             memcpy(&v, p + i * 2, 2);
-            out[i] = a->normalized ? (v < -32767 ? -1.0f : (float)v / 32767.0f) : (float)v * scale;
+            out[i] = a->normalized ? (v < -32767 ? -1.0f : (float)v * (1.0f / 32767.0f))
+                                   : (float)v * scale;
         }
         break;
     case ESPGPU_TYPE_U16:
         for (int i = 0; i < n; i++) {
             uint16_t v;
             memcpy(&v, p + i * 2, 2);
-            out[i] = a->normalized ? (float)v / 65535.0f : (float)v * scale;
+            out[i] = a->normalized ? (float)v * (1.0f / 65535.0f) : (float)v * scale;
         }
         break;
     case ESPGPU_TYPE_I32:
         for (int i = 0; i < n; i++) {
             int32_t v;
             memcpy(&v, p + i * 4, 4);
-            out[i] = a->normalized ? (float)v / 2147483647.0f : (float)v * scale;
+            out[i] = a->normalized ? (float)v * (1.0f / 2147483647.0f) : (float)v * scale;
         }
         break;
     case ESPGPU_TYPE_U32:
         for (int i = 0; i < n; i++) {
             uint32_t v;
             memcpy(&v, p + i * 4, 4);
-            out[i] = a->normalized ? (float)v / 4294967295.0f : (float)v * scale;
+            out[i] = a->normalized ? (float)v * (1.0f / 4294967295.0f) : (float)v * scale;
         }
         break;
     case ESPGPU_TYPE_FIXED16_16:
         for (int i = 0; i < n; i++) {
             int32_t v;
             memcpy(&v, p + i * 4, 4);
-            out[i] = (float)v / 65536.0f;
+            out[i] = (float)v * (1.0f / 65536.0f);
         }
         break;
     case ESPGPU_TYPE_RGB565: {
         uint16_t v;
         memcpy(&v, p, 2);
-        out[0] = (float)((v >> 11) & 0x1F) / 31.0f;
-        out[1] = (float)((v >> 5) & 0x3F) / 63.0f;
-        out[2] = (float)(v & 0x1F) / 31.0f;
+        out[0] = (float)((v >> 11) & 0x1F) * (1.0f / 31.0f);
+        out[1] = (float)((v >> 5) & 0x3F) * (1.0f / 63.0f);
+        out[2] = (float)(v & 0x1F) * (1.0f / 31.0f);
         out[3] = 1.0f;
         break;
     }
     case ESPGPU_TYPE_RGBA4444: {
         uint16_t v;
         memcpy(&v, p, 2);
-        out[0] = (float)((v >> 12) & 0xF) / 15.0f;
-        out[1] = (float)((v >> 8) & 0xF) / 15.0f;
-        out[2] = (float)((v >> 4) & 0xF) / 15.0f;
-        out[3] = (float)(v & 0xF) / 15.0f;
+        out[0] = (float)((v >> 12) & 0xF) * (1.0f / 15.0f);
+        out[1] = (float)((v >> 8) & 0xF) * (1.0f / 15.0f);
+        out[2] = (float)((v >> 4) & 0xF) * (1.0f / 15.0f);
+        out[3] = (float)(v & 0xF) * (1.0f / 15.0f);
         break;
     }
     default:
@@ -136,6 +156,7 @@ typedef struct {
     uint32_t vavail;    /* 可用顶点数 */
     uint32_t stride;
     const espgpu_vertex_attrib_t *attr[8]; /* 按语义槽，0..6 */
+    fetch_t fetch[8];   /* attr[] 非空的槽的解码参数 */
     gp_olayout_t ol;
     bool lighting;
     bool fog;
@@ -144,6 +165,11 @@ typedef struct {
     bool flat;
     bool cull;
     float gx, gy;       /* 保护带系数 */
+    /* 每次绘制预先算好的常量（顶点循环里不再除法） */
+    float ccol[4];      /* 常量顶点色 /255 */
+    float vsx, vox, vsy, voy; /* 窗口 x = vox + ndc_x * vsx，y 同理（y 向下） */
+    float zs, zo;       /* 窗口 z（0..65535 尺度，含偏移）= zo + ndc_z * zs */
+    float fog_inv_span; /* 线性雾 1/(end - start) */
 } draw_ctx_t;
 
 static bool shade_uses(uint8_t shade, int what) /* what: 0 = 颜色, 1 = T0, 2 = T1 */
@@ -220,8 +246,9 @@ static void build_olayout(draw_ctx_t *dc)
     }
 }
 
-static float fog_factor(const gpu_core_t *c, float dist)
+static float fog_factor(const draw_ctx_t *dc, float dist)
 {
+    const gpu_core_t *c = dc->c;
     float f;
     switch (c->ps.fog_mode) {
     case ESPGPU_FOG_EXP:
@@ -233,47 +260,101 @@ static float fog_factor(const gpu_core_t *c, float dist)
         break;
     }
     default: {
-        const float span = c->fog.fog_end - c->fog.fog_start;
-        f = span != 0.0f ? (c->fog.fog_end - dist) / span : 1.0f;
+        f = dc->fog_inv_span != 0.0f ? (c->fog.fog_end - dist) * dc->fog_inv_span : 1.0f;
         break;
     }
     }
     return gp_clampf(f, 0.0f, 1.0f);
 }
 
-/** 处理一个顶点到裁剪空间 */
-static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_cvtx_t *o)
+/* ── 裁剪平面 ─────────────────────────────────────────────────────── */
+
+#define N_PLANES 7
+
+static inline float plane_dist(const draw_ctx_t *dc, int p, const float *v)
+{
+    switch (p) {
+    case 0: return v[2] + v[3];              /* 近 */
+    case 1: return v[3] - v[2];              /* 远 */
+    case 2: return dc->gx * v[3] + v[0];     /* 左 */
+    case 3: return dc->gx * v[3] - v[0];     /* 右 */
+    case 4: return dc->gy * v[3] + v[1];     /* 下 */
+    case 5: return dc->gy * v[3] - v[1];     /* 上 */
+    default: return v[3] - 1e-5f;            /* w > 0 */
+    }
+}
+
+static inline uint32_t outcode(const draw_ctx_t *dc, const float *v)
+{
+    /* 展开写：与 plane_dist 的 7 个平面逐一对应 */
+    const float gw = dc->gx * v[3], hw = dc->gy * v[3];
+    uint32_t m = 0;
+    m |= (v[2] + v[3] < 0.0f) ? 1u : 0u;
+    m |= (v[3] - v[2] < 0.0f) ? 2u : 0u;
+    m |= (gw + v[0] < 0.0f) ? 4u : 0u;
+    m |= (gw - v[0] < 0.0f) ? 8u : 0u;
+    m |= (hw + v[1] < 0.0f) ? 16u : 0u;
+    m |= (hw - v[1] < 0.0f) ? 32u : 0u;
+    m |= (v[3] - 1e-5f < 0.0f) ? 64u : 0u;
+    /* NaN：比较全为假会被当成在内侧，投影后的坐标再由 gp_setup_tri 的有限性检查丢掉 */
+    return m;
+}
+
+/* ── 投影 ─────────────────────────────────────────────────────────── */
+
+/** clip → 窗口坐标（x, y, z, iw），属性不动 */
+static inline void project_xyz(const draw_ctx_t *dc, const float *clip, gp_wvtx_t *w)
+{
+    const float iw = 1.0f / clip[3];
+    w->x = dc->vox + clip[0] * iw * dc->vsx;
+    w->y = dc->voy + clip[1] * iw * dc->vsy;
+    const float z = dc->zo + clip[2] * iw * dc->zs;
+    w->z = gp_clampf(z, 0.0f, 65535.0f);
+    w->iw = iw;
+}
+
+/* ── 顶点 ─────────────────────────────────────────────────────────── */
+
+/** 处理一个顶点：裁剪坐标、outcode、属性，w > 0 时顺带投影 */
+static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_vce_t *o)
 {
     gpu_core_t *c = dc->c;
     const uint8_t *base = dc->vdata + (size_t)index * dc->stride;
 
     float pos[4] = {0, 0, 0, 1};
-    float col[4] = {1, 1, 1, 1};
+    float col[4];
     float tc[4][4] = {{0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}};
     float nrm[4] = {0, 0, 1, 0};
 
-    if (dc->attr[ESPGPU_ATTR_POSITION]) {
-        fetch_attr(base, dc->attr[ESPGPU_ATTR_POSITION], pos);
-    }
+    fetch_attr(base, &dc->fetch[ESPGPU_ATTR_POSITION], pos);
     if (dc->attr[ESPGPU_ATTR_COLOR]) {
         /* GL：属性里没给的分量补 (0,0,0,1)，不是 (1,1,1,1) */
         col[0] = col[1] = col[2] = 0.0f;
-        fetch_attr(base, dc->attr[ESPGPU_ATTR_COLOR], col);
+        col[3] = 1.0f;
+        fetch_attr(base, &dc->fetch[ESPGPU_ATTR_COLOR], col);
     } else {
-        for (int i = 0; i < 4; i++) col[i] = (float)c->const_color[i] / 255.0f;
+        memcpy(col, dc->ccol, sizeof(col));
     }
-    for (int u = 0; u < 4; u++) {
+    /* 非 VM 只用得到 T0 / T1 */
+    const int ntc = dc->vm ? 4 : 2;
+    for (int u = 0; u < ntc; u++) {
         if (dc->attr[ESPGPU_ATTR_TEXCOORD0 + u]) {
-            fetch_attr(base, dc->attr[ESPGPU_ATTR_TEXCOORD0 + u], tc[u]);
+            fetch_attr(base, &dc->fetch[ESPGPU_ATTR_TEXCOORD0 + u], tc[u]);
         }
     }
-    if (dc->attr[ESPGPU_ATTR_NORMAL]) {
+    if (dc->attr[ESPGPU_ATTR_NORMAL] && (dc->lighting || dc->vm)) {
         nrm[0] = nrm[1] = nrm[2] = 0.0f;
         nrm[3] = 1.0f;
-        fetch_attr(base, dc->attr[ESPGPU_ATTR_NORMAL], nrm);
+        fetch_attr(base, &dc->fetch[ESPGPU_ATTR_NORMAL], nrm);
     }
 
-    mat_vec4(c->mat[ESPGPU_MATRIX_MVP], pos, o->clip);
+    {
+        const float *m = c->mat[ESPGPU_MATRIX_MVP];
+        o->clip[0] = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3] * pos[3];
+        o->clip[1] = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7] * pos[3];
+        o->clip[2] = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11] * pos[3];
+        o->clip[3] = m[12] * pos[0] + m[13] * pos[1] + m[14] * pos[2] + m[15] * pos[3];
+    }
 
     if (dc->lighting) {
         const float *nm = c->mat[ESPGPU_MATRIX_NORMAL];
@@ -321,22 +402,23 @@ static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_cvtx_t *o)
     }
 
     const gp_olayout_t *ol = &dc->ol;
+    float *a = o->w.a;
     if (dc->vm) {
         const float *src[6] = {col, tc[0], tc[1], tc[2], tc[3], nrm};
         for (int k = 0; k < dc->varyings; k++) {
-            memcpy(&o->a[k * 4], src[k], 16);
+            memcpy(&a[k * 4], src[k], 16);
         }
     } else {
         if (ol->off_color >= 0) {
-            memcpy(&o->a[ol->off_color], col, 16);
+            memcpy(&a[ol->off_color], col, 16);
         }
         if (ol->off_t0 >= 0) {
-            o->a[ol->off_t0] = tc[0][0] * ol->t0_scale[0];
-            o->a[ol->off_t0 + 1] = tc[0][1] * ol->t0_scale[1];
+            a[ol->off_t0] = tc[0][0] * ol->t0_scale[0];
+            a[ol->off_t0 + 1] = tc[0][1] * ol->t0_scale[1];
         }
         if (ol->off_t1 >= 0) {
-            o->a[ol->off_t1] = tc[1][0] * ol->t1_scale[0];
-            o->a[ol->off_t1 + 1] = tc[1][1] * ol->t1_scale[1];
+            a[ol->off_t1] = tc[1][0] * ol->t1_scale[0];
+            a[ol->off_t1 + 1] = tc[1][1] * ol->t1_scale[1];
         }
     }
     if (ol->off_fog >= 0) {
@@ -347,48 +429,36 @@ static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_cvtx_t *o)
         } else {
             dist = o->clip[3];
         }
-        o->a[ol->off_fog] = fog_factor(c, fabsf(dist));
+        a[ol->off_fog] = fog_factor(dc, fabsf(dist));
+    }
+
+    o->oc = outcode(dc, o->clip);
+    if (!(o->oc & (1u << 6))) {
+        project_xyz(dc, o->clip, &o->w);
     }
 }
 
-static const gp_cvtx_t *get_vertex(draw_ctx_t *dc, uint32_t index)
+static const gp_vce_t *get_vertex(draw_ctx_t *dc, uint32_t index)
 {
     gpu_core_t *c = dc->c;
-    const uint32_t slot = index & (GP_VCACHE - 1);
-    if (c->vcache[slot].index != index) {
-        process_vertex(dc, index, &c->vcache[slot].v);
-        c->vcache[slot].index = index;
+    gp_vce_t *e = &c->vcache[index & (GP_VCACHE - 1)];
+    if (e->index != index) {
+        const uint32_t t0 = gp_cycles();
+        process_vertex(dc, index, e);
+        e->index = index;
         c->st_verts++;
+        c->cy_vtx += gp_cycles() - t0;
     }
-    return &c->vcache[slot].v;
+    return e;
 }
 
 /* ── 裁剪 ─────────────────────────────────────────────────────────── */
 
-#define N_PLANES 7
-
-static inline float plane_dist(const draw_ctx_t *dc, int p, const float *v)
+/** 只拷贝本次绘制用到的分量（gp_cvtx_t 约 128 字节，属性通常只有几个） */
+static inline void cvtx_from(const draw_ctx_t *dc, gp_cvtx_t *o, const float *clip, const float *a)
 {
-    switch (p) {
-    case 0: return v[2] + v[3];              /* 近 */
-    case 1: return v[3] - v[2];              /* 远 */
-    case 2: return dc->gx * v[3] + v[0];     /* 左 */
-    case 3: return dc->gx * v[3] - v[0];     /* 右 */
-    case 4: return dc->gy * v[3] + v[1];     /* 下 */
-    case 5: return dc->gy * v[3] - v[1];     /* 上 */
-    default: return v[3] - 1e-5f;            /* w > 0 */
-    }
-}
-
-static inline uint32_t outcode(const draw_ctx_t *dc, const float *v)
-{
-    uint32_t m = 0;
-    for (int p = 0; p < N_PLANES; p++) {
-        if (plane_dist(dc, p, v) < 0.0f) {
-            m |= 1u << p;
-        }
-    }
-    return m;
+    memcpy(o->clip, clip, sizeof(o->clip));
+    memcpy(o->a, a, sizeof(float) * dc->ol.n);
 }
 
 static void lerp_vtx(const draw_ctx_t *dc, const gp_cvtx_t *a, const gp_cvtx_t *b, float t,
@@ -419,7 +489,7 @@ static int clip_poly(const draw_ctx_t *dc, uint32_t mask, gp_cvtx_t *buf_a, gp_c
             const float da = plane_dist(dc, p, A->clip);
             const float db = plane_dist(dc, p, B->clip);
             if (da >= 0.0f) {
-                res[m++] = *A;
+                cvtx_from(dc, &res[m++], A->clip, A->a);
             }
             if ((da >= 0.0f) != (db >= 0.0f)) {
                 const float t = da / (da - db);
@@ -435,45 +505,107 @@ static int clip_poly(const draw_ctx_t *dc, uint32_t mask, gp_cvtx_t *buf_a, gp_c
     return n;
 }
 
-/* ── 投影 ─────────────────────────────────────────────────────────── */
-
 static void project(const draw_ctx_t *dc, const gp_cvtx_t *v, gp_wvtx_t *w)
 {
-    const gpu_core_t *c = dc->c;
-    const float iw = 1.0f / v->clip[3];
-    const float nx = v->clip[0] * iw;
-    const float ny = v->clip[1] * iw;
-    const float nz = v->clip[2] * iw;
-    w->x = (float)c->vp_x + (nx + 1.0f) * 0.5f * (float)c->vp_w;
-    w->y = (float)c->vp_y + (1.0f - ny) * 0.5f * (float)c->vp_h;
-    float z = c->depth_n + (nz + 1.0f) * 0.5f * (c->depth_f - c->depth_n);
-    z = z * 65535.0f - (float)c->ext.depth_bias;
-    w->z = gp_clampf(z, 0.0f, 65535.0f);
-    w->iw = iw;
+    project_xyz(dc, v->clip, w);
     memcpy(w->a, v->a, sizeof(float) * dc->ol.n);
 }
 
 /* ── 三角形建立 ───────────────────────────────────────────────────── */
 
-static inline int32_t floor_div16(int32_t v)
+/**
+ * v*16 就近取整（就近偶数，与 lrintf 逐位相同）。|v*16| < 2^22 时加减 1.5*2^23：
+ * 两次 FPU 加法 + 截断，不走 lrintf 库函数（Xtensa 上没有对应指令，是软件实现）。
+ * 要求 float 运算按 IEEE 单精度舍入（FLT_EVAL_METHOD 0：x64 / Xtensa / ARM 都是）。
+ */
+static inline int32_t snap16(float v)
 {
-    return v >= 0 ? v / 16 : -((-v + 15) / 16);
+    const float f = v * 16.0f;
+#if !defined(FLT_EVAL_METHOD) || FLT_EVAL_METHOD == 0
+    if (fabsf(f) < 4194304.0f) {
+        const float m = 12582912.0f;
+        const float r = (f + m) - m;
+        return (int32_t)r;
+    }
+#endif
+    return (int32_t)lrintf(f);
 }
 
-static void make_plane(gp_plane_t *p, float x0, float y0, float x1, float y1, float x2, float y2,
-                       float inv_det, float v0, float v1, float v2)
+/** 平面系数的公共部分：dx = d1*A - d2*B，dy = d2*C - d1*D，c = v0 + dx*ox + dy*oy */
+typedef struct {
+    float A, B, C, D, ox, oy;
+} plane_k_t;
+
+static inline void make_plane(gp_plane_t *p, const plane_k_t *k, float v0, float v1, float v2)
 {
+    if (v0 == v1 && v0 == v2) {
+        /* 常量属性（雾全 0 / 全 1、平面着色色、单色模型）：省掉乘法，结果严格是常量 */
+        p->dx = p->dy = 0.0f;
+        p->c = v0;
+        return;
+    }
     const float d1 = v1 - v0;
     const float d2 = v2 - v0;
-    p->dx = (d1 * (y2 - y0) - d2 * (y1 - y0)) * inv_det;
-    p->dy = (d2 * (x1 - x0) - d1 * (x2 - x0)) * inv_det;
-    p->c = v0 + p->dx * (0.5f - x0) + p->dy * (0.5f - y0);
+    p->dx = d1 * k->A - d2 * k->B;
+    p->dy = d2 * k->C - d1 * k->D;
+    p->c = v0 + p->dx * k->ox + p->dy * k->oy;
+}
+
+/** 透视：对 a*iw 建平面；a 三顶点相同时直接是 a × (1/w 平面) */
+static inline void make_plane_p(gp_plane_t *p, const plane_k_t *k, const gp_plane_t *iwp, float a0,
+                                float a1, float a2, float w0, float w1, float w2)
+{
+    if (a0 == a1 && a0 == a2) {
+        p->c = a0 * iwp->c;
+        p->dx = a0 * iwp->dx;
+        p->dy = a0 * iwp->dy;
+        return;
+    }
+    make_plane(p, k, a0 * w0, a1 * w1, a2 * w2);
+}
+
+static inline bool unit01(float v)
+{
+    return v >= 0.0f && v <= 1.0f; /* NaN → false */
+}
+
+/**
+ * 分箱：包围盒在两个方向都跨 tile 时，角上的 tile 可能完全在某条边外侧（细长斜三角形），
+ * 先用边函数在 tile 矩形上的最大值剔掉，省 arena 和光栅时的一次记录读取。
+ */
+static void bin_tri(gpu_core_t *c, const gp_tri_t *t, uint32_t off)
+{
+    const int tx0 = t->bx0 >> GP_TILE_SHIFT, ty0 = t->by0 >> GP_TILE_SHIFT;
+    const int tx1 = t->bx1 >> GP_TILE_SHIFT, ty1 = t->by1 >> GP_TILE_SHIFT;
+    if (tx0 == tx1 || ty0 == ty1) {
+        gp_bin_record(c, off, t->bx0, t->by0, t->bx1, t->by1);
+        return;
+    }
+    for (int ty = ty0; ty <= ty1; ty++) {
+        const int y0 = ty == ty0 ? t->by0 : ty << GP_TILE_SHIFT;
+        const int y1 = ty == ty1 ? t->by1 : (ty << GP_TILE_SHIFT) + GP_TILE - 1;
+        for (int tx = tx0; tx <= tx1; tx++) {
+            const int x0 = tx == tx0 ? t->bx0 : tx << GP_TILE_SHIFT;
+            const int x1 = tx == tx1 ? t->bx1 : (tx << GP_TILE_SHIFT) + GP_TILE - 1;
+            bool out = false;
+            for (int k = 0; k < 3 && !out; k++) {
+                const int32_t a = t->ea[k], b = t->eb[k];
+                const int64_t emax = (int64_t)a * (a > 0 ? x1 : x0) + (int64_t)b * (b > 0 ? y1 : y0) +
+                                     t->ec[k];
+                out = emax < 0;
+            }
+            if (!out) {
+                gp_bin_tile(c, ty * c->tiles_x + tx, off);
+            }
+        }
+    }
+    c->pending = true;
 }
 
 bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const gp_wvtx_t *v2,
-                  const gp_olayout_t *ol, uint32_t state_off_unused, bool cull_enabled)
+                  const gp_olayout_t *ol, const float *flat_col, bool cull_enabled)
 {
-    (void)state_off_unused;
+    const uint32_t cy0 = gp_cycles();
     const bool is2d = (ol->flags & GP_TF_2D) != 0;
 
     const gp_wvtx_t *V[3] = {v0, v1, v2};
@@ -481,13 +613,16 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
     for (int i = 0; i < 3; i++) {
         /* NaN / 极端坐标（坏矩阵、坏视口）：直接丢弃。±2^20 像素内边函数系数放得进 int32 */
         if (!(fabsf(V[i]->x) < 1048576.0f) || !(fabsf(V[i]->y) < 1048576.0f)) {
+            c->cy_setup += gp_cycles() - cy0;
             return true;
         }
-        X[i] = (int32_t)lrintf(V[i]->x * 16.0f);
-        Y[i] = (int32_t)lrintf(V[i]->y * 16.0f);
+        X[i] = snap16(V[i]->x);
+        Y[i] = snap16(V[i]->y);
     }
+    /* |X|,|Y| < 2^24：差值放得进 int32，乘积用 32×32→64（Xtensa 上是 MULL + MULSH，不走 __muldi3） */
     int64_t area = (int64_t)(X[1] - X[0]) * (Y[2] - Y[0]) - (int64_t)(Y[1] - Y[0]) * (X[2] - X[0]);
     if (area == 0) {
+        c->cy_setup += gp_cycles() - cy0;
         return true;
     }
 
@@ -498,6 +633,7 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
         if (cm == ESPGPU_CULL_BOTH || (cm == ESPGPU_CULL_BACK && !front) ||
             (cm == ESPGPU_CULL_FRONT && front)) {
             c->st_culled++;
+            c->cy_setup += gp_cycles() - cy0;
             return true;
         }
     }
@@ -511,7 +647,7 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
         area = -area;
     }
 
-    /* 包围盒（像素中心 16p+8 落在 [min,max] 内） */
+    /* 包围盒（像素中心 16p+8 落在 [min,max] 内）；>> 4 即向下取整（算术移位） */
     int32_t minx = X[0], maxx = X[0], miny = Y[0], maxy = Y[0];
     for (int i = 1; i < 3; i++) {
         if (X[i] < minx) minx = X[i];
@@ -519,15 +655,16 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
         if (Y[i] < miny) miny = Y[i];
         if (Y[i] > maxy) maxy = Y[i];
     }
-    int bx0 = floor_div16(minx - 8 + 15);
-    int by0 = floor_div16(miny - 8 + 15);
-    int bx1 = floor_div16(maxx - 8);
-    int by1 = floor_div16(maxy - 8);
+    int bx0 = (minx - 8 + 15) >> 4;
+    int by0 = (miny - 8 + 15) >> 4;
+    int bx1 = (maxx - 8) >> 4;
+    int by1 = (maxy - 8) >> 4;
     if (bx0 < c->sc_x) bx0 = c->sc_x;
     if (by0 < c->sc_y) by0 = c->sc_y;
     if (bx1 > c->sc_x + c->sc_w - 1) bx1 = c->sc_x + c->sc_w - 1;
     if (by1 > c->sc_y + c->sc_h - 1) by1 = c->sc_y + c->sc_h - 1;
     if (bx0 > bx1 || by0 > by1) {
+        c->cy_setup += gp_cycles() - cy0;
         return true;
     }
 
@@ -536,22 +673,25 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
     const uint32_t n_tiles = (uint32_t)(((bx1 >> GP_TILE_SHIFT) - (bx0 >> GP_TILE_SHIFT) + 1) *
                                         ((by1 >> GP_TILE_SHIFT) - (by0 >> GP_TILE_SHIFT) + 1));
     if (!gp_reserve(c, rec_bytes, n_tiles)) {
+        c->cy_setup += gp_cycles() - cy0;
         return false;
     }
     const uint32_t state_off = gp_snapshot_state(c, is2d);
     if (state_off == 0) {
+        c->cy_setup += gp_cycles() - cy0;
         return false;
     }
 
     uint32_t off;
     gp_tri_t *t = (gp_tri_t *)gp_arena_alloc(c, rec_bytes, &off);
     if (t == NULL) {
+        c->cy_setup += gp_cycles() - cy0;
         return false;
     }
+    uint32_t flags = ol->flags & ~(uint32_t)GP_TF_2D;
     t->type = GP_REC_TRI;
     t->n_att = (uint8_t)n_att;
     t->pad = 0;
-    t->flags = (uint8_t)(ol->flags & ~GP_TF_2D);
     t->o_col = ol->off_color;
     t->o_t0 = ol->off_t0;
     t->o_t1 = ol->off_t1;
@@ -564,63 +704,113 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
     memcpy(t->const_rgba, c->const_color, 4);
 
     /* 边 k 对着顶点 k：e0 = v1→v2，e1 = v2→v0，e2 = v0→v1 */
+    float fa[3];
     for (int k = 0; k < 3; k++) {
         const int i = (k + 1) % 3;
         const int j = (k + 2) % 3;
-        const int64_t dx = (int64_t)X[j] - X[i];
-        const int64_t dy = (int64_t)Y[j] - Y[i];
-        const int64_t a = -16 * dy;
-        const int64_t b = 16 * dx;
-        int64_t cc = dx * (8 - (int64_t)Y[i]) - dy * (8 - (int64_t)X[i]);
+        const int32_t dx = X[j] - X[i];
+        const int32_t dy = Y[j] - Y[i];
+        const int32_t a = -16 * dy;
+        const int32_t b = 16 * dx;
+        int64_t cc = (int64_t)dx * (8 - Y[i]) - (int64_t)dy * (8 - X[i]);
         const bool top_left = (a > 0) || (a == 0 && b > 0);
         if (!top_left) {
             cc -= 1;
         }
-        t->ea[k] = (int32_t)a;
-        t->eb[k] = (int32_t)b;
+        t->ea[k] = a;
+        t->eb[k] = b;
         t->ec[k] = cc;
-        t->inv_ea[k] = a != 0 ? 1.0f / (float)a : 0.0f;
+        fa[k] = a != 0 ? (float)a : 1.0f;
+    }
+
+    /* 1/ea[k] 与 256/area 共用一次除法：r = 1/(a0·a1·a2·area)，各倒数 = r × 其余因子之积。
+     * inv_ea 只用作跨度估计（光栅时用精确整数边函数修正），inv_det 相对误差几个 ulp；
+     * 乘积可能溢出 / 下溢的病态三角形退回逐个除 */
+    const float farea = (float)area;
+    const float p01 = fa[0] * fa[1];
+    const float pa = p01 * fa[2];
+    const float pall = pa * farea;
+    float inv_det;
+    if (pall > -1e36f && pall < 1e36f && (pall > 1e-30f || pall < -1e-30f)) {
+        const float r = 1.0f / pall;
+        const float ra = r * farea;
+        t->inv_ea[0] = t->ea[0] ? ra * fa[1] * fa[2] : 0.0f;
+        t->inv_ea[1] = t->ea[1] ? ra * fa[0] * fa[2] : 0.0f;
+        t->inv_ea[2] = t->ea[2] ? ra * p01 : 0.0f;
+        inv_det = 256.0f * r * pa;
+    } else {
+        for (int k = 0; k < 3; k++) {
+            t->inv_ea[k] = t->ea[k] ? 1.0f / fa[k] : 0.0f;
+        }
+        inv_det = 256.0f / farea;
     }
 
     /* 平面 */
-    const float x0 = (float)X[0] / 16.0f, y0 = (float)Y[0] / 16.0f;
-    const float x1 = (float)X[1] / 16.0f, y1 = (float)Y[1] / 16.0f;
-    const float x2 = (float)X[2] / 16.0f, y2 = (float)Y[2] / 16.0f;
-    const float inv_det = 256.0f / (float)area;
+    const float x0 = (float)X[0] * (1.0f / 16.0f), y0 = (float)Y[0] * (1.0f / 16.0f);
+    const float x1 = (float)X[1] * (1.0f / 16.0f), y1 = (float)Y[1] * (1.0f / 16.0f);
+    const float x2 = (float)X[2] * (1.0f / 16.0f), y2 = (float)Y[2] * (1.0f / 16.0f);
+    plane_k_t pk;
+    pk.A = (y2 - y0) * inv_det;
+    pk.B = (y1 - y0) * inv_det;
+    pk.C = (x1 - x0) * inv_det;
+    pk.D = (x2 - x0) * inv_det;
+    pk.ox = 0.5f - x0;
+    pk.oy = 0.5f - y0;
 
-    make_plane(&t->z, x0, y0, x1, y1, x2, y2, inv_det, V[0]->z, V[1]->z, V[2]->z);
+    make_plane(&t->z, &pk, V[0]->z, V[1]->z, V[2]->z);
 
     const float w0 = V[0]->iw, w1 = V[1]->iw, w2 = V[2]->iw;
     const float tol = fabsf(w0) * 1e-5f;
     const bool affine = fabsf(w1 - w0) <= tol && fabsf(w2 - w0) <= tol;
+    const int oc = ol->off_color;
     if (affine) {
-        t->flags |= GP_TF_AFFINE;
+        flags |= GP_TF_AFFINE;
         t->iw.c = w0;
         t->iw.dx = t->iw.dy = 0.0f;
-        for (uint32_t k = 0; k < n_att; k++) {
-            make_plane(&t->att[k], x0, y0, x1, y1, x2, y2, inv_det, V[0]->a[k], V[1]->a[k],
-                       V[2]->a[k]);
-        }
     } else {
-        make_plane(&t->iw, x0, y0, x1, y1, x2, y2, inv_det, w0, w1, w2);
-        for (uint32_t k = 0; k < n_att; k++) {
-            make_plane(&t->att[k], x0, y0, x1, y1, x2, y2, inv_det, V[0]->a[k] * w0,
-                       V[1]->a[k] * w1, V[2]->a[k] * w2);
+        make_plane(&t->iw, &pk, w0, w1, w2);
+    }
+    for (uint32_t k = 0; k < n_att; k++) {
+        float a0 = V[0]->a[k], a1 = V[1]->a[k], a2 = V[2]->a[k];
+        if (flat_col && oc >= 0 && (int)k >= oc && (int)k < oc + 4) {
+            a0 = a1 = a2 = flat_col[k - (uint32_t)oc];
+        }
+        if (affine) {
+            make_plane(&t->att[k], &pk, a0, a1, a2);
+        } else {
+            make_plane_p(&t->att[k], &pk, &t->iw, a0, a1, a2, w0, w1, w2);
         }
     }
 
-    gp_bin_record(c, off, bx0, by0, bx1, by1);
+    /* 颜色三顶点都在 [0,1]（光照 / 归一化顶点色总是如此，F32 顶点色可能越界）：
+     * 三角形内（凸组合）也在 [0,1]，像素管线快速路径可以只在段端点夹取 */
+    bool unit = true;
+    if (oc >= 0 && !(flags & GP_TF_VM)) {
+        for (int i = 0; i < 3 && unit; i++) {
+            const float *col = flat_col ? flat_col : &V[i]->a[oc];
+            unit = unit01(col[0]) && unit01(col[1]) && unit01(col[2]) && unit01(col[3]);
+        }
+    }
+    if (unit) {
+        flags |= GP_TF_UNIT;
+    }
+    t->flags = (uint8_t)flags;
+
+    const uint32_t cy1 = gp_cycles();
+    c->cy_setup += cy1 - cy0;
+    bin_tri(c, t, off);
+    c->cy_bin += gp_cycles() - cy1;
     c->st_tris++;
     return true;
 }
 
 /** 失败（arena 满）时刷新后重试一次 */
 static void emit_tri(draw_ctx_t *dc, const gp_wvtx_t *a, const gp_wvtx_t *b, const gp_wvtx_t *c,
-                     bool cull)
+                     const float *flat, bool cull)
 {
-    if (!gp_setup_tri(dc->c, a, b, c, &dc->ol, 0, cull)) {
+    if (!gp_setup_tri(dc->c, a, b, c, &dc->ol, flat, cull)) {
         gp_flush(dc->c);
-        if (!gp_setup_tri(dc->c, a, b, c, &dc->ol, 0, cull)) {
+        if (!gp_setup_tri(dc->c, a, b, c, &dc->ol, flat, cull)) {
             gp_log(GP_LOG_WARN, "triangle dropped: arena too small");
         }
     }
@@ -628,61 +818,88 @@ static void emit_tri(draw_ctx_t *dc, const gp_wvtx_t *a, const gp_wvtx_t *b, con
 
 /* ── 图元 ─────────────────────────────────────────────────────────── */
 
-static void apply_flat(draw_ctx_t *dc, gp_cvtx_t *v, int n, const gp_cvtx_t *provoking)
-{
-    if (!dc->flat || dc->ol.off_color < 0) {
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        memcpy(&v[i].a[dc->ol.off_color], &provoking->a[dc->ol.off_color], 16);
-    }
-}
-
 /** prov = 激发顶点的索引（平面着色时取它的颜色） */
 static void draw_triangle(draw_ctx_t *dc, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t prov)
 {
+    float pcol[4];
+    const float *flat = NULL;
+    if (dc->flat && dc->ol.off_color >= 0) {
+        /* 先取激发顶点的颜色：它和 i0..i2 可能落在同一个缓存槽 */
+        memcpy(pcol, &get_vertex(dc, prov)->w.a[dc->ol.off_color], sizeof(pcol));
+        flat = pcol;
+    }
+
+    const gp_vce_t *A = get_vertex(dc, i0);
+    const gp_vce_t *B = get_vertex(dc, i1);
+    const gp_vce_t *C = get_vertex(dc, i2);
     gp_cvtx_t va[3 + N_PLANES + 2];
     gp_cvtx_t vb[3 + N_PLANES + 2];
 
-    if (dc->flat) {
-        /* 先取激发顶点：它和 i0..i2 可能落在同一个缓存槽 */
-        const gp_cvtx_t p = *get_vertex(dc, prov);
-        va[0] = *get_vertex(dc, i0);
-        va[1] = *get_vertex(dc, i1);
-        va[2] = *get_vertex(dc, i2);
-        apply_flat(dc, va, 3, &p);
-    } else {
-        va[0] = *get_vertex(dc, i0);
-        va[1] = *get_vertex(dc, i1);
-        va[2] = *get_vertex(dc, i2);
+    if (A->index != i0 || B->index != i1) {
+        /* 两个不同索引落进同一槽（相差 64 的倍数）：后取的把先取的冲掉了，按值重取 */
+        A = get_vertex(dc, i0);
+        cvtx_from(dc, &va[0], A->clip, A->w.a);
+        const uint32_t oa = A->oc;
+        B = get_vertex(dc, i1);
+        cvtx_from(dc, &va[1], B->clip, B->w.a);
+        const uint32_t ob = B->oc;
+        C = get_vertex(dc, i2);
+        cvtx_from(dc, &va[2], C->clip, C->w.a);
+        const uint32_t oc = C->oc;
+        if (oa & ob & oc) {
+            dc->c->st_culled++;
+            return;
+        }
+        dc->c->st_prims++;
+        const uint32_t cy0 = gp_cycles();
+        gp_cvtx_t *poly = va;
+        int n = 3;
+        if (oa | ob | oc) {
+            n = clip_poly(dc, oa | ob | oc, va, vb, 3, &poly);
+        }
+        gp_wvtx_t w[3 + N_PLANES + 2];
+        for (int i = 0; i < n; i++) {
+            project(dc, &poly[i], &w[i]);
+        }
+        dc->c->cy_clip += gp_cycles() - cy0;
+        for (int i = 1; i + 1 < n; i++) {
+            emit_tri(dc, &w[0], &w[i], &w[i + 1], flat, true);
+        }
+        return;
     }
 
-    const uint32_t o0 = outcode(dc, va[0].clip);
-    const uint32_t o1 = outcode(dc, va[1].clip);
-    const uint32_t o2 = outcode(dc, va[2].clip);
+    const uint32_t o0 = A->oc, o1 = B->oc, o2 = C->oc;
     if (o0 & o1 & o2) {
         dc->c->st_culled++;
         return;
     }
     dc->c->st_prims++;
 
-    gp_cvtx_t *poly = va;
-    int n = 3;
     const uint32_t any = o0 | o1 | o2;
-    if (any) {
-        n = clip_poly(dc, any, va, vb, 3, &poly);
-        if (n < 3) {
-            return;
-        }
+    if (!any) {
+        /* 常见情况：三个顶点都在保护带内，直接用缓存里已投影的窗口坐标 */
+        emit_tri(dc, &A->w, &B->w, &C->w, flat, true);
+        return;
     }
 
+    const uint32_t cy0 = gp_cycles();
+    cvtx_from(dc, &va[0], A->clip, A->w.a);
+    cvtx_from(dc, &va[1], B->clip, B->w.a);
+    cvtx_from(dc, &va[2], C->clip, C->w.a);
+    gp_cvtx_t *poly = va;
+    const int n = clip_poly(dc, any, va, vb, 3, &poly);
+    if (n < 3) {
+        dc->c->cy_clip += gp_cycles() - cy0;
+        return;
+    }
     gp_wvtx_t w[3 + N_PLANES + 2];
     for (int i = 0; i < n; i++) {
         project(dc, &poly[i], &w[i]);
     }
+    dc->c->cy_clip += gp_cycles() - cy0;
     /* 扇形三角化；裁剪不改变绕序，剔除判断仍然有效 */
     for (int i = 1; i + 1 < n; i++) {
-        emit_tri(dc, &w[0], &w[i], &w[i + 1], true);
+        emit_tri(dc, &w[0], &w[i], &w[i + 1], flat, true);
     }
 }
 
@@ -699,16 +916,19 @@ static void emit_quad(draw_ctx_t *dc, const gp_wvtx_t *p0, const gp_wvtx_t *p1, 
     q[1].x -= nx + ex; q[1].y -= ny + ey;
     q[2].x -= nx - ex; q[2].y -= ny - ey;
     q[3].x += nx + ex; q[3].y += ny + ey;
-    emit_tri(dc, &q[0], &q[1], &q[2], false);
-    emit_tri(dc, &q[0], &q[2], &q[3], false);
+    emit_tri(dc, &q[0], &q[1], &q[2], NULL, false);
+    emit_tri(dc, &q[0], &q[2], &q[3], NULL, false);
 }
 
 static void draw_line(draw_ctx_t *dc, uint32_t i0, uint32_t i1)
 {
-    gp_cvtx_t a = *get_vertex(dc, i0);
-    gp_cvtx_t b = *get_vertex(dc, i1);
-    if (dc->flat) {
-        apply_flat(dc, &a, 1, &b);
+    gp_cvtx_t a, b;
+    const gp_vce_t *e = get_vertex(dc, i0);
+    cvtx_from(dc, &a, e->clip, e->w.a);
+    e = get_vertex(dc, i1);
+    cvtx_from(dc, &b, e->clip, e->w.a);
+    if (dc->flat && dc->ol.off_color >= 0) {
+        memcpy(&a.a[dc->ol.off_color], &b.a[dc->ol.off_color], 16);
     }
     const uint32_t oa = outcode(dc, a.clip);
     const uint32_t ob = outcode(dc, b.clip);
@@ -759,12 +979,12 @@ static void draw_line(draw_ctx_t *dc, uint32_t i0, uint32_t i1)
 
 static void draw_point(draw_ctx_t *dc, uint32_t i0)
 {
-    const gp_cvtx_t *v = get_vertex(dc, i0);
-    if (outcode(dc, v->clip)) {
+    const gp_vce_t *v = get_vertex(dc, i0);
+    if (v->oc) {
         return;
     }
     gp_wvtx_t w;
-    project(dc, v, &w);
+    w = v->w;
     const float hs = (dc->c->ext.point_size ? (float)dc->c->ext.point_size : 1.0f) * 0.5f;
     emit_quad(dc, &w, &w, 0.0f, hs, hs, 0.0f);
     dc->c->st_prims++;
@@ -854,6 +1074,26 @@ void gp_draw3d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *inline_data
     dc.gx = 1.0f + 2.0f * GP_GUARD_PX / (float)(c->vp_w > 0 ? c->vp_w : 1);
     dc.gy = 1.0f + 2.0f * GP_GUARD_PX / (float)(c->vp_h > 0 ? c->vp_h : 1);
     build_olayout(&dc);
+    for (int s = 0; s < 8; s++) {
+        if (dc.attr[s]) {
+            fetch_init(&dc.fetch[s], dc.attr[s]);
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        dc.ccol[i] = (float)c->const_color[i] * (1.0f / 255.0f);
+    }
+    /* 视口：x = vp_x + (ndc+1)/2 · w = (vp_x + w/2) + ndc · w/2；y 向下 */
+    dc.vsx = 0.5f * (float)c->vp_w;
+    dc.vox = (float)c->vp_x + dc.vsx;
+    dc.vsy = -0.5f * (float)c->vp_h;
+    dc.voy = (float)c->vp_y - dc.vsy;
+    /* z = (n + (ndc+1)/2 · (f-n)) · 65535 - bias */
+    dc.zs = 0.5f * (c->depth_f - c->depth_n) * 65535.0f;
+    dc.zo = c->depth_n * 65535.0f + dc.zs - (float)c->ext.depth_bias;
+    {
+        const float span = c->fog.fog_end - c->fog.fog_start;
+        dc.fog_inv_span = span != 0.0f ? 1.0f / span : 0.0f;
+    }
 
     /* 后变换缓存每次绘制失效（矩阵 / 布局可能已变） */
     for (int i = 0; i < GP_VCACHE; i++) {

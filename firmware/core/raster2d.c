@@ -46,23 +46,23 @@ void gp_draw2d(gpu_core_t *c, const espgpu_draw_t *d, const uint8_t *verts, uint
 
         gp_wvtx_t w[4];
         for (uint32_t k = 0; k < per; k++) {
-            memset(&w[k], 0, sizeof(gp_wvtx_t));
-            w[k].x = (float)v[k].x / 16.0f;
-            w[k].y = (float)v[k].y / 16.0f;
+            /* gp_setup_tri 只读 x/y/z/iw 和前 ol.n（≤ 2）个属性：不必清整个 128 字节 */
+            w[k].x = (float)v[k].x * (1.0f / 16.0f); /* 2 的幂：与 / 16 逐位相同 */
+            w[k].y = (float)v[k].y * (1.0f / 16.0f);
             w[k].z = 0.0f;
             w[k].iw = 1.0f;
-            w[k].a[0] = (float)v[k].u / 16.0f;
-            w[k].a[1] = (float)v[k].v / 16.0f;
+            w[k].a[0] = (float)v[k].u * (1.0f / 16.0f);
+            w[k].a[1] = (float)v[k].v * (1.0f / 16.0f);
         }
         for (int attempt = 0; attempt < 2; attempt++) {
-            if (gp_setup_tri(c, &w[0], &w[1], &w[2], &ol, 0, false)) {
+            if (gp_setup_tri(c, &w[0], &w[1], &w[2], &ol, NULL, false)) {
                 break;
             }
             gp_flush(c);
         }
         if (per == 4) {
             for (int attempt = 0; attempt < 2; attempt++) {
-                if (gp_setup_tri(c, &w[0], &w[2], &w[3], &ol, 0, false)) {
+                if (gp_setup_tri(c, &w[0], &w[2], &w[3], &ol, NULL, false)) {
                     break;
                 }
                 gp_flush(c);

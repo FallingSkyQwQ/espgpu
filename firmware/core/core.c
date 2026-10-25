@@ -289,6 +289,32 @@ static void cmd_fbo(gpu_core_t *c, const espgpu_fbo_t *f)
 
 /* ── 分箱 ─────────────────────────────────────────────────────────── */
 
+void gp_bin_tile(gpu_core_t *c, int tile, uint32_t rec_off)
+{
+    gp_bin_t *b = &c->bins[tile];
+    gp_bin_chunk_t *ch = b->tail ? (gp_bin_chunk_t *)gp_arena_ptr(c, b->tail) : NULL;
+    if (ch == NULL || ch->count == GP_BIN_CHUNK) {
+        uint32_t off;
+        gp_bin_chunk_t *n = (gp_bin_chunk_t *)gp_arena_alloc(c, sizeof(gp_bin_chunk_t), &off);
+        if (n == NULL) {
+            /* 调用者已经按最坏情况预留过空间，这里不应发生 */
+            gp_log(GP_LOG_ERROR, "bin: arena exhausted");
+            return;
+        }
+        n->next = 0;
+        n->count = 0;
+        if (ch) {
+            ch->next = off;
+        } else {
+            b->head = off;
+        }
+        b->tail = off;
+        ch = n;
+    }
+    ch->rec[ch->count++] = rec_off;
+    b->count++;
+}
+
 void gp_bin_record(gpu_core_t *c, uint32_t rec_off, int x0, int y0, int x1, int y1)
 {
     const int tx0 = x0 >> GP_TILE_SHIFT;
@@ -298,29 +324,7 @@ void gp_bin_record(gpu_core_t *c, uint32_t rec_off, int x0, int y0, int x1, int 
 
     for (int ty = ty0; ty <= ty1; ty++) {
         for (int tx = tx0; tx <= tx1; tx++) {
-            gp_bin_t *b = &c->bins[ty * c->tiles_x + tx];
-            gp_bin_chunk_t *ch = b->tail ? (gp_bin_chunk_t *)gp_arena_ptr(c, b->tail) : NULL;
-            if (ch == NULL || ch->count == GP_BIN_CHUNK) {
-                uint32_t off;
-                gp_bin_chunk_t *n =
-                    (gp_bin_chunk_t *)gp_arena_alloc(c, sizeof(gp_bin_chunk_t), &off);
-                if (n == NULL) {
-                    /* 调用者已经按最坏情况预留过空间，这里不应发生 */
-                    gp_log(GP_LOG_ERROR, "bin: arena exhausted");
-                    return;
-                }
-                n->next = 0;
-                n->count = 0;
-                if (ch) {
-                    ch->next = off;
-                } else {
-                    b->head = off;
-                }
-                b->tail = off;
-                ch = n;
-            }
-            ch->rec[ch->count++] = rec_off;
-            b->count++;
+            gp_bin_tile(c, ty * c->tiles_x + tx, rec_off);
         }
     }
     c->pending = true;
@@ -513,6 +517,7 @@ void gp_flush(gpu_core_t *c)
         return;
     }
     gp_raster_frame(c);
+    c->st_flushes++;
     if (c->arena_used > c->st_bin_peak) {
         c->st_bin_peak = c->arena_used;
     }
@@ -540,6 +545,21 @@ static void do_present(gpu_core_t *c)
         c->cb.present(c->cb.user, px, c->screen.w, c->screen.h);
     }
 
+    {
+        /* 分段计时：周期 → µs（每帧一次除法） */
+        const uint64_t r = gp_cycles_per_us();
+        c->last_vtx_us = (uint32_t)(c->cy_vtx / r);
+        c->last_clip_us = (uint32_t)(c->cy_clip / r);
+        c->last_setup_us = (uint32_t)(c->cy_setup / r);
+        c->last_bin_us = (uint32_t)(c->cy_bin / r);
+        c->last_tile_us = (uint32_t)(c->cy_raster / r);
+        c->last_io_us = (uint32_t)(c->cy_io / r);
+        c->cy_vtx = c->cy_clip = c->cy_setup = c->cy_bin = c->cy_raster = c->cy_io = 0;
+        memcpy(c->last_path, c->st_path, sizeof(c->last_path));
+        memset(c->st_path, 0, sizeof(c->st_path));
+        c->last_flushes = c->st_flushes;
+        c->st_flushes = 0;
+    }
     c->last_tris = c->st_tris;
     c->last_culled = c->st_culled;
     c->last_bin = c->st_bin_peak;
@@ -667,7 +687,10 @@ void gpu_core_destroy(gpu_core_t *c)
         if (c->workers[i].depth) gp_free(c->workers[i].depth);
     }
     for (int i = 0; i < (int)ESPGPU_VM_MAX_PROGRAMS; i++) {
-        if (c->progs[i]) gp_free(c->progs[i]);
+        if (c->progs[i]) {
+            gp_vm_forget(c->progs[i]->code); /* vm.c 按 code 地址缓存解码结果 */
+            gp_free(c->progs[i]);
+        }
     }
     if (c->buffers) {
         for (uint32_t i = 0; i < ESPGPU_MAX_BUFFERS; i++) {
@@ -763,6 +786,17 @@ void gpu_core_fill_stats(gpu_core_t *c, espgpu_stats_t *s)
     s->t_tnl_us = c->last_tnl_us;
     s->debug_view = c->debug_view;
     s->buffers_bytes = c->buffer_bytes;
+    s->t_vtx_us = c->last_vtx_us;
+    s->t_clip_us = c->last_clip_us;
+    s->t_setup_us = c->last_setup_us;
+    s->t_bin_us = c->last_bin_us;
+    s->t_tile_us = c->last_tile_us;
+    s->t_tile_io_us = c->last_io_us;
+    s->tris_fill = c->last_path[GP_PATH_FILL];
+    s->tris_fast = c->last_path[GP_PATH_FAST];
+    s->tris_px = c->last_path[GP_PATH_PX];
+    s->tris_generic = c->last_path[GP_PATH_GENERIC];
+    s->raster_passes = c->last_flushes;
 }
 
 /* ── DATA chunk：设备端缓冲 ───────────────────────────────────────── */

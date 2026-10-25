@@ -2,11 +2,13 @@
  * dag.cpp — 运算语义、DAG 解释执行（顶点着色器）、VM 参考解释器、反汇编
  *
  * eval_op 是唯一的数值语义来源：编译期常量折叠、主机端顶点着色器执行、
- * VM 参考解释器都调用它，保证三者结果一致。边界情况（除零、负数开方 / 对数 / 幂、
- * smoothstep 两端相等）逐条照抄 firmware/core/vm.c，折叠与否结果都和设备相同。
+ * VM 参考解释器都调用它。逐分量语义（含 sin / exp2 / log2 / pow 的近似和所有边界情况）
+ * 来自 shared/espgpu_vm_math.h，与 firmware/core/vm.c 是同一份代码，折叠与否结果都和设备相同。
  */
 
 #include "internal.h"
+
+#include "espgpu_vm_math.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,68 +24,19 @@ void eval_op(uint8_t op, const float a[4], const float b[4], const float c[4], f
     case ESPGPU_VM_DP2:
     case ESPGPU_VM_DP3:
     case ESPGPU_VM_DP4: {
-        const int n = op == ESPGPU_VM_DP2 ? 2 : op == ESPGPU_VM_DP3 ? 3 : 4;
-        float s = 0;
-        for (int i = 0; i < n; i++) s += a[i] * b[i];
+        const float s = espgpu_vm_dot(op == ESPGPU_VM_DP2 ? 2 : op == ESPGPU_VM_DP3 ? 3 : 4, a, b);
         d[0] = d[1] = d[2] = d[3] = s;
         return;
     }
-    case ESPGPU_VM_RCP: {
-        const float v = a[0] != 0.0f ? 1.0f / a[0] : 0.0f;
-        d[0] = d[1] = d[2] = d[3] = v;
-        return;
-    }
+    case ESPGPU_VM_RCP:
     case ESPGPU_VM_RSQ: {
-        const float s = std::fabs(a[0]);
-        const float v = s > 0.0f ? 1.0f / std::sqrt(s) : 0.0f;
+        const float v = espgpu_vm_eval_scalar(op, a[0], 0.0f, 0.0f);
         d[0] = d[1] = d[2] = d[3] = v;
         return;
     }
     default: break;
     }
-    for (int i = 0; i < 4; i++) {
-        const float x = a[i], y = b[i], z = c[i];
-        float r = 0;
-        switch (op) {
-        case ESPGPU_VM_MOV: r = x; break;
-        case ESPGPU_VM_ADD: r = x + y; break;
-        case ESPGPU_VM_SUB: r = x - y; break;
-        case ESPGPU_VM_MUL: r = x * y; break;
-        case ESPGPU_VM_MAD: r = x * y + z; break;
-        case ESPGPU_VM_DIV: r = y != 0.0f ? x / y : 0.0f; break;
-        case ESPGPU_VM_MIN: r = x < y ? x : y; break;
-        case ESPGPU_VM_MAX: r = x > y ? x : y; break;
-        case ESPGPU_VM_SQRT: r = std::sqrt(std::fabs(x)); break;
-        case ESPGPU_VM_EXP2: r = std::exp2(x); break;
-        case ESPGPU_VM_LOG2: r = x > 0.0f ? std::log2(x) : -126.0f; break;
-        case ESPGPU_VM_POW: r = std::pow(x < 0.0f ? 0.0f : x, y); break;
-        case ESPGPU_VM_FRC: r = x - std::floor(x); break;
-        case ESPGPU_VM_FLR: r = std::floor(x); break;
-        case ESPGPU_VM_ABS: r = std::fabs(x); break;
-        case ESPGPU_VM_SLT: r = x < y ? 1.0f : 0.0f; break;
-        case ESPGPU_VM_SGE: r = x >= y ? 1.0f : 0.0f; break;
-        case ESPGPU_VM_SEQ: r = x == y ? 1.0f : 0.0f; break;
-        case ESPGPU_VM_SNE: r = x != y ? 1.0f : 0.0f; break;
-        case ESPGPU_VM_LRP: r = y + x * (z - y); break;
-        case ESPGPU_VM_CMP: r = x < 0 ? y : z; break;
-        case ESPGPU_VM_SEL: r = x != 0 ? y : z; break;
-        case ESPGPU_VM_CLAMP: r = x < y ? y : (x > z ? z : x); break;
-        case ESPGPU_VM_SIN: r = std::sin(x); break;
-        case ESPGPU_VM_COS: r = std::cos(x); break;
-        case ESPGPU_VM_MOD: r = y != 0.0f ? x - y * std::floor(x / y) : 0.0f; break;
-        case ESPGPU_VM_SIGN: r = x > 0 ? 1.0f : (x < 0 ? -1.0f : 0.0f); break;
-        case ESPGPU_VM_STEP: r = x >= y ? 1.0f : 0.0f; break;
-        case ESPGPU_VM_SMOOTH: {
-            const float dd = y - x;
-            float t = dd != 0.0f ? (z - x) / dd : (z >= y ? 1.0f : 0.0f);
-            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-            r = t * t * (3.0f - 2.0f * t);
-            break;
-        }
-        default: r = 0; break;
-        }
-        d[i] = r;
-    }
+    for (int i = 0; i < 4; i++) d[i] = espgpu_vm_eval_scalar(op, a[i], b[i], c[i]);
 }
 
 /* ── 顶点着色器解释执行 / 主机预计算 ───────────────────────────── */
@@ -125,7 +78,7 @@ void eval_nodes(const Dag &d, const std::vector<int> &order, const float (*input
             if (n.nargs > 2) gather(n.a[2], val, c);
             eval_op(n.op, a, b, c, r.data());
             if (n.flags & ESPGPU_VM_F_SAT) {
-                for (float &x : r) x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+                for (float &x : r) x = espgpu_vm_sat(x);
             }
             break;
         }
@@ -198,7 +151,7 @@ void fragment_consts(const Shader &fs, const float (*uniforms)[4], float (*c)[4]
 bool vm_run(const espgpu_vm_insn_t *code, size_t n, const float v[ESPGPU_VM_VARYINGS][4],
             const float c[ESPGPU_VM_CONSTS][4], TexFn tex, void *user, float out[4])
 {
-    /* 与设备一致：临时寄存器在像素之间不清零（这里填 NaN，读到未写的寄存器会立刻暴露），
+    /* 设备每像素把临时寄存器清零；这里故意填 NaN：编译器若生成"读未写寄存器"的代码会立刻暴露。
      * o0 初值 (0,0,0,1)，mask == 0 等于写全部四个分量 */
     float r[ESPGPU_VM_TEMPS][4];
     for (auto &t : r) t[0] = t[1] = t[2] = t[3] = std::numeric_limits<float>::quiet_NaN();
@@ -243,7 +196,7 @@ bool vm_run(const espgpu_vm_insn_t *code, size_t n, const float v[ESPGPU_VM_VARY
             eval_op(in.op, a, b, cc, d);
         }
         if (in.flags & ESPGPU_VM_F_SAT) {
-            for (float &x : d) x = std::min(std::max(x, 0.0f), 1.0f);
+            for (float &x : d) x = espgpu_vm_sat(x);
         }
         float *dst;
         if ((in.dst & 0xC0) == ESPGPU_VM_BANK_SPECIAL) {

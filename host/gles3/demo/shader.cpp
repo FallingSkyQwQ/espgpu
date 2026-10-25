@@ -4,12 +4,45 @@
  * 背景是经典的 plasma（多组 sin 叠加 + 调色），由 GLSL 编译成 VM 字节码在设备上
  * 逐像素执行；前景是一张程序生成的棋盘纹理，顶点着色器里用 sin/cos 做旋转
  * 和摆动（不是纯矩阵变换，主机端解释执行），片元着色器加了暗角和 alpha 裁剪。
+ *
+ * 设备分辨率：VM 每像素约 30 条标量微指令（7 个 sin），320x200 全屏在 ESP32-S3 上
+ * 仍是一帧上百毫秒，所以 demo 默认把设备开成 160x100（窗口照常 640x400，主机拉伸显示）。
+ * 想看全分辨率：先 set ESPGPU_RES=320x200。所用分辨率和帧率显示在标题栏，
+ * 从控制台启动时也打印到控制台。
  */
 
 #include "window.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
+
+/** 没有显式指定 ESPGPU_RES 时用 160x100（必须在 eglInitialize 之前设置） */
+static const char *pick_device_resolution()
+{
+    static char res[32] = "160x100";
+    char buf[32];
+    const DWORD n = GetEnvironmentVariableA("ESPGPU_RES", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+        std::snprintf(res, sizeof(res), "%s", buf);
+    } else {
+        /* libGLESv2 用 CRT 的 getenv 读：_putenv_s 改 CRT 环境（/MD 与 MinGW 共享同一个 CRT），
+         * SetEnvironmentVariable 改进程环境，两个都设 */
+        _putenv_s("ESPGPU_RES", res);
+        SetEnvironmentVariableA("ESPGPU_RES", res);
+    }
+    return res;
+}
+
+/** GUI 子系统程序：从控制台启动时把输出接到父控制台上 */
+static void attach_console()
+{
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE *f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+    }
+}
 
 static const char *kPlasmaVS = R"(#version 300 es
 in vec2 aPos;
@@ -102,6 +135,11 @@ static GLuint make_checker()
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
+    attach_console();
+    const char *res = pick_device_resolution();
+    std::printf("gles-shader: device resolution %s (fragment VM plasma; override with ESPGPU_RES=WxH)\n", res);
+    std::fflush(stdout);
+
     DemoWindow w;
     if (!demo_init(w, L"espgpu GLES 3.0 - plasma (fragment VM)", 640, 400)) return 1;
 
@@ -150,6 +188,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     const GLint uc_tex = glGetUniformLocation(card, "uTex");
     const GLint uc_tint = glGetUniformLocation(card, "uTint");
 
+    double fps_t0 = demo_time();
+    int fps_frames = 0;
     while (demo_pump(w)) {
         const float t = static_cast<float>(demo_time());
         const float aspect = w.height > 0 ? static_cast<float>(w.width) / static_cast<float>(w.height) : 1.0f;
@@ -172,6 +212,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
 
         demo_swap(w);
+
+        /* 每秒刷新一次标题：设备分辨率 + 帧率 */
+        fps_frames++;
+        const double now = demo_time();
+        if (now - fps_t0 >= 1.0) {
+            const double fps = fps_frames / (now - fps_t0);
+            char title[128];
+            std::snprintf(title, sizeof(title), "espgpu GLES 3.0 - plasma (fragment VM) - device %s - %.1f fps", res, fps);
+            SetWindowTextA(w.hwnd, title);
+            std::printf("gles-shader: %s  %.1f fps\n", res, fps);
+            std::fflush(stdout);
+            fps_t0 = now;
+            fps_frames = 0;
+        }
     }
 
     demo_shutdown(w);

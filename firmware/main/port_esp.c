@@ -8,9 +8,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_memory_utils.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -69,6 +71,18 @@ void gp_log(int level, const char *fmt, ...)
     }
 }
 
+/* 分段计时（统计里的 t_vtx_us / t_setup_us / t_tile_us …）：读 CCOUNT 约 8 个周期 */
+IRAM_ATTR uint32_t gp_cycles(void)
+{
+    return (uint32_t)esp_cpu_get_cycle_count();
+}
+
+uint32_t gp_cycles_per_us(void)
+{
+    const uint32_t r = esp_rom_get_cpu_ticks_per_us(); /* 跟随 SET_CLOCK / esp_pm */
+    return r ? r : 240;
+}
+
 int gp_atomic_fetch_add(volatile int *p, int v)
 {
     return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
@@ -105,7 +119,8 @@ static void ensure_worker(void)
         return;
     }
     /* 优先级高于 core1 上的呈现任务（6），保证 PRESENT 时立刻开工 */
-    if (xTaskCreatePinnedToCore(worker_task, "gpu_raster1", 4096, NULL, 8, &s_worker, 1) !=
+    /* 6 KB：通用路径的跨度缓冲 + gp_vm_run_span（整段 8 像素一起跑 VM）约多 1.2 KB */
+    if (xTaskCreatePinnedToCore(worker_task, "gpu_raster1", 6144, NULL, 8, &s_worker, 1) !=
         pdPASS) {
         s_worker = NULL;
     }

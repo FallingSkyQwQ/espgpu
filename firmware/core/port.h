@@ -24,6 +24,15 @@ int gp_is_fast(const void *p);
 
 uint64_t gp_time_us(void);
 
+/**
+ * 分段计时用的廉价单调计数器，只用来做差（32 位回绕无妨，单段远小于回绕周期）。
+ * ESP：CPU 周期（CCOUNT，每核各自计数，worker 只在自己的核上做差）；主机：TSC / 系统计数器。
+ * 每帧每个阶段累加几千次，读一次必须只有几个周期，不能走 esp_timer / 系统调用。
+ */
+uint32_t gp_cycles(void);
+/** gp_cycles() 每微秒的计数（ESP：CPU MHz）。可以慢，每帧只调一次。 */
+uint32_t gp_cycles_per_us(void);
+
 enum { GP_LOG_ERROR = 1, GP_LOG_WARN = 2, GP_LOG_INFO = 3, GP_LOG_DEBUG = 4 };
 void gp_log(int level, const char *fmt, ...);
 

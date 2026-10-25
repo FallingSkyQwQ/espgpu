@@ -849,6 +849,101 @@ static void test_depth_persist(gpu_core_t *c)
     expect("depth persists across test-only pass", 160, 100, 255, 0, 0, 8);
 }
 
+/* 深度测试函数可配的 PIPELINE（雾关、不剔除） */
+static void pipeline_z(uint8_t shade, int dtest, int dwrite, uint8_t zfunc)
+{
+    uint8_t body[sizeof(espgpu_pipeline_t) + sizeof(espgpu_pipeline_fog_t) +
+                 sizeof(espgpu_pipeline_ext_t)];
+    espgpu_pipeline_t p;
+    memset(&p, 0, sizeof(p));
+    p.mask = 0xFFFF & ~ESPGPU_PS_TEXTURE;
+    p.depth_test = (uint8_t)dtest;
+    p.depth_write = (uint8_t)dwrite;
+    p.depth_func = zfunc;
+    p.alpha_func = ESPGPU_CMP_ALWAYS;
+    p.shade_mode = shade;
+    espgpu_pipeline_fog_t f = {0, 1, 1};
+    espgpu_pipeline_ext_t e;
+    memset(&e, 0, sizeof(e));
+    e.shade_model = ESPGPU_SHADE_MODEL_SMOOTH;
+    e.color_write = 1;
+    memcpy(body, &p, sizeof(p));
+    memcpy(body + sizeof(p), &f, sizeof(f));
+    memcpy(body + sizeof(p) + sizeof(f), &e, sizeof(e));
+    push(ESPGPU_OP_PIPELINE, 0, body, sizeof(body));
+}
+
+/*
+ * 多遍渲染：同一几何先走一条光栅路径写深度，再用 EQUAL 走另一条路径——每个像素都必须通过。
+ * 各路径（fill / fast / px / generic）共用 row_zfix 的定点深度，任何一条自己算深度都会在这里漏像素。
+ * 顺带检查分段统计（tris_px / tris_generic）有数。
+ */
+static void test_depth_equal_across_paths(gpu_core_t *c)
+{
+    float proj[16], mv[16], mvp[16];
+    perspective(1.0f, 320.0f / 200.0f, 0.5f, 50.0f, proj);
+    memcpy(mv, k_ident, sizeof(mv));
+    mv[11] = -4.0f;
+    mat_mul(proj, mv, mvp);
+    /* 倾斜的四边形 + 一个小三角形：深度逐像素变化、透视非仿射、跨多个 tile */
+    vtx_t q[7] = {
+        {-2.5f, -1.2f, 1.5f, 0, 0, 200, 40, 40, 255},  {2.5f, -1.2f, 1.5f, 4, 0, 40, 200, 40, 255},
+        {2.0f, 1.3f, -3.0f, 4, 4, 40, 40, 200, 255},   {-2.0f, 1.3f, -3.0f, 0, 4, 200, 200, 40, 255},
+        {-0.3f, -0.2f, 0.7f, 0, 0, 90, 90, 90, 255},   {0.6f, 0.1f, 0.4f, 1, 0, 90, 90, 90, 255},
+        {0.1f, 0.8f, -0.9f, 1, 1, 90, 90, 90, 255},
+    };
+    static uint16_t tex[8 * 8];
+    for (int i = 0; i < 64; i++) tex[i] = (i & 1) ? rgb(120, 80, 40) : rgb(60, 100, 140);
+    upload_tex(61, 8, 8, ESPGPU_FMT_RGB565, tex);
+    mat(ESPGPU_MATRIX_MVP, mvp);
+    layout_xyz_uv_rgba();
+    /* 第一遍 / 第二遍的着色：TEX_MOD_COLOR + 插值色 + 纹理 → px；TEX_ADD → generic */
+    const uint8_t sh[2][2] = {{ESPGPU_SHADE_TEX_MOD_COLOR, ESPGPU_SHADE_TEX_ADD},
+                              {ESPGPU_SHADE_TEX_ADD, ESPGPU_SHADE_TEX_MOD_COLOR}};
+    for (int order = 0; order < 2; order++) {
+        clear(rgb(0, 0, 0));
+        bind(0, 61, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT);
+        pipeline_z(sh[order][0], 1, 1, ESPGPU_CMP_LESS);
+        draw(ESPGPU_PRIM_QUADS, q, 4, NULL, 0);
+        draw(ESPGPU_PRIM_TRIANGLES, q + 4, 3, NULL, 0);
+        push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+        submit(c);
+        int covered = 0;
+        for (int i = 0; i < g_w * g_h; i++) covered += g_frame[i] != 0;
+        espgpu_stats_t st;
+        memset(&st, 0, sizeof(st));
+        gpu_core_fill_stats(c, &st);
+        const uint32_t first_px = st.tris_px, first_gen = st.tris_generic;
+
+        /* 第二遍：不清屏，EQUAL、不写深度，纯白（无纹理的 TEX_ADD / 白色常量 × 白纹理） */
+        bind(0, 0, ESPGPU_FILTER_NEAREST, ESPGPU_WRAP_REPEAT);
+        pipeline_z(sh[order][1], 1, 0, ESPGPU_CMP_EQUAL);
+        vtx_t w[7];
+        memcpy(w, q, sizeof(w));
+        for (int i = 0; i < 7; i++) w[i].r = w[i].g = w[i].b = 255;
+        draw(ESPGPU_PRIM_QUADS, w, 4, NULL, 0);
+        draw(ESPGPU_PRIM_TRIANGLES, w + 4, 3, NULL, 0);
+        push(ESPGPU_OP_PRESENT, 0, NULL, 0);
+        submit(c);
+        int white = 0;
+        for (int i = 0; i < g_w * g_h; i++) white += g_frame[i] == 0xFFFF;
+        memset(&st, 0, sizeof(st));
+        gpu_core_fill_stats(c, &st);
+        if (covered < 5000 || white != covered) {
+            printf("FAIL depth EQUAL across paths (order %d): %d covered, %d passed\n", order, covered,
+                   white);
+            g_fails++;
+        }
+        const bool px_used = order == 0 ? first_px > 0 : st.tris_px > 0;
+        const bool gen_used = order == 0 ? st.tris_generic > 0 : first_gen > 0;
+        if (!px_used || !gen_used) {
+            printf("FAIL path stats (order %d): px %u/%u generic %u/%u\n", order, first_px, st.tris_px,
+                   first_gen, st.tris_generic);
+            g_fails++;
+        }
+    }
+}
+
 /* 坏输入：不能崩、不能越界、不能泄漏 */
 static void test_bad_input(gpu_core_t *c)
 {
@@ -951,6 +1046,7 @@ int main(void)
     test_vm_temps_zeroed(c);
     test_debug_views(c);
     test_depth_persist(c);
+    test_depth_equal_across_paths(c);
     test_bad_input(c);
     espgpu_stats_t st;
     memset(&st, 0, sizeof(st));
