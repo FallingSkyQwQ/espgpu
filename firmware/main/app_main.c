@@ -28,6 +28,21 @@
 #include "usb_device.h"
 #include "version.h"
 
+#if CONFIG_ESPGPU_USB_ENABLE
+/* USB 的中断分配在调用 tinyusb_driver_install() 的那个核上。app_main 在 core0，
+ * 而 core0 跑命令执行（T&L 是单核的）：每个 64 字节包一次中断，整帧发送期间会把
+ * T&L 的墙钟时间拉长（issue #2 里 T&L 随分辨率变慢的一个可疑原因）。
+ * 所以在 core1 上安装，让中断和 TinyUSB 任务、发送任务待在一起。 */
+static esp_err_t s_usb_err;
+
+static void usb_init_task(void *arg)
+{
+    s_usb_err = espgpu_usb_init();
+    xTaskNotifyGive((TaskHandle_t)arg);
+    vTaskDelete(NULL);
+}
+#endif
+
 static const char *TAG = "app";
 
 void app_main(void)
@@ -83,13 +98,20 @@ void app_main(void)
     /* ── USB ── */
     espgpu_descriptors_init();
 #if CONFIG_ESPGPU_USB_ENABLE
-    ESP_ERROR_CHECK(espgpu_usb_init());
+    s_usb_err = ESP_FAIL;
+    if (xTaskCreatePinnedToCore(usb_init_task, "usb_init", 4096, xTaskGetCurrentTaskHandle(), 5,
+                                NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "usb_init task create failed");
+        abort();
+    }
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ESP_ERROR_CHECK(s_usb_err);
 #else
     ESP_LOGW(TAG, "USB OTG disabled by config, Serial-JTAG stays active");
 #endif
 
     /* ── 任务 ──
-     * core0：命令收发 + T&L / 光栅（worker 0）/ 编码 + 统计采样
+     * core0：接收 + 控制请求（8）/ 命令执行：T&L / 光栅（worker 0）/ 编码（7）
      * core1：TinyUSB（9）/ 第二个光栅 worker（8）/ 帧发送（7）/ 测试图案呈现（6）
      *
      * 命令任务的栈：gpu_core_exec → gp_draw3d → draw_triangle（gp_cvtx_t va[]+vb[] 和
@@ -107,6 +129,9 @@ void app_main(void)
         BaseType_t core;
     } tasks[] = {
         {espgpu_gpu_command_task, "gpu_cmd", 16384, 7, 0},
+        /* 接收 + 控制请求：优先级高于命令任务，渲染一帧期间也能及时回 GET_STATS 等
+         * （issue #3）。大部分时间阻塞在 USB 读上，几乎不占 CPU。 */
+        {espgpu_gpu_rx_task, "gpu_rx", 6144, 8, 0},
         {espgpu_gpu_present_task, "gpu_present", 6144, 6, 1},
         /* 命令模式的帧发送：与下一帧的命令执行重叠。放 core1，
          * 命令模式下那里的测试图案任务是空闲的。 */

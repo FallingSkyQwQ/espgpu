@@ -28,6 +28,7 @@
 #include "freertos/task.h"
 #include "driver/temperature_sensor.h"
 
+#include "espgpu_block.h"
 #include "espgpu_lz.h"
 #include "espgpu_proto.h"
 #include "frame_chain.h"
@@ -40,7 +41,21 @@ static const char *TAG = "gpu";
 
 espgpu_gpu_t g_gpu;
 
-static uint8_t *s_cmd_buf;              /* 接收命令的载荷缓冲（PSRAM） */
+/* ── 接收任务 → 命令任务（issue #3） ──
+ * 以前命令任务自己读 USB：读到一个 CMD chunk 就把整帧执行完（T&L + 光栅 + 编码，
+ * 3D 一帧 100+ ms）才回去读下一个 chunk，排在后面的 GET_STATS 等控制请求必然超时。
+ * 现在接收任务（core0，优先级高于命令任务）只管读 chunk：控制请求当场处理并回响应，
+ * CMD / DATA（以及要动渲染状态的 SET_MODE / SET_DEBUG_VIEW）按到达顺序进队列给命令任务。 */
+#define RX_POOL 4
+enum { RX_CMD = 0, RX_DATA = 1, RX_CTRL = 2 };
+typedef struct {
+    espgpu_chunk_hdr_t hdr;
+    uint8_t kind;
+    uint8_t buf; /* s_rx_buf 下标 */
+} rx_item_t;
+static uint8_t *s_rx_buf[RX_POOL];     /* 每个一整个 chunk 载荷（PSRAM） */
+static QueueHandle_t s_rx_free_q;      /* 空闲缓冲下标 */
+static QueueHandle_t s_rx_work_q;      /* 待命令任务处理的 rx_item_t */
 static uint8_t *s_lz_buf;               /* LZ 解压缓冲 */
 #define LZ_BUF_SIZE (64u * 1024u)
 static temperature_sensor_handle_t s_tsens;
@@ -60,6 +75,7 @@ typedef struct {
     uint32_t frame_id;
     uint16_t w, h;
     uint8_t codec;
+    bool key;      /**< 关键帧（主机不需要参考帧就能解） */
 } send_slot_t;
 
 #define SEND_SLOTS 2
@@ -156,7 +172,8 @@ static void fill_device_info(espgpu_device_info_t *di)
                        ESPGPU_CAP_TEX_LRU | ESPGPU_CAP_PALETTED_TEX | ESPGPU_CAP_BUFFERS |
                        ESPGPU_CAP_CLOCK | ESPGPU_CAP_DEBUG_VIEW | ESPGPU_CAP_LZ |
                        ESPGPU_CAP_LOG;
-    di->codecs = ESPGPU_CAP_CODEC_RAW | ESPGPU_CAP_CODEC_RLE | ESPGPU_CAP_CODEC_DELTA_RLE;
+    di->codecs = ESPGPU_CAP_CODEC_RAW | ESPGPU_CAP_CODEC_RLE | ESPGPU_CAP_CODEC_DELTA_RLE |
+                 ESPGPU_CAP_CODEC_BLOCK | ESPGPU_CAP_CODEC_AUTO;
 
     di->texture_cache_size = TEXTURE_BUDGET;
     di->max_texture_dim = 512;
@@ -364,7 +381,9 @@ void espgpu_gpu_present_task(void *arg)
             g_gpu.mode_pending = false;
         }
 
-        if (!g_gpu.streaming || g_gpu.command_mode || !espgpu_usb_ready() ||
+        const bool held =
+            (int32_t)((uint32_t)(esp_timer_get_time() / 1000) - g_gpu.pattern_hold_until_ms) < 0;
+        if (!g_gpu.streaming || g_gpu.command_mode || held || !espgpu_usb_ready() ||
             g_gpu.enc_buf == NULL) {
             xSemaphoreGive(g_gpu.lock);
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -516,6 +535,117 @@ static void drain_sender(void)
     }
 }
 
+/** BLOCK 编码一帧到槽位（shadow 同时更新）。块编码只支持 RGB565，命令模式本来就是。 */
+static esp_err_t encode_block(const uint16_t *pixels, uint16_t w, uint16_t h, bool key,
+                              send_slot_t *sl, espgpu_fb_encode_result_t *res)
+{
+    const size_t n = espgpu_block_encode(pixels, (uint16_t *)g_gpu.shadow, w, h, key ? 1 : 0,
+                                         sl->buf, sl->cap);
+    if (n == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    res->raw_bytes = (uint32_t)w * h * 2u;
+    res->enc_bytes = (uint32_t)n;
+    return ESP_OK;
+}
+
+/** AUTO 每帧带宽预算（字节）：链路速率 / 目标帧率，至少 8 KB */
+static uint32_t auto_budget(void)
+{
+    const uint32_t fps = g_gpu.mode.max_fps ? g_gpu.mode.max_fps : 24u;
+    const uint32_t b = CHAIN_AUTO_LINK_BPS / fps;
+    return b < 8192u ? 8192u : b;
+}
+
+/**
+ * 按 g_gpu.frame_codec 编码一帧，决定 codec 与是否关键帧。
+ * 返回 ESP_OK 时 shadow == pixels（下一帧的差分参考）。
+ */
+static esp_err_t encode_frame(const uint16_t *pixels, uint16_t w, uint16_t h, size_t raw,
+                              bool need_key, send_slot_t *sl, uint8_t *codec_out, bool *key_out,
+                              espgpu_fb_encode_result_t *res)
+{
+    const uint8_t *cur = (const uint8_t *)pixels;
+    chain_prod_t *p = &s_chain_prod;
+    esp_err_t err;
+
+    switch (g_gpu.frame_codec) {
+    case ESPGPU_CODEC_RAW:
+    case ESPGPU_CODEC_RLE:
+        *codec_out = g_gpu.frame_codec;
+        *key_out = true;
+        return espgpu_encode_update(cur, g_gpu.shadow, raw, 2, g_gpu.frame_codec, sl->buf,
+                                    sl->cap, res);
+
+    case ESPGPU_CODEC_BLOCK:
+        *codec_out = ESPGPU_CODEC_BLOCK;
+        *key_out = need_key;
+        return encode_block(pixels, w, h, need_key, sl, res);
+
+    case ESPGPU_CODEC_AUTO: {
+        const uint32_t budget = auto_budget();
+        const uint32_t nblocks = espgpu_block_count(w, h);
+        const uint32_t bitmap = espgpu_block_bitmap_bytes(w, h);
+        if (p->refresh_backoff) {
+            p->refresh_backoff--;
+        }
+
+        if (!p->lossy) {
+            /* 主机画面是精确的：优先无损。放不进预算（镜头在动）就改发有损关键帧。
+             * 无损编码已经把 shadow 更新成这一帧，块编码再对它做一遍是无害的拷贝。 */
+            const uint8_t c = need_key ? ESPGPU_CODEC_RLE : ESPGPU_CODEC_DELTA_RLE;
+            err = espgpu_encode_update(cur, g_gpu.shadow, raw, 2, c, sl->buf, sl->cap, res);
+            /* 关键帧（周期性兜底 / 主机要求）允许超预算几倍：只是偶尔一帧慢一点，
+             * 不值得为此把静止画面降成有损 */
+            const uint32_t limit = need_key ? budget * CHAIN_AUTO_REFRESH_SLACK : budget;
+            if (err == ESP_OK && res->enc_bytes <= limit) {
+                *codec_out = c;
+                *key_out = need_key;
+                return ESP_OK;
+            }
+            p->calm = 0;
+            *codec_out = ESPGPU_CODEC_BLOCK;
+            *key_out = true;
+            return encode_block(pixels, w, h, true, sl, res);
+        }
+
+        /* 有损状态：画面静止了一阵就补一帧无损关键帧，把有损误差清掉 */
+        if (p->calm >= CHAIN_AUTO_CALM_FRAMES && p->refresh_backoff == 0) {
+            p->calm = 0;
+            err = espgpu_encode_update(cur, g_gpu.shadow, raw, 2, ESPGPU_CODEC_RLE, sl->buf,
+                                       sl->cap, res);
+            if (err == ESP_OK && res->enc_bytes <= budget * CHAIN_AUTO_REFRESH_SLACK) {
+                *codec_out = ESPGPU_CODEC_RLE;
+                *key_out = true;
+                return ESP_OK;
+            }
+            /* 太大（纹理很碎）：这次放弃，冷却一段时间。shadow 已是这一帧，只能发块关键帧 */
+            p->refresh_backoff = CHAIN_AUTO_REFRESH_BACKOFF;
+            *codec_out = ESPGPU_CODEC_BLOCK;
+            *key_out = true;
+            return encode_block(pixels, w, h, true, sl, res);
+        }
+
+        *codec_out = ESPGPU_CODEC_BLOCK;
+        *key_out = need_key;
+        err = encode_block(pixels, w, h, need_key, sl, res);
+        if (err == ESP_OK) {
+            const uint32_t changed = (res->enc_bytes - bitmap) / 8u;
+            p->calm = (!need_key && changed <= nblocks / CHAIN_AUTO_CALM_DIV) ? p->calm + 1u : 0u;
+        }
+        return err;
+    }
+
+    case ESPGPU_CODEC_DELTA_RLE:
+    default: {
+        const uint8_t c = chain_pick_delta_rle(p, need_key, raw);
+        *codec_out = c;
+        *key_out = c != ESPGPU_CODEC_DELTA_RLE;
+        return espgpu_encode_update(cur, g_gpu.shadow, raw, 2, c, sl->buf, sl->cap, res);
+    }
+    }
+}
+
 /** core 的 PRESENT 回调：在命令任务上下文执行 */
 static void on_core_present(void *user, const uint16_t *pixels, uint16_t w, uint16_t h)
 {
@@ -536,16 +666,13 @@ static void on_core_present(void *user, const uint16_t *pixels, uint16_t w, uint
     send_slot_t *sl = &s_slots[slot];
 
     const bool key_req = take_keyframe_request();
-    const uint8_t codec =
-        chain_pick_codec(&s_chain_prod, &s_chain_tx, g_gpu.frame_codec, key_req, raw);
+    const bool need_key = chain_need_key(&s_chain_prod, &s_chain_tx, key_req);
 
-    /* 只有 DELTA_RLE 对 shadow 做差分；编码的同一遍把 shadow 更新成这一帧
-     * （关键帧则编码后整帧拷贝）。主机只会在这一帧之后收到基于它的差分帧 ——
-     * 这一帧要是没发出去，发送任务会断链并丢掉后面的差分帧（frame_chain.h）。 */
-    espgpu_fb_encode_result_t res;
     const int64_t t0 = esp_timer_get_time();
-    esp_err_t err = espgpu_encode_update((const uint8_t *)pixels, g_gpu.shadow, raw, 2, codec,
-                                         sl->buf, sl->cap, &res);
+    uint8_t codec;
+    bool key;
+    espgpu_fb_encode_result_t res = {0};
+    esp_err_t err = encode_frame(pixels, w, h, raw, need_key, sl, &codec, &key, &res);
     g_gpu.stats.t_encode_us = (uint32_t)(esp_timer_get_time() - t0);
     if (err != ESP_OK) {
         /* shadow 可能已被部分更新，必须重建参考帧 */
@@ -554,7 +681,7 @@ static void on_core_present(void *user, const uint16_t *pixels, uint16_t w, uint
         xQueueSend(s_free_q, &slot, 0);
         return;
     }
-    chain_produced(&s_chain_prod, codec, res.enc_bytes);
+    chain_produced(&s_chain_prod, key, codec, res.enc_bytes);
 
     sl->enc_len = res.enc_bytes;
     sl->raw_len = res.raw_bytes;
@@ -562,23 +689,10 @@ static void on_core_present(void *user, const uint16_t *pixels, uint16_t w, uint
     sl->w = w;
     sl->h = h;
     sl->codec = codec;
+    sl->key = key;
     g_gpu.stats.frame_raw_bytes = res.raw_bytes;
     g_gpu.stats.frame_enc_bytes = res.enc_bytes;
     xQueueSend(s_send_q, &slot, portMAX_DELAY);
-}
-
-static uint32_t st_raster(void)
-{
-    espgpu_stats_t s = {0};
-    gpu_core_fill_stats(g_gpu.core, &s);
-    return s.t_raster_us;
-}
-
-static uint32_t st_tnl(void)
-{
-    espgpu_stats_t s = {0};
-    gpu_core_fill_stats(g_gpu.core, &s);
-    return s.t_tnl_us;
 }
 
 void espgpu_gpu_sender_task(void *arg)
@@ -591,7 +705,7 @@ void espgpu_gpu_sender_task(void *arg)
             continue;
         }
         send_slot_t *sl = &s_slots[slot];
-        if (!chain_tx_should_send(&s_chain_tx, sl->codec)) {
+        if (!chain_tx_should_send(&s_chain_tx, sl->key)) {
             /* 断链后的差分帧：参考帧主机没有，发了只会花屏 */
             g_gpu.stats.frames_dropped++;
             xQueueSend(s_free_q, &slot, portMAX_DELAY);
@@ -602,7 +716,7 @@ void espgpu_gpu_sender_task(void *arg)
                                    ESPGPU_FMT_RGB565, sl->frame_id);
         g_gpu.stats.t_usb_us = (uint32_t)(esp_timer_get_time() - t0);
         /* 先记结果再还槽位：命令任务拿到这个槽位时一定已经看得到 fail_seq */
-        chain_tx_done(&s_chain_tx, sl->codec, err == ESP_OK);
+        chain_tx_done(&s_chain_tx, sl->key, err == ESP_OK);
         if (err == ESP_OK) {
             g_gpu.stats.frames_presented++;
         } else {
@@ -610,13 +724,28 @@ void espgpu_gpu_sender_task(void *arg)
         }
         const uint32_t enc_len = sl->enc_len;
         const uint32_t raw_len = sl->raw_len;
+        const uint8_t codec = sl->codec;
+        const bool key = sl->key;
         xQueueSend(s_free_q, &slot, portMAX_DELAY);
 
         if (++dbg_frames % 30 == 0) {
-            ESP_LOGI(TAG, "frame %u: raster %u us  tnl %u us  encode %u us  usb %u us  enc %u/%u B",
-                     (unsigned)dbg_frames, (unsigned)st_raster(), (unsigned)st_tnl(),
+            /* 分段 profile（issue #2）：读 core 的统计是无锁的整数快照，偶尔撕裂无所谓 */
+            espgpu_stats_t cs = {0};
+            gpu_core_fill_stats(g_gpu.core, &cs);
+            ESP_LOGI(TAG,
+                     "frame %u: raster %u us  tnl %u us  encode %u us  usb %u us  enc %u/%u B "
+                     "codec %u%s",
+                     (unsigned)dbg_frames, (unsigned)cs.t_raster_us, (unsigned)cs.t_tnl_us,
                      (unsigned)g_gpu.stats.t_encode_us, (unsigned)g_gpu.stats.t_usb_us,
-                     (unsigned)enc_len, (unsigned)raw_len);
+                     (unsigned)enc_len, (unsigned)raw_len, (unsigned)codec, key ? " key" : "");
+            ESP_LOGI(TAG,
+                     "  stages: vtx %u clip %u setup %u bin %u tile %u tile_io %u us | "
+                     "tris %u culled %u | paths fill %u fast %u px %u generic %u | passes %u",
+                     (unsigned)cs.t_vtx_us, (unsigned)cs.t_clip_us, (unsigned)cs.t_setup_us,
+                     (unsigned)cs.t_bin_us, (unsigned)cs.t_tile_us, (unsigned)cs.t_tile_io_us,
+                     (unsigned)cs.triangles, (unsigned)cs.culled, (unsigned)cs.tris_fill,
+                     (unsigned)cs.tris_fast, (unsigned)cs.tris_px, (unsigned)cs.tris_generic,
+                     (unsigned)cs.raster_passes);
         }
     }
 }
@@ -828,6 +957,24 @@ static void confirm_running_app_once(void)
     }
 }
 
+/**
+ * 回到测试图案模式（issue #4）：以前 command_mode 一旦置位只有复位才清，跑过任何
+ * GL / demo 之后面板和 bench 就再也看不到帧。主机侧 WinUSB 是独占的，换一个程序打开设备
+ * （握手 GET_DEVICE_INFO）或者改模式（SET_MODE）都说明之前的命令流已经结束；
+ * 如果新程序接着发命令，handle_cmd_chunk 会重新进入命令模式并强制关键帧。
+ */
+static void leave_command_mode(void)
+{
+    if (!g_gpu.command_mode) {
+        return;
+    }
+    g_gpu.pattern_hold_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + 250u;
+    g_gpu.command_mode = false;
+    /* 测试图案路径的差分参考（fb 双缓冲）主机早就没有了，第一帧必须是关键帧 */
+    g_gpu.force_keyframe = true;
+    ESP_LOGI(TAG, "leaving command mode, test patterns resume");
+}
+
 static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint32_t extra_len)
 {
     uint16_t status = ESPGPU_OK;
@@ -840,6 +987,7 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         return;
 
     case ESPGPU_CTRL_GET_DEVICE_INFO: {
+        leave_command_mode(); /* espgpu_open() 的握手：新的主机程序接管了设备 */
         espgpu_device_info_t di;
         fill_device_info(&di);
         espgpu_usb_send_ctrl_resp(req->op, req->seq, ESPGPU_OK, &di, sizeof(di), 500);
@@ -861,6 +1009,8 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         if (extra_len >= sizeof(m)) {
             memcpy(&m, extra, sizeof(m));
         }
+        /* 命令模式支持 BLOCK / AUTO；测试图案路径（sanitize_mode）只支持到 DELTA_RLE */
+        const uint8_t req_codec = m.codec;
         m = sanitize_mode(&m);
         /* 命令模式的屏幕目标由命令任务（也就是这里）拥有，直接改 */
         if (g_gpu.core) {
@@ -870,13 +1020,15 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
             }
             g_gpu.force_keyframe = true;
         }
-        if (m.codec <= ESPGPU_CODEC_DELTA_RLE) {
-            g_gpu.frame_codec = m.codec;
+        if (req_codec <= ESPGPU_CODEC_AUTO && req_codec != ESPGPU_CODEC_TILE_DELTA) {
+            g_gpu.frame_codec = req_codec;
         }
         esp_err_t err = espgpu_gpu_set_mode(&m, (uint8_t)req->arg0);
         if (err != ESP_OK && status == ESPGPU_OK) {
             status = ESPGPU_ERR_NO_MEM;
         }
+        /* gpu_core_set_size 已经丢掉了未完成的分箱；测试图案在短暂延迟后恢复 */
+        leave_command_mode();
         break;
     }
 
@@ -944,7 +1096,7 @@ static void handle_ctrl(const espgpu_ctrl_req_t *req, const uint8_t *extra, uint
         break;
 
     case ESPGPU_CTRL_SET_CODEC:
-        if (req->arg0 <= ESPGPU_CODEC_DELTA_RLE) {
+        if (req->arg0 <= ESPGPU_CODEC_AUTO && req->arg0 != ESPGPU_CODEC_TILE_DELTA) {
             g_gpu.frame_codec = (uint8_t)req->arg0;
             g_gpu.force_keyframe = true;
         } else {
@@ -1007,17 +1159,27 @@ static void handle_cmd_chunk(const uint8_t *data, uint32_t len)
     g_gpu.stats.cmd_count++;
 }
 
-void espgpu_gpu_command_task(void *arg)
+/** 必须在命令任务里执行的控制请求：会改屏幕目标 / 核心状态 / 发送槽位 */
+static bool ctrl_needs_cmd_task(uint16_t op)
+{
+    return op == ESPGPU_CTRL_SET_MODE || op == ESPGPU_CTRL_SET_DEBUG_VIEW;
+}
+
+void espgpu_gpu_rx_task(void *arg)
 {
     (void)arg;
-
-    espgpu_chunk_hdr_t hdr;
+    int b = -1;
 
     while (1) {
-        drain_logs();
+        if (b < 0 && xQueueReceive(s_rx_free_q, &b, pdMS_TO_TICKS(100)) != pdTRUE) {
+            /* 命令任务手上压着所有缓冲（主机提交得比设备快）：不读 USB 就是背压 */
+            b = -1;
+            continue;
+        }
 
+        rx_item_t it;
         esp_err_t err =
-            espgpu_usb_read_chunk(&hdr, s_cmd_buf, ESPGPU_CHUNK_MAX_PAYLOAD, 100);
+            espgpu_usb_read_chunk(&it.hdr, s_rx_buf[b], ESPGPU_CHUNK_MAX_PAYLOAD, 100);
         if (err == ESP_ERR_TIMEOUT) {
             espgpu_gpu_sample_stats();
             continue;
@@ -1027,21 +1189,63 @@ void espgpu_gpu_command_task(void *arg)
             continue;
         }
 
-        switch (hdr.type) {
-        case ESPGPU_CHUNK_CTRL:
-            if (hdr.length >= sizeof(espgpu_ctrl_req_t)) {
-                espgpu_ctrl_req_t req;
-                memcpy(&req, s_cmd_buf, sizeof(req));
-                handle_ctrl(&req, s_cmd_buf + sizeof(req), hdr.length - sizeof(req));
-                confirm_running_app_once();
-            } else {
+        switch (it.hdr.type) {
+        case ESPGPU_CHUNK_CTRL: {
+            if (it.hdr.length < sizeof(espgpu_ctrl_req_t)) {
                 g_gpu.stats.host_errors++;
+                break;
+            }
+            espgpu_ctrl_req_t req;
+            memcpy(&req, s_rx_buf[b], sizeof(req));
+            if (ctrl_needs_cmd_task(req.op)) {
+                it.kind = RX_CTRL;
+                it.buf = (uint8_t)b;
+                xQueueSend(s_rx_work_q, &it, portMAX_DELAY);
+                b = -1;
+            } else {
+                handle_ctrl(&req, s_rx_buf[b] + sizeof(req), it.hdr.length - sizeof(req));
+                confirm_running_app_once();
             }
             break;
+        }
+        case ESPGPU_CHUNK_CMD:
+        case ESPGPU_CHUNK_DATA:
+            it.kind = it.hdr.type == ESPGPU_CHUNK_CMD ? RX_CMD : RX_DATA;
+            it.buf = (uint8_t)b;
+            xQueueSend(s_rx_work_q, &it, portMAX_DELAY);
+            b = -1;
+            break;
+        default:
+            g_gpu.stats.host_errors++;
+            break;
+        }
+    }
+}
 
-        case ESPGPU_CHUNK_CMD: {
+void espgpu_gpu_command_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        drain_logs();
+
+        rx_item_t it;
+        if (xQueueReceive(s_rx_work_q, &it, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+        uint8_t *payload = s_rx_buf[it.buf];
+
+        switch (it.kind) {
+        case RX_CTRL: {
+            espgpu_ctrl_req_t req;
+            memcpy(&req, payload, sizeof(req));
+            handle_ctrl(&req, payload + sizeof(req), it.hdr.length - sizeof(req));
+            confirm_running_app_once();
+            break;
+        }
+        case RX_CMD: {
             uint32_t len = 0;
-            const uint8_t *p = unpack(&hdr, s_cmd_buf, &len);
+            const uint8_t *p = unpack(&it.hdr, payload, &len);
             if (p) {
                 handle_cmd_chunk(p, len);
             } else {
@@ -1049,10 +1253,9 @@ void espgpu_gpu_command_task(void *arg)
             }
             break;
         }
-
-        case ESPGPU_CHUNK_DATA: {
+        case RX_DATA: {
             uint32_t len = 0;
-            const uint8_t *p = unpack(&hdr, s_cmd_buf, &len);
+            const uint8_t *p = unpack(&it.hdr, payload, &len);
             if (p) {
                 gpu_core_data(g_gpu.core, p, len);
             } else {
@@ -1060,11 +1263,12 @@ void espgpu_gpu_command_task(void *arg)
             }
             break;
         }
-
         default:
-            g_gpu.stats.host_errors++;
             break;
         }
+
+        const int b = it.buf;
+        xQueueSend(s_rx_free_q, &b, portMAX_DELAY);
     }
 }
 
@@ -1081,9 +1285,21 @@ esp_err_t espgpu_gpu_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_cmd_buf = heap_caps_malloc(ESPGPU_CHUNK_MAX_PAYLOAD, MALLOC_CAP_SPIRAM);
+    s_rx_free_q = xQueueCreate(RX_POOL, sizeof(int));
+    s_rx_work_q = xQueueCreate(RX_POOL, sizeof(rx_item_t));
+    if (s_rx_free_q == NULL || s_rx_work_q == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < RX_POOL; i++) {
+        s_rx_buf[i] = heap_caps_malloc(ESPGPU_CHUNK_MAX_PAYLOAD, MALLOC_CAP_SPIRAM);
+        if (s_rx_buf[i] == NULL) {
+            ESP_LOGE(TAG, "rx buffer alloc failed");
+            return ESP_ERR_NO_MEM;
+        }
+        xQueueSend(s_rx_free_q, &i, 0);
+    }
     s_lz_buf = heap_caps_malloc(LZ_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (s_cmd_buf == NULL || s_lz_buf == NULL) {
+    if (s_lz_buf == NULL) {
         ESP_LOGE(TAG, "command buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }

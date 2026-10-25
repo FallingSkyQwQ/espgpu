@@ -37,6 +37,9 @@ typedef struct {
     uint8_t *shadow;               /**< PSRAM，上一帧已编码内容（差分参考） */
     size_t shadow_bytes;
     volatile bool command_mode;    /**< true = 由命令流驱动，停掉测试图案 */
+    /** 退出命令模式后，测试图案在这个时刻（esp_timer 毫秒，回绕比较）之前不出帧：
+     *  前端常见的顺序是 SET_MODE 紧跟着命令流，不应该先闪一帧测试图案（issue #4） */
+    volatile uint32_t pattern_hold_until_ms;
     uint8_t frame_codec;           /**< PRESENT 时使用的编码 */
     /* 关键帧 / 差分链的簿记见 gpu.c 的 s_chain_*（frame_chain.h） */
 
@@ -67,6 +70,9 @@ void espgpu_gpu_present_task(void *arg);
 
 /** 命令处理任务：读 Chunk、分发、回响应。 */
 void espgpu_gpu_command_task(void *arg);
+
+/** 接收任务：读 USB chunk，控制请求当场处理，命令 / 数据排队给命令任务（issue #3）。 */
+void espgpu_gpu_rx_task(void *arg);
 
 /** 帧发送任务：把命令模式编码好的帧发出去，与下一帧的命令执行重叠。 */
 void espgpu_gpu_sender_task(void *arg);
