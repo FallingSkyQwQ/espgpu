@@ -137,7 +137,7 @@ void app_main(void)
          * 命令模式下那里的测试图案任务是空闲的。 */
         /* 优先级高于 core1 上的光栅 / 编码 worker（8）：发送任务大部分时间阻塞在 USB 上，
          * 但 TX FIFO 只有 8 KB（~11 ms），被 worker 压住时上行会断流 */
-        {espgpu_gpu_sender_task, "gpu_send", 4096, 9, 1},
+        {espgpu_gpu_sender_task, "gpu_send", 4096, 7, 1},
     };
     for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
         if (xTaskCreatePinnedToCore(tasks[i].fn, tasks[i].name, tasks[i].stack, NULL,

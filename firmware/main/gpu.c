@@ -764,7 +764,14 @@ static esp_err_t encode_frame(const uint16_t *pixels, uint16_t w, uint16_t h, si
             /* 关键帧（周期性兜底 / 主机要求）允许超预算几倍：只是偶尔一帧慢一点，
              * 不值得为此把静止画面降成有损 */
             const uint32_t limit = need_key ? budget * CHAIN_AUTO_REFRESH_SLACK : budget;
-            if (err == ESP_OK && res->enc_bytes <= limit) {
+            /* 即便放得进预算，也不要把整条链路吃满：无损帧的预估 USB 时间超过
+             * 渲染忙碌时间的一半时，发送会和下一帧的 raster 抢 CPU，改发 BLOCK
+             * 往往更快（例如 demo3d：80 KB 无损帧 ≈ 111 ms USB，raster ≈ 72 ms）。 */
+            const uint32_t usb_us =
+                (uint32_t)((uint64_t)res->enc_bytes * 1000000u / CHAIN_AUTO_LINK_BPS);
+            const bool link_heavy =
+                !need_key && s_prod_us && (uint64_t)usb_us * 2u > (uint64_t)s_prod_us;
+            if (err == ESP_OK && res->enc_bytes <= limit && !link_heavy) {
                 *codec_out = c;
                 *key_out = need_key;
                 return ESP_OK;
