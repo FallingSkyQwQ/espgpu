@@ -1122,24 +1122,44 @@ void swap_buffers()
         d.target_h = d.height;
         d.vp_valid = d.sc_valid = false;
     }
+    /* 背压：设备比应用慢时（例如片元 VM 的重 shader，一帧要 1 秒以上），
+     * 必须在提交这一帧之前把上一帧等完。否则命令会一直往设备 RX FIFO 里堆，
+     * 画面永远停在几千帧之前。swap_interval > 0 时给足时间；超时说明设备
+     * 确实跟不上，这一帧直接丢掉，下一轮再试。 */
+    const int wait_ms = c->swap_interval > 0 ? 5000 : 30;
+    if (d.inflight) {
+        const int rc = espgpu_wait_frame(d.dev, d.inflight_before, wait_ms);
+        d.inflight = false;
+        if (rc == 0) {
+            espgpu_cmd_discard(d.dev);
+            if (c->hwnd) {
+                RECT rc2;
+                GetClientRect(c->hwnd, &rc2);
+                c->win_w = std::max(1, static_cast<int>(rc2.right - rc2.left));
+                c->win_h = std::max(1, static_cast<int>(rc2.bottom - rc2.top));
+                HDC dc = GetDC(c->hwnd);
+                if (dc) {
+                    espgpu_blit_to_hdc(d.dev, dc, c->win_w, c->win_h);
+                    ReleaseDC(c->hwnd, dc);
+                }
+            }
+            return;
+        }
+    }
+
     const uint32_t before = espgpu_frame_id(d.dev);
     espgpu_cmd_present(d.dev, 500);
     d.frame_counter++;
+    d.inflight_before = before;
+    d.inflight = true;
 
     /*
-     * 节奏：允许一帧在路上。等的是上一次 PRESENT 的那一帧，这样应用准备第 N+1 帧的命令时
-     * 设备还在光栅 / 编码 / 回传第 N 帧（设备侧本来就是双槽流水），而不是每帧串行地
-     * "主机提交 → 设备算完 → 回传完" 再开始下一帧。ESPGPU_GLES_SYNC=1 恢复逐帧同步。
-     * 等待有上限，避免设备卡住时拖死应用。
+     * ESPGPU_GLES_SYNC=1 时逐帧同步：这一帧发出去就等它画完，
+     * 不再和下一次提交重叠。
      */
-    const int wait_ms = c->swap_interval > 0 ? 200 : 30;
     if (d.sync_swap) {
         espgpu_wait_frame(d.dev, before, wait_ms);
         d.inflight = false;
-    } else {
-        if (d.inflight) espgpu_wait_frame(d.dev, d.inflight_before, wait_ms);
-        d.inflight_before = before;
-        d.inflight = true;
     }
 
     if (c->hwnd) {

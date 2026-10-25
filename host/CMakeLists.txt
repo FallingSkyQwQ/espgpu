@@ -95,6 +95,8 @@ target_link_libraries(espgpu-bench PRIVATE espgpu)
 
 # ── espgpu-core-test.exe — 设备核心的渲染冒烟测试（不需要硬件） ────────
 add_executable(espgpu-core-test tests/core_test.c)
+# shared/ 头文件里的 _Static_assert 需要 C11；MSVC 默认的 C 方言不支持
+set_target_properties(espgpu-core-test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_link_libraries(espgpu-core-test PRIVATE espgpu_core)
 if(NOT MSVC)
     target_link_libraries(espgpu-core-test PRIVATE m)

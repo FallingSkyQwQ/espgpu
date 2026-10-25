@@ -496,7 +496,7 @@ int main(int argc, char **argv)
         if (frames % (static_cast<uint64_t>(fps) * 4) == 0) {
             const espgpu_link_stats_t *ls = espgpu_link_stats(dev);
             espgpu_stats_t ds{};
-            const bool have = espgpu_get_stats(dev, &ds, 200) == 0;
+            const bool have = espgpu_get_stats(dev, &ds, 1000) == 0;
             printf("frames %llu  %.1f fps  up %.0f KB/s  down %.0f KB/s",
                    static_cast<unsigned long long>(frames), ls->fps, ls->in_kbps, ls->out_kbps);
             if (have) {

@@ -38,4 +38,6 @@ endif()
 
 add_custom_command(TARGET espgpu-panel POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-panel>)
+            $<TARGET_FILE:espgpu> $<TARGET_FILE_DIR:espgpu-panel>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:espgpu-panel> $<TARGET_FILE_DIR:espgpu>)

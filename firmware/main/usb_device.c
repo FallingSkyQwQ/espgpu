@@ -391,12 +391,13 @@ bool espgpu_usb_ready(void)
 
 /* ── TinyUSB 回调 ────────────────────────────────────────────────── */
 
-/* 0.21 起 bufsize 是 uint32_t（FIFO 模式下 buffer/bufsize 为 NULL/0，数据在 RX FIFO 里）。
+/* FIFO 模式下 buffer/bufsize 为 NULL/0，数据在 RX FIFO 里。
+ * bufsize 的类型由 CFG_TUD_API_V0_19_COMPAT 决定（默认 1 → uint16_t），
  * 签名必须和 tusb 的声明一致，否则编译报 conflicting types。 */
-#if TUSB_VERSION_NUMBER >= 2100
-void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint32_t bufsize)
-#else
+#if CFG_TUD_API_V0_19_COMPAT
 void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint16_t bufsize)
+#else
+void tud_vendor_rx_cb(uint8_t idx, const uint8_t *buffer, uint32_t bufsize)
 #endif
 {
     (void)idx;

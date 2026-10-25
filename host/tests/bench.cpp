@@ -82,9 +82,12 @@ int run_case(espgpu_device_t *dev, uint16_t w, uint16_t h, uint8_t format, uint8
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
     const auto t0 = std::chrono::steady_clock::now();
-    const espgpu_link_stats_t *ls = espgpu_link_stats(dev);
-    const uint32_t frames0 = ls->frames_received;
-    const uint32_t bytes0 = ls->bytes_in;
+    /* 注意：espgpu_link_stats() 返回的是加锁拷贝出来的快照，必须在采样时刻重新调用；
+     * 缓存指针会一直读到 t0 那一次的值。 */
+    espgpu_link_stats_t ls0{};
+    espgpu_get_link_stats(dev, &ls0);
+    const uint32_t frames0 = ls0.frames_received;
+    const uint32_t bytes0 = ls0.bytes_in;
 
     while (true) {
         const auto now = std::chrono::steady_clock::now();
@@ -96,8 +99,10 @@ int run_case(espgpu_device_t *dev, uint16_t w, uint16_t h, uint8_t format, uint8
 
     const auto t1 = std::chrono::steady_clock::now();
     const double elapsed = std::chrono::duration<double>(t1 - t0).count();
-    const uint32_t frames = ls->frames_received - frames0;
-    const uint32_t bytes = ls->bytes_in - bytes0;
+    espgpu_link_stats_t ls1{};
+    espgpu_get_link_stats(dev, &ls1);
+    const uint32_t frames = ls1.frames_received - frames0;
+    const uint32_t bytes = ls1.bytes_in - bytes0;
 
     espgpu_stats_t ds{};
     const bool have_stats = espgpu_get_stats(dev, &ds, 500) == 0;
