@@ -29,10 +29,11 @@ void impl_glClear(GLbitfield mask)
         set_error(GL_INVALID_OPERATION);
         return;
     }
-    flush_pending(c);
     if (g_sh.dev == nullptr) {
         return;
     }
+    std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
+    flush_pending(c);
     sync_viewport_scissor(c);
     uint8_t flags = 0;
     const State &s = c->st;
@@ -52,6 +53,7 @@ void impl_glClear(GLbitfield mask)
 void impl_glFlush(void)
 {
     ESPGL_CTX(c);
+    std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
     flush_pending(c);
     if (g_sh.dev) {
         espgpu_cmd_flush(g_sh.dev, 200);
@@ -61,10 +63,11 @@ void impl_glFlush(void)
 void impl_glFinish(void)
 {
     ESPGL_CTX(c);
-    flush_pending(c);
     if (g_sh.dev == nullptr) {
         return;
     }
+    std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
+    flush_pending(c);
     const uint32_t v = ++g_sh.fence;
     espgpu_cmd_fence(g_sh.dev, v);
     espgpu_cmd_flush(g_sh.dev, 500);
@@ -93,6 +96,7 @@ void impl_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GL
     }
     if (g_sh.dev) {
         /* 读回的是设备最近一帧：先把当前内容呈现出来 */
+        std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
         flush_pending(c);
         espgpu_cmd_present(g_sh.dev, 1000);
         if (espgpu_wait_frame(g_sh.dev, g_sh.last_frame_id, 500) == 1) {
@@ -232,7 +236,7 @@ void impl_glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type
     c->modelview.top() = Mat4::identity();
     c->projection.top() = Mat4::identity();
     c->texmat[0].top() = Mat4::identity();
-    c->dc.mvp_valid = false;
+    c->key_dirty = true;
 
     /* 窗口坐标 → NDC（以当前视口为准，和 GL 的定义一致） */
     const float vx = static_cast<float>(s.viewport[0]), vy = static_cast<float>(s.viewport[1]);
@@ -264,7 +268,7 @@ void impl_glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type
     c->modelview.top() = mv;
     c->projection.top() = pj;
     c->texmat[0].top() = tm;
-    c->dc.mvp_valid = false;
+    c->key_dirty = true;
 }
 
 void impl_glCopyPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type)

@@ -8,9 +8,11 @@
  *
  * 绘制路径：
  *   glBegin/glEnd、glDrawArrays/Elements、glCallList 都汇成 emit()，追加进 Pending 批次。
- *   影响绘制的状态真正变化时先 flush_pending()（用旧状态把批次发掉）再改状态。
- *   flush 时一次性同步设备状态（视口/裁剪/管线/纹理/光照），按 PLAN §2 的带宽预算
- *   把顶点压成 12 字节左右，再 espgpu_cmd_draw。
+ *   状态变化只做标记（state_changed）；出几何时 begin_geometry 把当前状态解析成 DrawKey，
+ *   与批次的比较：相同就继续合批，不同就另开批次（可重排的旧批次暂存在 parked 里，之后同状态的几何还能并回去）。
+ *   每个批次带着开始时的状态快照和矩阵，flush 时换上快照同步设备（视口/裁剪/管线/纹理/光照），
+ *   按 PLAN §2 的带宽预算把顶点压成 12 字节左右，再 espgpu_cmd_draw。
+ *   改纹理数据 / 清屏 / 呈现等是顺序屏障：flush_pending 把所有批次按开始的先后发出。
  */
 
 #pragma once
@@ -284,6 +286,7 @@ struct Texture {
     bool upload = true;       /* 需要上传到设备 */
     bool resident = false;
     bool device_only = false; /* glCopyTexImage 产生的内容只存在设备上 */
+    bool pal_changed = false; /* 调色板改过、设备上的还是旧的（不能走「图像没变就不重传」的捷径） */
     uint64_t last_used = 0;
     float priority = 1.0f;
     bool pin = false;         /* 当前这次绘制正要用：LRU 绝不换出 */
@@ -314,6 +317,13 @@ struct ListOp {
     int batch = -1;
 };
 
+/** 显示列表里连续的三角形类几何（中间没有状态命令）：缓存后合成一条带索引的 DRAW */
+struct ListRun {
+    int first_op = 0, last_op = 0; /* ops 下标，闭区间 */
+    uint32_t base_vertex = 0, vertex_count = 0;
+    uint32_t index_offset = 0, index_count = 0;
+};
+
 struct DisplayList {
     std::vector<ListOp> ops;
     std::vector<ListBatch> batches;
@@ -326,6 +336,11 @@ struct DisplayList {
     double origin[3] = {0, 0, 0};
     bool pos_f32 = false;
     uint32_t replays = 0;
+    std::vector<ListRun> runs;
+    std::vector<int> run_at;   /* ops 下标 → runs 下标（-1 = 不是某个 run 的开头） */
+    uint32_t buffer_bytes = 0;
+    uint64_t last_used = 0;    /* 帧号，设备缓冲 LRU 用 */
+    int evictions = 0;         /* 被设备换出的次数：反复换出就不再缓存 */
 };
 
 /** 正在录制的列表 */
@@ -341,6 +356,22 @@ struct Recorder {
 
 /* ── 待发批次 ─────────────────────────────────────────────────────── */
 
+/** GL 状态解析到设备侧的结果（resolve_key）。相等 = 对设备没区别，几何可以合批。 */
+struct DrawKey {
+    espgpu_pipeline_t p;
+    espgpu_pipeline_fog_t fog;
+    espgpu_pipeline_ext_t ext;
+    int16_t vp[4], sc[4];
+    float dr[2];
+    const Texture *tex[kMaxUnits];
+    int units[kMaxUnits];
+    uint8_t filt[kMaxUnits], wrap[kMaxUnits];
+    int nu;
+    bool white;
+    bool reorder_ok; /* 不透明 + 深度测试写深度：和同类批次之间可以重排 */
+    uint64_t light_sig;
+};
+
 enum PrimClass {
     PCLS_NONE = 0,
     PCLS_QUADS = 1,  /* ESPGPU_PRIM_QUADS，无索引 */
@@ -350,6 +381,16 @@ enum PrimClass {
 };
 
 struct Pending {
+    /* 批次开始时的状态快照：flush 用它（而不是 flush 时刻的当前状态）同步设备。
+     * 状态变化不必立刻 flush——下一次出几何时再比较 DrawKey，对设备没区别就继续合批。 */
+    State st;
+    DrawKey key{};
+    uint64_t seq = 0;
+    /* 批次所在的变换：flush 用它算 MVP（而不是 flush 时刻的当前矩阵）。
+     * 之后来的几何若只是 modelview 差一个仿射变换，就在主机上把顶点变换进本批次的坐标系，继续合批。 */
+    Mat4 mv = Mat4::identity(), proj = Mat4::identity();
+    Mat4 mv_inv = Mat4::identity();
+    bool mv_inv_ok = false;
     std::vector<Vertex> quads;
     std::vector<Vertex> tri_v;
     std::vector<uint16_t> tri_i;
@@ -368,6 +409,7 @@ struct Pending {
         line_i.clear();
         points.clear();
         classes = 0;
+        mv_inv_ok = false;
     }
 };
 
@@ -382,6 +424,8 @@ struct DevCache {
     bool layout_valid = false;
     float mvp[16] = {};
     bool mvp_valid = false;
+    double origin[3] = {0, 0, 0}; /* 设备 MVP 里折进去的批次原点（I16 位置的量化坐标系） */
+    bool origin_valid = false;
     float normal_m[16] = {};
     bool normal_valid = false;
     uint8_t color[4] = {255, 255, 255, 255};
@@ -436,13 +480,20 @@ struct Context {
     std::unique_ptr<Recorder> rec;
     int replay_depth = 0;
 
-    Pending pending;
+    Pending pending;                 /* 正在接收几何的批次 */
+    std::vector<Pending> parked;     /* 暂存的可重排批次（DrawKey 各不相同），按 seq 顺序发出 */
+    bool key_dirty = true;           /* 状态变过：下一次出几何前要重新解析 DrawKey */
+    uint64_t batch_seq = 0;
+    std::vector<uint8_t> scratch_blob;
     DevCache dc;
 
     /* glLockArraysEXT */
     bool arrays_locked = false;
 
     int swap_interval = 1;
+
+    /* wglMakeCurrent：当前绑在哪个线程上（0 = 没有）。WGL 规定一个上下文同时只能在一个线程上当前 */
+    DWORD owner_thread = 0;
 };
 
 /* ── 共享对象 ─────────────────────────────────────────────────────── */
@@ -459,6 +510,8 @@ struct Shared {
     std::map<GLuint, std::unique_ptr<DisplayList>> lists;
     uint32_t next_buffer_id = 1;
     std::unordered_map<uint32_t, GLuint> buffer_to_list;
+    uint32_t list_buffers = 0;       /* 设备上驻留的列表缓冲个数 / 字节（设备最多 256 个、固件预算 512 KB） */
+    uint64_t list_buffer_bytes = 0;
 
     /* 共享调色板（GL_SHARED_TEXTURE_PALETTE_EXT） */
     uint8_t shared_palette[256 * 4] = {};
@@ -500,8 +553,13 @@ void device_present(Context *c);
 /* 绘制 */
 void emit(Context *c, GLenum mode, const Vertex *v, size_t n);
 void emit_indexed(Context *c, GLenum mode, const Vertex *v, size_t nv, const uint32_t *idx, size_t ni);
-void flush_pending(Context *c);
-void state_dirty(Context *c);          /* 状态即将变化：先 flush */
+void flush_pending(Context *c);        /* 把所有待发批次（含暂存的）按顺序发出：命令顺序屏障 */
+void state_dirty(Context *c);          /* 即将改纹理数据之类：批次引用的东西要变，先全部 flush */
+void state_changed(Context *c);        /* 纯状态变化：只标记，下一次出几何时比较 DrawKey */
+void begin_geometry(Context *c);       /* 出几何前调用：按当前状态选 / 开批次 */
+void flush_current(Context *c);        /* 只发当前批次（它和暂存批次之间可重排时用） */
+void resolve_key(Context *c, DrawKey &k);
+bool key_equal(const DrawKey &a, const DrawKey &b);
 bool sync_device_state(Context *c, int *shade_out, bool *force_white, int dev_units[2], int *n_units);
 void sync_viewport_scissor(Context *c);
 void fetch_array_vertex(Context *c, GLint i, Vertex &out);

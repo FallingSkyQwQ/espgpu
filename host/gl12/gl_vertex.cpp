@@ -46,6 +46,9 @@ void apply_color_material(Context *c)
     if (!s.color_material) {
         return;
     }
+    if (s.lighting) {
+        c->key_dirty = true; /* 材质参与光照签名 */
+    }
     for (int f = 0; f < 2; f++) {
         if ((f == 0 && s.color_material_face == GL_BACK) || (f == 1 && s.color_material_face == GL_FRONT)) {
             continue;
@@ -596,15 +599,24 @@ static void record_array_batch(Context *c, GLenum mode, std::vector<Vertex> &&v)
 void impl_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
     ESPGL_CTX(c);
-    if (count <= 0 || !c->cs.vertex.enabled) {
+    if (count < 0 || first < 0) {
+        set_error(GL_INVALID_VALUE);
         return;
     }
-    std::vector<Vertex> v(static_cast<size_t>(count));
+    if (mode > GL_POLYGON) {
+        set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (count == 0 || !c->cs.vertex.enabled) {
+        return;
+    }
+    thread_local std::vector<Vertex> v;
+    v.resize(static_cast<size_t>(count));
     for (GLsizei k = 0; k < count; k++) {
         fetch_array_vertex(c, first + k, v[static_cast<size_t>(k)]);
     }
     if (rec_active(c)) {
-        std::vector<Vertex> copy = v;
+        std::vector<Vertex> copy(v.begin(), v.end());
         record_array_batch(c, mode, std::move(copy));
         if (list_compile_only(c)) {
             return;
@@ -641,10 +653,19 @@ static bool read_indices(GLsizei count, GLenum type, const void *indices, std::v
 
 static void draw_elements(Context *c, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
+    if (count < 0) {
+        set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (mode > GL_POLYGON) {
+        set_error(GL_INVALID_ENUM);
+        return;
+    }
     if (!c->cs.vertex.enabled) {
         return;
     }
-    std::vector<uint32_t> idx;
+    thread_local std::vector<uint32_t> idx; /* 每次调用复用，不在热路径上分配 */
+    thread_local std::vector<Vertex> v;
     if (!read_indices(count, type, indices, idx)) {
         return;
     }
@@ -658,12 +679,12 @@ static void draw_elements(Context *c, GLenum mode, GLsizei count, GLenum type, c
     /* 录制或区间稀疏时直接展开成非索引 */
     if (rec_active(c) || range > idx.size() * 2 || range > 4000 ||
         (mode != GL_TRIANGLES && mode != GL_LINES && mode != GL_POINTS)) {
-        std::vector<Vertex> v(idx.size());
+        v.resize(idx.size());
         for (size_t k = 0; k < idx.size(); k++) {
             fetch_array_vertex(c, static_cast<GLint>(idx[k]), v[k]);
         }
         if (rec_active(c)) {
-            std::vector<Vertex> copy = v;
+            std::vector<Vertex> copy(v.begin(), v.end());
             record_array_batch(c, mode, std::move(copy));
             if (list_compile_only(c)) {
                 return;
@@ -673,7 +694,7 @@ static void draw_elements(Context *c, GLenum mode, GLsizei count, GLenum type, c
         return;
     }
 
-    std::vector<Vertex> v(range);
+    v.resize(range);
     for (size_t k = 0; k < range; k++) {
         fetch_array_vertex(c, static_cast<GLint>(lo + k), v[k]);
     }
@@ -754,13 +775,8 @@ void impl_glInterleavedArrays(GLenum format, GLsizei stride, const GLvoid *point
 namespace {
 
 constexpr size_t kPendingMaxVerts = 6000;
+constexpr size_t kMaxParked = 48;
 
-bool reorder_ok(Context *c)
-{
-    const State &s = c->st;
-    return s.depth_test && s.depth_mask && !s.blend &&
-           (s.depth_func == GL_LESS || s.depth_func == GL_LEQUAL);
-}
 
 void quads_to_tris(Pending &p)
 {
@@ -785,10 +801,10 @@ int prepare(Context *c, int cls, size_t n)
 {
     Pending &p = c->pending;
     if (p.total() + n > kPendingMaxVerts) {
-        flush_pending(c);
+        flush_current(c); /* 批次（状态快照 / 坐标系）保留，只把几何发掉 */
     }
     const int others = p.classes & ~(1 << cls);
-    if (others == 0 || reorder_ok(c)) {
+    if (others == 0 || p.key.reorder_ok) {
         return cls;
     }
     /* 不允许重排：填充类只保留一种 */
@@ -802,29 +818,33 @@ int prepare(Context *c, int cls, size_t n)
             return PCLS_TRIS;
         }
     }
-    flush_pending(c);
+    flush_current(c);
     return cls;
 }
 
-void add_quad(Context *c, const Vertex &a, const Vertex &b, const Vertex &cc, const Vertex &d)
+/** fc 非空 = 平面着色：四个顶点都用激发顶点的颜色（转三角形后激发顶点会变，先抹平） */
+void add_quad(Context *c, const Vertex &a, const Vertex &b, const Vertex &cc, const Vertex &d, const float *fc)
 {
     const int cls = prepare(c, PCLS_QUADS, 4);
     Pending &p = c->pending;
+    std::vector<Vertex> &dst = cls == PCLS_QUADS ? p.quads : p.tri_v;
+    const size_t base = dst.size();
+    dst.push_back(a);
+    dst.push_back(b);
+    dst.push_back(cc);
+    dst.push_back(d);
+    if (fc) {
+        for (size_t k = base; k < base + 4; k++) {
+            memcpy(dst[k].color, fc, sizeof(dst[k].color));
+        }
+    }
     if (cls == PCLS_QUADS) {
-        p.quads.push_back(a);
-        p.quads.push_back(b);
-        p.quads.push_back(cc);
-        p.quads.push_back(d);
         p.classes |= 1 << PCLS_QUADS;
         return;
     }
-    const uint16_t base = static_cast<uint16_t>(p.tri_v.size());
-    p.tri_v.push_back(a);
-    p.tri_v.push_back(b);
-    p.tri_v.push_back(cc);
-    p.tri_v.push_back(d);
-    const uint16_t ix[6] = {base, static_cast<uint16_t>(base + 1), static_cast<uint16_t>(base + 2),
-                            base, static_cast<uint16_t>(base + 2), static_cast<uint16_t>(base + 3)};
+    const uint16_t b0 = static_cast<uint16_t>(base);
+    const uint16_t ix[6] = {b0, static_cast<uint16_t>(b0 + 1), static_cast<uint16_t>(b0 + 2),
+                            b0, static_cast<uint16_t>(b0 + 2), static_cast<uint16_t>(b0 + 3)};
     p.tri_i.insert(p.tri_i.end(), ix, ix + 6);
     p.classes |= 1 << PCLS_TRIS;
 }
@@ -864,10 +884,203 @@ void add_points(Context *c, const Vertex *v, size_t nv)
 
 } // namespace
 
+namespace {
+
+bool same_color(const Vertex &a, const Vertex &b)
+{
+    return memcmp(a.color, b.color, sizeof(a.color)) == 0;
+}
+
+bool is_affine(const Mat4 &r)
+{
+    if (std::fabs(r.m[3]) > 1e-12 || std::fabs(r.m[7]) > 1e-12 || std::fabs(r.m[11]) > 1e-12 ||
+        std::fabs(r.m[15] - 1.0) > 1e-12) {
+        return false;
+    }
+    for (double x : r.m) {
+        if (!std::isfinite(x) || std::fabs(x) > 1e7) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * 让新几何落进待发批次的坐标系：批次记着自己的 modelview / projection。
+ * 只是 modelview 变了（Doom 每块地板一个 glTranslatef）时把顶点在主机上变换过去继续合批，
+ * 不必为了换矩阵打断批次（省 DRAW 头 + SET_MATRIX）。开光照时法线也得跟着变，干脆不折叠。
+ */
+const Vertex *adopt_xform(Context *c, const Vertex *v, size_t n, std::vector<Vertex> &tmp)
+{
+    Pending &p = c->pending;
+    const Mat4 &mv = c->modelview.top();
+    const Mat4 &pj = c->projection.top();
+    if (p.empty()) {
+        p.mv = mv;
+        p.proj = pj;
+        p.mv_inv_ok = false;
+        return v;
+    }
+    const bool same_proj = memcmp(pj.m, p.proj.m, sizeof(pj.m)) == 0;
+    if (same_proj && memcmp(mv.m, p.mv.m, sizeof(mv.m)) == 0) {
+        return v;
+    }
+    if (same_proj && !c->st.lighting) {
+        if (!p.mv_inv_ok) {
+            p.mv_inv_ok = mat_inverse(p.mv, p.mv_inv);
+        }
+        if (p.mv_inv_ok) {
+            Mat4 r = mat_mul(p.mv_inv, mv);
+            /* 求逆带来的 1e-16 级噪声会让本来精确（如 1/128 网格）的坐标变得不精确：吸附到 2^-24 网格 */
+            for (double &x : r.m) {
+                const double q = std::nearbyint(x * 16777216.0) / 16777216.0;
+                if (std::fabs(q - x) <= 1e-9 * std::max(1.0, std::fabs(x))) {
+                    x = q;
+                }
+            }
+            if (is_affine(r)) {
+                if (tmp.data() != v) {
+                    tmp.assign(v, v + n);
+                }
+                for (Vertex &x : tmp) {
+                    const double in[4] = {x.pos[0], x.pos[1], x.pos[2], x.pos[3]};
+                    for (int row = 0; row < 3; row++) {
+                        x.pos[row] = static_cast<float>(r.m[row] * in[0] + r.m[4 + row] * in[1] +
+                                                        r.m[8 + row] * in[2] + r.m[12 + row] * in[3]);
+                    }
+                }
+                return tmp.data();
+            }
+        }
+    }
+    /* 折不进去：结束本批次（可重排就暂存，否则连同暂存的一起发掉），用同样的状态开新批次 */
+    if (p.key.reorder_ok && c->parked.size() < kMaxParked) {
+        Pending keep;
+        keep.st = p.st;
+        keep.key = p.key;
+        c->parked.push_back(std::move(p));
+        p = std::move(keep);
+    } else {
+        flush_pending(c);
+    }
+    p.seq = ++c->batch_seq;
+    p.mv = mv;
+    p.proj = pj;
+    p.mv_inv_ok = false;
+    return v;
+}
+
+void emit_impl(Context *c, GLenum mode, const Vertex *v, size_t n);
+
+} // namespace
+
+/** 纹理矩阵在出几何时就乘掉（与 GL 一样按顶点处理时的矩阵），批次里存的是最终纹理坐标 */
+const Vertex *apply_texmat(Context *c, const Vertex *v, size_t n, std::vector<Vertex> &tmp)
+{
+    bool any = false;
+    bool tm[kMaxUnits];
+    for (int u = 0; u < kMaxUnits; u++) {
+        tm[u] = !c->texmat[u].top().is_identity();
+        any = any || tm[u];
+    }
+    if (!any) {
+        return v;
+    }
+    if (tmp.data() != v) {
+        tmp.assign(v, v + n);
+    }
+    for (Vertex &x : tmp) {
+        for (int u = 0; u < kMaxUnits; u++) {
+            if (!tm[u]) {
+                continue;
+            }
+            float out[4];
+            mat_xform(c->texmat[u].top(), x.tc[u], out);
+            const float q = out[3] != 0.0f ? out[3] : 1.0f;
+            x.tc[u][0] = out[0] / q;
+            x.tc[u][1] = out[1] / q;
+            x.tc[u][2] = out[2] / q;
+            x.tc[u][3] = 1.0f;
+        }
+    }
+    return tmp.data();
+}
+
+void begin_geometry(Context *c)
+{
+    Pending &p = c->pending;
+    if (!c->key_dirty && !p.empty()) {
+        return;
+    }
+    DrawKey k;
+    resolve_key(c, k);
+    c->key_dirty = false;
+    if (!p.empty()) {
+        if (key_equal(k, p.key)) {
+            return;
+        }
+        if (p.key.reorder_ok && k.reorder_ok && c->parked.size() < kMaxParked) {
+            c->parked.push_back(std::move(p)); /* 可重排：暂存，后面同状态的几何还能并进去 */
+        } else {
+            flush_pending(c);
+        }
+        p = Pending();
+    }
+    if (!k.reorder_ok) {
+        /* 有次序要求的几何必须排在之前所有批次之后 */
+        flush_pending(c);
+    } else {
+        const Mat4 &pj = c->projection.top();
+        const Mat4 &mv = c->modelview.top();
+        for (size_t i = 0; i < c->parked.size(); i++) {
+            Pending &b = c->parked[i];
+            if (!key_equal(b.key, k) || memcmp(b.proj.m, pj.m, sizeof(pj.m)) != 0 ||
+                (c->st.lighting && memcmp(b.mv.m, mv.m, sizeof(mv.m)) != 0)) {
+                continue;
+            }
+            p = std::move(b);
+            c->parked.erase(c->parked.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
+    p.st = c->st;
+    p.key = k;
+    p.seq = ++c->batch_seq;
+    p.mv = c->modelview.top();
+    p.proj = c->projection.top();
+    p.mv_inv_ok = false;
+}
+
 void emit(Context *c, GLenum mode, const Vertex *v, size_t n)
 {
     if (n == 0) {
         return;
+    }
+    begin_geometry(c);
+    thread_local std::vector<Vertex> tmp;
+    tmp.clear();
+    v = apply_texmat(c, v, n, tmp);
+    v = adopt_xform(c, v, n, tmp);
+    emit_impl(c, mode, v, n);
+}
+
+namespace {
+
+void emit_impl(Context *c, GLenum mode, const Vertex *v, size_t n)
+{
+    if (n == 0) {
+        return;
+    }
+    /* GL 的平面着色取激发顶点的颜色：多边形是第一个顶点，其余图元是最后一个。
+     * 设备对三角形 / 线取最后一个、QUADS 取第 4 个；下面拆图元时保证两者一致。 */
+    const bool flat = c->st.shade_model == GL_FLAT;
+    std::vector<Vertex> poly;
+    if (flat && mode == GL_POLYGON && n >= 3) {
+        poly.assign(v, v + n);
+        for (Vertex &x : poly) {
+            memcpy(x.color, v[0].color, sizeof(x.color));
+        }
+        v = poly.data();
     }
     /* 超大的单个图元按块切开，保证 u16 索引与 pending 上限 */
     if (n > kPendingMaxVerts / 2) {
@@ -879,52 +1092,53 @@ void emit(Context *c, GLenum mode, const Vertex *v, size_t n)
             const size_t unit = mode == GL_POINTS ? 1 : mode == GL_LINES ? 2 : mode == GL_TRIANGLES ? 3 : 4;
             const size_t chunk = (kPendingMaxVerts / 2 / unit) * unit;
             for (size_t off = 0; off < n; off += chunk) {
-                emit(c, mode, v + off, std::min(chunk, n - off));
+                emit_impl(c, mode, v + off, std::min(chunk, n - off));
             }
             return;
         }
         default: {
-            /* 超长 strip / fan：先展开成列表再切块，避免 u16 索引越界 */
-            std::vector<Vertex> flat;
+            /* 超长 strip / fan：先展开成列表再切块，避免 u16 索引越界（顺序保持激发顶点在最后） */
+            std::vector<Vertex> flatv;
             GLenum list_mode = GL_TRIANGLES;
             if (mode == GL_LINE_STRIP || mode == GL_LINE_LOOP) {
                 list_mode = GL_LINES;
                 for (size_t i = 0; i + 1 < n; i++) {
-                    flat.push_back(v[i]);
-                    flat.push_back(v[i + 1]);
+                    flatv.push_back(v[i]);
+                    flatv.push_back(v[i + 1]);
                 }
                 if (mode == GL_LINE_LOOP) {
-                    flat.push_back(v[n - 1]);
-                    flat.push_back(v[0]);
+                    flatv.push_back(v[n - 1]);
+                    flatv.push_back(v[0]);
                 }
             } else if (mode == GL_TRIANGLE_STRIP) {
                 for (size_t i = 0; i + 2 < n; i++) {
-                    flat.push_back(v[(i & 1) ? i + 1 : i]);
-                    flat.push_back(v[(i & 1) ? i : i + 1]);
-                    flat.push_back(v[i + 2]);
+                    flatv.push_back(v[(i & 1) ? i + 1 : i]);
+                    flatv.push_back(v[(i & 1) ? i : i + 1]);
+                    flatv.push_back(v[i + 2]);
                 }
             } else if (mode == GL_QUAD_STRIP) {
                 list_mode = GL_QUADS;
                 for (size_t i = 0; i + 3 < n; i += 2) {
-                    flat.push_back(v[i]);
-                    flat.push_back(v[i + 1]);
-                    flat.push_back(v[i + 3]);
-                    flat.push_back(v[i + 2]);
+                    flatv.push_back(v[i + 2]);
+                    flatv.push_back(v[i]);
+                    flatv.push_back(v[i + 1]);
+                    flatv.push_back(v[i + 3]);
                 }
             } else { /* FAN / POLYGON */
                 for (size_t i = 1; i + 1 < n; i++) {
-                    flat.push_back(v[0]);
-                    flat.push_back(v[i]);
-                    flat.push_back(v[i + 1]);
+                    flatv.push_back(v[0]);
+                    flatv.push_back(v[i]);
+                    flatv.push_back(v[i + 1]);
                 }
             }
-            emit(c, list_mode, flat.data(), flat.size());
+            emit_impl(c, list_mode, flatv.data(), flatv.size());
             return;
         }
         }
     }
 
-    std::vector<uint32_t> idx;
+    thread_local std::vector<uint32_t> idx;
+    idx.clear();
     switch (mode) {
     case GL_POINTS:
         add_points(c, v, n);
@@ -952,11 +1166,15 @@ void emit(Context *c, GLenum mode, const Vertex *v, size_t n)
             idx.push_back(static_cast<uint32_t>(i + 1));
             idx.push_back(static_cast<uint32_t>(i + 2));
         }
-        add_tris(c, v, n, idx.data(), idx.size());
+        if (!idx.empty()) {
+            add_tris(c, v, n - n % 3, idx.data(), idx.size());
+        }
         return;
     case GL_TRIANGLE_STRIP:
-        if (n == 4) {
-            add_quad(c, v[0], v[1], v[3], v[2]);
+        if (n == 4 && (!flat || same_color(v[2], v[3]))) {
+            /* 4 顶点带 = 四边形，免索引。按 (1,3,2,0) 排：设备拆成 (1,3,2)(1,2,0)，
+             * 对角线 v1-v2 与 GL 的 strip 相同（非平面四边形也一致），绕序不变 */
+            add_quad(c, v[1], v[3], v[2], v[0], flat ? v[3].color : nullptr);
             return;
         }
         for (size_t i = 0; i + 2 < n; i++) {
@@ -969,12 +1187,14 @@ void emit(Context *c, GLenum mode, const Vertex *v, size_t n)
             }
             idx.push_back(static_cast<uint32_t>(i + 2));
         }
-        add_tris(c, v, n, idx.data(), idx.size());
+        if (!idx.empty()) {
+            add_tris(c, v, n, idx.data(), idx.size());
+        }
         return;
     case GL_TRIANGLE_FAN:
     case GL_POLYGON:
-        if (n == 4) {
-            add_quad(c, v[0], v[1], v[2], v[3]);
+        if (n == 4 && (!flat || mode == GL_POLYGON || same_color(v[2], v[3]))) {
+            add_quad(c, v[0], v[1], v[2], v[3], flat ? v[3].color : nullptr);
             return;
         }
         for (size_t i = 1; i + 1 < n; i++) {
@@ -982,16 +1202,19 @@ void emit(Context *c, GLenum mode, const Vertex *v, size_t n)
             idx.push_back(static_cast<uint32_t>(i));
             idx.push_back(static_cast<uint32_t>(i + 1));
         }
-        add_tris(c, v, n, idx.data(), idx.size());
+        if (!idx.empty()) {
+            add_tris(c, v, n, idx.data(), idx.size());
+        }
         return;
     case GL_QUADS:
         for (size_t i = 0; i + 3 < n; i += 4) {
-            add_quad(c, v[i], v[i + 1], v[i + 2], v[i + 3]);
+            add_quad(c, v[i], v[i + 1], v[i + 2], v[i + 3], flat ? v[i + 3].color : nullptr);
         }
         return;
     case GL_QUAD_STRIP:
+        /* 第 i 个四边形 (2i, 2i+1, 2i+3, 2i+2)，激发顶点 2i+3 放最后 */
         for (size_t i = 0; i + 3 < n; i += 2) {
-            add_quad(c, v[i], v[i + 1], v[i + 3], v[i + 2]);
+            add_quad(c, v[i + 2], v[i], v[i + 1], v[i + 3], flat ? v[i + 3].color : nullptr);
         }
         return;
     default:
@@ -1002,8 +1225,20 @@ void emit(Context *c, GLenum mode, const Vertex *v, size_t n)
     }
 }
 
+} // namespace
+
 void emit_indexed(Context *c, GLenum mode, const Vertex *v, size_t nv, const uint32_t *idx, size_t ni)
 {
+    if (nv == 0 || ni == 0) {
+        return;
+    }
+    thread_local std::vector<Vertex> tmp2;
+    if (mode == GL_TRIANGLES || mode == GL_LINES) {
+        begin_geometry(c);
+        tmp2.clear();
+        v = apply_texmat(c, v, nv, tmp2);
+        v = adopt_xform(c, v, nv, tmp2);
+    }
     switch (mode) {
     case GL_TRIANGLES:
         add_tris(c, v, nv, idx, ni - ni % 3);
@@ -1024,9 +1259,13 @@ void emit_indexed(Context *c, GLenum mode, const Vertex *v, size_t nv, const uin
 
 void state_dirty(Context *c)
 {
-    if (!c->pending.empty()) {
-        flush_pending(c);
-    }
+    flush_pending(c);
+    c->key_dirty = true;
+}
+
+void state_changed(Context *c)
+{
+    c->key_dirty = true;
 }
 
 } // namespace espgl

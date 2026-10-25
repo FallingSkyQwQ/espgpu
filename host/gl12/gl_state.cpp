@@ -19,7 +19,7 @@ template <typename T>
 inline void set_if(Context *c, T &field, const T &v)
 {
     if (!(field == v)) {
-        state_dirty(c);
+        state_changed(c);
         field = v;
     }
 }
@@ -27,7 +27,7 @@ inline void set_if(Context *c, T &field, const T &v)
 inline void set4(Context *c, float *dst, const float *src)
 {
     if (memcmp(dst, src, 4 * sizeof(float)) != 0) {
-        state_dirty(c);
+        state_changed(c);
         memcpy(dst, src, 4 * sizeof(float));
     }
 }
@@ -254,7 +254,7 @@ void impl_glDepthRange(GLclampd n, GLclampd f)
     const double nn = n < 0 ? 0 : (n > 1 ? 1 : n);
     const double ff = f < 0 ? 0 : (f > 1 ? 1 : f);
     if (c->st.depth_range[0] != nn || c->st.depth_range[1] != ff) {
-        state_dirty(c);
+        state_changed(c);
         c->st.depth_range[0] = nn;
         c->st.depth_range[1] = ff;
     }
@@ -287,7 +287,7 @@ void impl_glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a)
     ESPGL_RECORD(c, impl_glColorMask(r, g, b, a));
     const bool v[4] = {r != 0, g != 0, b != 0, a != 0};
     if (memcmp(v, c->st.color_mask, sizeof(v)) != 0) {
-        state_dirty(c);
+        state_changed(c);
         memcpy(c->st.color_mask, v, sizeof(v));
     }
 }
@@ -450,7 +450,7 @@ void impl_glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
     }
     const GLint v[4] = {x, y, w, h};
     if (memcmp(v, c->st.viewport, sizeof(v)) != 0) {
-        state_dirty(c);
+        state_changed(c);
         memcpy(c->st.viewport, v, sizeof(v));
     }
     c->viewport_init = true;
@@ -466,7 +466,7 @@ void impl_glScissor(GLint x, GLint y, GLsizei w, GLsizei h)
     }
     const GLint v[4] = {x, y, w, h};
     if (memcmp(v, c->st.scissor_box, sizeof(v)) != 0) {
-        state_dirty(c);
+        state_changed(c);
         memcpy(c->st.scissor_box, v, sizeof(v));
     }
 }
@@ -586,7 +586,7 @@ void impl_glLightfv(GLenum light, GLenum pname, const GLfloat *p)
             return;
         }
     }
-    state_dirty(c);
+    state_changed(c);
     LightState &L = c->st.lights[light - GL_LIGHT0];
     switch (pname) {
     case GL_AMBIENT: memcpy(L.ambient, p, 16); break;
@@ -688,7 +688,7 @@ void impl_glLightModelfv(GLenum pname, const GLfloat *p)
             return;
         }
     }
-    state_dirty(c);
+    state_changed(c);
     switch (pname) {
     case GL_LIGHT_MODEL_AMBIENT: memcpy(c->st.light_model_ambient, p, 16); break;
     case GL_LIGHT_MODEL_TWO_SIDE: c->st.light_model_two_side = p[0] != 0; break;
@@ -738,7 +738,7 @@ void impl_glMaterialfv(GLenum face, GLenum pname, const GLfloat *p)
             return;
         }
     }
-    state_dirty(c);
+    state_changed(c);
     for (int f = 0; f < 2; f++) {
         if ((f == 0 && face == GL_BACK) || (f == 1 && face == GL_FRONT)) {
             continue;
@@ -844,7 +844,7 @@ void impl_glPopAttrib(void)
         set_error(GL_STACK_UNDERFLOW);
         return;
     }
-    state_dirty(c);
+    state_changed(c);
     const AttribEntry e = c->attrib_stack.back();
     c->attrib_stack.pop_back();
     const GLbitfield m = e.mask;

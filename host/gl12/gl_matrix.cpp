@@ -107,22 +107,19 @@ void matrix_changed(Context *c)
     }
 }
 
-/* 改矩阵之前先把用旧矩阵攒的批次发掉 */
-static void pre_change(Context *c)
-{
-    state_dirty(c);
-}
-
+/* 改矩阵不需要 flush：待发批次记着自己的 modelview / projection（见 gl_vertex.cpp 的 adopt_xform），
+ * 纹理矩阵在出几何时就乘到了纹理坐标上 */
 static void load(Context *c, const Mat4 &m)
 {
-    pre_change(c);
     cur_matrix(c) = m;
     matrix_changed(c);
 }
 
 static void mult(Context *c, const Mat4 &m)
 {
-    pre_change(c);
+    if (m.is_identity()) {
+        return;
+    }
     Mat4 &t = cur_matrix(c);
     t = mat_mul(t, m);
     matrix_changed(c);
@@ -393,7 +390,6 @@ void impl_glPopMatrix(void)
         set_error(GL_STACK_UNDERFLOW);
         return;
     }
-    pre_change(c);
     s.s.pop_back();
     matrix_changed(c);
 }

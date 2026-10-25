@@ -96,6 +96,9 @@ def main():
     out.append('')
     for name, st in procs:
         out.append('- `%s` — %s' % (name, st))
+    # Windows 下重定向到文件时 stdout 是本地代码页（cp1252 / cp936），写不了 ✅ 之类：固定 UTF-8
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
     print('\n'.join(out))
 
 

@@ -44,18 +44,20 @@
 
 | GL | 设备 |
 |---|---|
-| 矩阵栈（modelview 32 / projection 4 / texture 4） | MVP = P·MV·T(批次原点) 发给 `SET_MATRIX`；纹理矩阵在主机上乘掉 |
-| `glBegin`/`glEnd`、顶点数组、`glDrawElements`、`glInterleavedArrays`、`glRect*` | 统一进待发批次；状态不变就一直合批 |
-| `GL_QUADS` / 4 顶点 strip / fan / polygon | `ESPGPU_PRIM_QUADS`（无索引） |
-| 其余三角形图元 | `TRIANGLES` + u16 索引 |
+| 矩阵栈（modelview 32 / projection 4 / texture 4） | MVP = P·MV·T(批次原点) 发给 `SET_MATRIX`；纹理矩阵在出几何时乘掉；改矩阵不打断批次（批次记着自己的矩阵，modelview 只差仿射变换时顶点在主机上变换进去） |
+| `glBegin`/`glEnd`、顶点数组、`glDrawElements`、`glInterleavedArrays`、`glRect*` | 统一进待发批次。状态变化只做标记，出几何时比较解析到设备侧的状态（`DrawKey`），没区别就继续合批；不透明 + 深度测试写深度的批次可暂存、按状态重排合并（其余状态、清屏、改纹理数据、`SwapBuffers` 等是顺序屏障） |
+| `GL_QUADS` / 4 顶点 strip / fan / polygon | `ESPGPU_PRIM_QUADS`（无索引；strip 按 GL 的对角线排；平面着色时保证激发顶点与 GL 一致） |
+| 其余三角形图元 | `TRIANGLES` + u16 索引（超过单条命令上限时前端按图元切开，不去索引化） |
 | 线 / 线带 / 线环、点 | `LINES` + 索引 / `POINTS`，宽度按窗口→设备比例缩放 |
-| 显示列表 | 闭包 + 几何批次；第 2 次回放起几何上传为设备缓冲（`DRAW` + `VSRC_BUFFER`） |
+| 显示列表 | 闭包 + 几何批次；第 2 次回放起几何上传为设备缓冲，连续三角形类几何合成一条带索引的 `DRAW(VSRC_BUFFER)`；缓冲按设备上限（256 个 / 512 KB）做 LRU |
 | blend / alpha test / depth / cull / front face / shade model / polygon offset | `PIPELINE` + `pipeline_ext`（深度偏移只能表达负偏移） |
 | fog（LINEAR / EXP / EXP2） | `PIPELINE` + `pipeline_fog`，设备用 clip w 作眼空间深度 |
 | 光照（≤ 4 盏，GL_COLOR_MATERIAL） | `LIGHTING` + `SET_MATRIX(NORMAL)`；点光源近似成方向光 |
 | 视口 / 裁剪（左下原点、窗口像素） | 按 窗口→设备 比例换算成左上原点 |
 | `glClear` | `CLEAR`（受裁剪与 color/depth mask 约束） |
 | `glCopyTexImage2D` / `glCopyTexSubImage2D` | `FBO COPY_TO_TEXTURE`（整张替换） |
+| `GL_COMBINE` 的 `ADD_SIGNED` | 第一层按调制、第二层（细节纹理）按透传近似 |
+| WGL | 上下文同时只能在一个线程上当前（`wglMakeCurrent` / `wglDeleteContext` 跨线程按 WGL 规则失败）；窗口最小化时保留上次的客户区尺寸；设备掉线后每秒重连一次 |
 | `glReadPixels` | PRESENT + 取回最近一帧，缩放到窗口坐标，按 pack 状态打包 |
 | `glDrawPixels` | 临时纹理 + 屏幕对齐四边形 |
 | `glFinish` / `glFlush` | `FENCE` + 等待 / 立即发出 |

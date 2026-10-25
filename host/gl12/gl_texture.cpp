@@ -131,10 +131,22 @@ void unpack_pixel(const uint8_t *p, GLenum type, int comps, bool swap, uint8_t o
     uint32_t raw0 = 0;
     for (int k = 0; k < comps && k < 4; k++) {
         const uint8_t *q = p + k * tb;
+        uint8_t sw[4];
+        if (swap && tb == 4) {
+            sw[0] = q[3];
+            sw[1] = q[2];
+            sw[2] = q[1];
+            sw[3] = q[0];
+            q = sw;
+        } else if (swap && tb == 2) {
+            sw[0] = q[1];
+            sw[1] = q[0];
+            q = sw;
+        }
         switch (type) {
         case GL_UNSIGNED_BYTE: f[k] = q[0] / 255.0f; raw0 = k == 0 ? q[0] : raw0; break;
         case GL_BYTE: { int8_t t; memcpy(&t, q, 1); f[k] = std::max(0, static_cast<int>(t)) / 127.0f; raw0 = k == 0 ? static_cast<uint32_t>(std::max(0, static_cast<int>(t))) : raw0; break; }
-        case GL_UNSIGNED_SHORT: { uint16_t t; memcpy(&t, q, 2); if (swap) t = static_cast<uint16_t>((t >> 8) | (t << 8)); f[k] = t / 65535.0f; raw0 = k == 0 ? t : raw0; break; }
+        case GL_UNSIGNED_SHORT: { uint16_t t; memcpy(&t, q, 2); f[k] = t / 65535.0f; raw0 = k == 0 ? t : raw0; break; }
         case GL_SHORT: { int16_t t; memcpy(&t, q, 2); f[k] = std::max(0, static_cast<int>(t)) / 32767.0f; raw0 = k == 0 ? static_cast<uint32_t>(std::max(0, static_cast<int>(t))) : raw0; break; }
         case GL_UNSIGNED_INT: { uint32_t t; memcpy(&t, q, 4); f[k] = static_cast<float>(t / 4294967295.0); raw0 = k == 0 ? t : raw0; break; }
         case GL_INT: { int32_t t; memcpy(&t, q, 4); f[k] = static_cast<float>(std::max(0, t) / 2147483647.0); raw0 = k == 0 ? static_cast<uint32_t>(std::max(0, t)) : raw0; break; }
@@ -241,7 +253,11 @@ void tex_unpack_to_rgba(Context *c, int w, int h, GLenum format, GLenum type, co
     const int row_px = ps.row_length > 0 ? ps.row_length : w;
     size_t row_bytes = static_cast<size_t>(row_px) * bpp;
     const size_t al = static_cast<size_t>(std::max(1, ps.alignment));
-    row_bytes = (row_bytes + al - 1) / al * al;
+    /* GL：分量（打包类型则整个像素）不小于对齐值时行之间不补齐 */
+    const size_t elem = static_cast<size_t>(packed ? pb : type_bytes(type));
+    if (elem < al) {
+        row_bytes = (row_bytes + al - 1) / al * al;
+    }
     const uint8_t *base = static_cast<const uint8_t *>(pixels) + static_cast<size_t>(ps.skip_rows) * row_bytes +
                           static_cast<size_t>(ps.skip_pixels) * bpp;
     for (int y = 0; y < h; y++) {
@@ -274,7 +290,9 @@ void tex_pack_from_rgba(Context *c, int w, int h, GLenum format, GLenum type, co
     const int row_px = ps.row_length > 0 ? ps.row_length : w;
     size_t row_bytes = static_cast<size_t>(row_px) * bpp;
     const size_t al = static_cast<size_t>(std::max(1, ps.alignment));
-    row_bytes = (row_bytes + al - 1) / al * al;
+    if (static_cast<size_t>(tb) < al) {
+        row_bytes = (row_bytes + al - 1) / al * al;
+    }
     uint8_t *base = static_cast<uint8_t *>(pixels) + static_cast<size_t>(ps.skip_rows) * row_bytes +
                     static_cast<size_t>(ps.skip_pixels) * bpp;
     for (int y = 0; y < h; y++) {
@@ -566,7 +584,19 @@ bool tex_make_resident(Texture *t)
         return t->resident;
     }
     if (t->dirty) {
+        /* 重新指定了一模一样的图像（有的引擎每帧重传动画纹理的同一帧）：设备上的那份还能用 */
+        const bool was_resident = t->resident;
+        const std::vector<uint8_t> old_px = was_resident ? t->dev_pixels : std::vector<uint8_t>();
+        const uint8_t old_fmt = t->dev_fmt;
+        const int old_w = t->dw, old_h = t->dh;
+        uint8_t old_pal[256 * 4];
+        memcpy(old_pal, t->palette, sizeof(old_pal));
         build_device_pixels(t);
+        if (was_resident && !t->pal_changed && t->dev_fmt == old_fmt && t->dw == old_w && t->dh == old_h &&
+            t->dev_pixels == old_px &&
+            (t->dev_fmt != ESPGPU_FMT_INDEX8 || memcmp(old_pal, t->palette, sizeof(old_pal)) == 0)) {
+            t->upload = false;
+        }
     }
     if (t->resident && !t->upload) {
         return true;
@@ -609,6 +639,7 @@ bool tex_make_resident(Texture *t)
     }
     t->resident = true;
     t->upload = false;
+    t->pal_changed = false;
     g_sh.tex_used += t->dev_bytes;
     g_sh.bind_epoch++;
     return true;
@@ -640,6 +671,32 @@ static void tex_free(Texture *t)
         g_sh.free_dev_ids.push_back(t->dev_id);
         t->dev_id = 0;
     }
+}
+
+/** 纹理的数据 / 参数要变：引用它的待发批次（flush 时才采样）先发掉 */
+static void flush_if_used(Context *c, const Texture *t)
+{
+    bool used = false;
+    auto check = [&](const Pending &p) {
+        if (p.empty()) {
+            return;
+        }
+        /* 按快照里启用单元绑定的名字比：批次开始时还不可用（没图像）的纹理变得可用也算 */
+        for (int u = 0; u < kMaxUnits; u++) {
+            const TexUnitState &us = p.st.unit[u];
+            const GLuint name = us.enable_2d ? us.bound_2d : (us.enable_1d ? us.bound_1d : 0xFFFFFFFFu);
+            used = used || (name != 0xFFFFFFFFu && tex_lookup(name, false) == t) ||
+                   (name == 0 && t == &g_sh.default_tex);
+        }
+    };
+    check(c->pending);
+    for (const Pending &p : c->parked) {
+        check(p);
+    }
+    if (used) {
+        flush_pending(c);
+    }
+    c->key_dirty = true;
 }
 
 /* ── GL 入口 ──────────────────────────────────────────────────────── */
@@ -729,7 +786,7 @@ void impl_glBindTexture(GLenum target, GLuint texture)
     TexUnitState &u = c->st.unit[c->st.active_unit];
     GLuint &slot = target == GL_TEXTURE_1D ? u.bound_1d : u.bound_2d;
     if (slot != texture) {
-        state_dirty(c);
+        state_changed(c);
         slot = texture;
     }
 }
@@ -760,7 +817,7 @@ static void tex_image(Context *c, GLenum target, GLint level, GLint ifmt, GLsize
     if (level != 0) {
         return; /* 设备不做 mipmap，只用层级 0 */
     }
-    state_dirty(c);
+    flush_if_used(c, t);
     t->w = w;
     t->h = h;
     t->internal_format = ifmt;
@@ -812,7 +869,7 @@ static void tex_sub_image(Context *c, GLenum target, GLint level, GLint xo, GLin
         log_line("glTexSubImage on a copied (device-only) texture is not supported");
         return;
     }
-    state_dirty(c);
+    flush_if_used(c, t);
     std::vector<uint8_t> rgba, idx;
     tex_unpack_to_rgba(c, w, h, format, type, pixels, rgba, t->paletted ? &idx : nullptr);
     for (int y = 0; y < h; y++) {
@@ -946,12 +1003,23 @@ static void tex_param(Context *c, GLenum target, GLenum pname, const float *p)
 {
     std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
     Texture *t = target_tex(c, target);
-    state_dirty(c);
+    GLenum *field = nullptr;
     switch (pname) {
-    case GL_TEXTURE_MIN_FILTER: t->min_filter = static_cast<GLenum>(p[0]); break;
-    case GL_TEXTURE_MAG_FILTER: t->mag_filter = static_cast<GLenum>(p[0]); break;
-    case GL_TEXTURE_WRAP_S: t->wrap_s = static_cast<GLenum>(p[0]); break;
-    case GL_TEXTURE_WRAP_T: t->wrap_t = static_cast<GLenum>(p[0]); break;
+    case GL_TEXTURE_MIN_FILTER: field = &t->min_filter; break;
+    case GL_TEXTURE_MAG_FILTER: field = &t->mag_filter; break;
+    case GL_TEXTURE_WRAP_S: field = &t->wrap_s; break;
+    case GL_TEXTURE_WRAP_T: field = &t->wrap_t; break;
+    default: break;
+    }
+    if (field) {
+        const GLenum v = static_cast<GLenum>(p[0]);
+        if (*field != v) {
+            flush_if_used(c, t); /* 过滤 / 环绕是绑定参数：用到它的批次按旧值发 */
+            *field = v;
+        }
+        return;
+    }
+    switch (pname) {
     case GL_TEXTURE_BORDER_COLOR: memcpy(t->border_color, p, 16); break;
     case GL_TEXTURE_PRIORITY:
         t->priority = p[0];
@@ -1119,7 +1187,7 @@ void impl_glTexEnvfv(GLenum target, GLenum pname, const GLfloat *p)
     if (target != GL_TEXTURE_ENV) {
         return;
     }
-    state_dirty(c);
+    state_changed(c);
     const GLenum e = static_cast<GLenum>(v[0]);
     switch (pname) {
     case GL_TEXTURE_ENV_MODE: u.env_mode = e; break;
@@ -1215,25 +1283,41 @@ static void color_table(Context *c, GLenum target, GLsizei start, GLsizei count,
     std::vector<uint8_t> rgba;
     tex_unpack_to_rgba(c, count, 1, format, type, data, rgba, nullptr);
     std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
-    state_dirty(c);
+    {
+        /* 内容没变（有的引擎每次绑定都重设一遍调色板）：什么都不做，免得整张纹理重传 */
+        const bool shared = target == 0x81FB;
+        Texture *t = shared ? nullptr : target_tex(c, target == 0x8064 ? GL_TEXTURE_2D : target);
+        const uint8_t *cur_pal = shared ? g_sh.shared_palette : t->palette;
+        const int cur_size = shared ? g_sh.shared_palette_size : t->palette_size;
+        const int end = std::min(256, static_cast<int>(start + count));
+        const bool has = shared ? true : (t->has_palette && t->palette_format != 0);
+        if (has && start >= 0 && end <= cur_size && (!replace || end == cur_size) &&
+            memcmp(cur_pal + start * 4, rgba.data(), static_cast<size_t>(end - start) * 4) == 0) {
+            return;
+        }
+    }
     uint8_t *dst;
     int *size;
     if (target == 0x81FB /* GL_SHARED_TEXTURE_PALETTE_EXT */) {
+        state_dirty(c);
         dst = g_sh.shared_palette;
         size = &g_sh.shared_palette_size;
         /* 共享调色板变了：所有没有自带调色板的 INDEX8 纹理都要重发调色板 */
         for (auto &kv : g_sh.textures) {
             if (kv.second->paletted && !kv.second->has_palette) {
                 kv.second->upload = true;
+                kv.second->pal_changed = true;
             }
         }
     } else {
         Texture *t = target_tex(c, target == 0x8064 ? GL_TEXTURE_2D : target);
+        flush_if_used(c, t);
         dst = t->palette;
         size = &t->palette_size;
         t->has_palette = true;
         t->palette_format = format;
         t->upload = true;
+        t->pal_changed = true;
     }
     for (GLsizei i = 0; i < count && start + i < 256; i++) {
         memcpy(dst + (start + i) * 4, &rgba[static_cast<size_t>(i) * 4], 4);

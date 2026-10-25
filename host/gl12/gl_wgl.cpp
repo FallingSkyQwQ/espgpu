@@ -100,9 +100,11 @@ void update_window_size(Context *c)
         return;
     }
     RECT rc;
-    if (GetClientRect(c->hwnd, &rc)) {
-        c->win_w = std::max(1L, rc.right - rc.left);
-        c->win_h = std::max(1L, rc.bottom - rc.top);
+    /* 最小化 / 尚未显示的窗口客户区是 0×0：保留原值，否则窗口→设备的视口换算会除以 1 */
+    if (GetClientRect(c->hwnd, &rc) && rc.right > rc.left && rc.bottom > rc.top) {
+        c->win_w = rc.right - rc.left;
+        c->win_h = rc.bottom - rc.top;
+        c->key_dirty = true;
     }
 }
 
@@ -355,10 +357,17 @@ BOOL WINAPI ewglDeleteContext(HGLRC h)
     if (pt()) {
         return g_ptw.DeleteContext ? g_ptw.DeleteContext(h) : FALSE;
     }
+    std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
     if (!is_our_context(h)) {
+        SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
     Context *c = ctx_from(h);
+    if (c->owner_thread != 0 && c->owner_thread != GetCurrentThreadId()) {
+        /* WGL：不能删别的线程上的当前上下文（那个线程的 cur() 会悬空） */
+        SetLastError(ERROR_BUSY);
+        return FALSE;
+    }
     if (cur() == c) {
         flush_pending(c);
         set_cur(nullptr);
@@ -366,11 +375,8 @@ BOOL WINAPI ewglDeleteContext(HGLRC h)
     if (g_sh.dc_owner == c) {
         g_sh.dc_owner = nullptr;
     }
-    {
-        std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
-        auto &v = g_sh.contexts;
-        v.erase(std::remove(v.begin(), v.end(), c), v.end());
-    }
+    auto &v = g_sh.contexts;
+    v.erase(std::remove(v.begin(), v.end(), c), v.end());
     delete c;
     return TRUE;
 }
@@ -381,10 +387,12 @@ BOOL WINAPI ewglMakeCurrent(HDC hdc, HGLRC h)
     if (pt()) {
         return g_ptw.MakeCurrent ? g_ptw.MakeCurrent(hdc, h) : FALSE;
     }
+    std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
     Context *old = cur();
     if (h == nullptr) {
         if (old) {
             flush_pending(old);
+            old->owner_thread = 0;
         }
         set_cur(nullptr);
         return TRUE;
@@ -394,9 +402,16 @@ BOOL WINAPI ewglMakeCurrent(HDC hdc, HGLRC h)
         return FALSE;
     }
     Context *c = ctx_from(h);
+    const DWORD tid = GetCurrentThreadId();
+    if (c->owner_thread != 0 && c->owner_thread != tid) {
+        SetLastError(ERROR_BUSY); /* 已经是别的线程的当前上下文 */
+        return FALSE;
+    }
     if (old && old != c) {
         flush_pending(old);
+        old->owner_thread = 0;
     }
+    c->owner_thread = tid;
     if (hdc) {
         c->hdc = hdc;
         HWND w = WindowFromDC(hdc);
@@ -497,7 +512,14 @@ BOOL WINAPI ewglCopyContext(HGLRC src, HGLRC dst, UINT mask)
     if (!is_our_context(src) || !is_our_context(dst)) {
         return FALSE;
     }
-    ctx_from(dst)->st = ctx_from(src)->st;
+    std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
+    Context *d = ctx_from(dst);
+    if (d->owner_thread != 0) {
+        SetLastError(ERROR_BUSY); /* 目标不能是任何线程的当前上下文 */
+        return FALSE;
+    }
+    d->st = ctx_from(src)->st;
+    d->key_dirty = true;
     return TRUE;
 }
 
@@ -517,8 +539,10 @@ BOOL WINAPI ewglSwapBuffers(HDC hdc)
         /* 不是当前上下文的 DC：找绑定在这个窗口上的上下文 */
         std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
         HWND w = WindowFromDC(hdc);
+        const DWORD tid = GetCurrentThreadId();
         for (Context *x : g_sh.contexts) {
-            if (x->hdc == hdc || (w && x->hwnd == w)) {
+            /* 别的线程正在用的上下文不能碰（它的待发批次属于那个线程） */
+            if ((x->hdc == hdc || (w && x->hwnd == w)) && (x->owner_thread == 0 || x->owner_thread == tid)) {
                 c = x;
                 break;
             }

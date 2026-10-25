@@ -27,11 +27,11 @@ namespace {
 std::once_flag g_init_once;
 std::mutex g_mu;
 
-uint64_t g_counts[FN_COUNT];
+std::atomic<uint64_t> g_counts[FN_COUNT]; /* 多线程调用时也不丢计数 */
 std::set<uint64_t> g_enums;              /* (fn << 40) | (param << 32) | value */
 std::map<std::string, std::pair<uint64_t, bool>> g_procs; /* wglGetProcAddress 请求 */
 std::set<int> g_unimpl;
-uint64_t g_frames = 0;
+std::atomic<uint64_t> g_frames{0};
 int g_trace_frames = 3;                   /* 逐调用日志记录的帧数 */
 FILE *g_trace_file = nullptr;
 FILE *g_log_file = nullptr;
@@ -133,7 +133,7 @@ void mode_init()
 
 void trace_count(FnId fn)
 {
-    g_counts[fn]++;
+    g_counts[fn].fetch_add(1, std::memory_order_relaxed);
 }
 
 void trace_enum(FnId fn, int param, GLenum value)
@@ -192,16 +192,19 @@ void trace_proc_request(const char *name, bool found)
 
 void trace_frame()
 {
-    g_frames++;
-    if (g_trace_file && g_trace_frames >= 0 && g_frames == static_cast<uint64_t>(g_trace_frames)) {
+    bool dump = false;
+    {
         std::lock_guard<std::mutex> lk(g_mu);
-        fprintf(g_trace_file, "---- per-call log stopped after %d frame(s) ----\n", g_trace_frames);
-        fflush(g_trace_file);
-    } else if (g_trace_file) {
-        std::lock_guard<std::mutex> lk(g_mu);
-        fprintf(g_trace_file, "---- frame %llu ----\n", static_cast<unsigned long long>(g_frames));
+        g_frames++;
+        if (g_trace_file && g_trace_frames >= 0 && g_frames == static_cast<uint64_t>(g_trace_frames)) {
+            fprintf(g_trace_file, "---- per-call log stopped after %d frame(s) ----\n", g_trace_frames);
+            fflush(g_trace_file);
+        } else if (g_trace_file && (g_trace_frames < 0 || g_frames < static_cast<uint64_t>(g_trace_frames))) {
+            fprintf(g_trace_file, "---- frame %llu ----\n", static_cast<unsigned long long>(g_frames.load()));
+        }
+        dump = g_watch && g_frames % 300 == 0;
     }
-    if (g_watch && g_frames % 300 == 0) {
+    if (dump) {
         trace_dump();
     }
 }
@@ -218,20 +221,21 @@ void trace_dump()
     }
     fprintf(f, "# espgpu GL call inventory\n");
     fprintf(f, "# mode: %s   frames: %llu\n", g_mode == MODE_PASSTHROUGH ? "passthrough" : "espgpu",
-            static_cast<unsigned long long>(g_frames));
+            static_cast<unsigned long long>(g_frames.load()));
     fprintf(f, "# columns: calls  calls/frame  function\n\n");
 
     std::vector<std::pair<uint64_t, int>> v;
     for (int i = 0; i < FN_COUNT; i++) {
-        if (g_counts[i]) {
-            v.emplace_back(g_counts[i], i);
+        const uint64_t n = g_counts[i].load(std::memory_order_relaxed);
+        if (n) {
+            v.emplace_back(n, i);
         }
     }
     std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first > b.first; });
     fprintf(f, "## functions (%zu unique)\n", v.size());
     for (auto &e : v) {
         fprintf(f, "%12llu %10.1f  %s%s\n", static_cast<unsigned long long>(e.first),
-                g_frames ? static_cast<double>(e.first) / static_cast<double>(g_frames) : 0.0,
+                g_frames.load() ? static_cast<double>(e.first) / static_cast<double>(g_frames.load()) : 0.0,
                 kFnNames[e.second], kFnIsExt[e.second] ? "  (ext)" : "");
     }
 

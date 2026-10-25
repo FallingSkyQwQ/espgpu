@@ -47,9 +47,11 @@ dsda-doom.exe ──SDL──> LoadLibrary("OPENGL32.DLL")   ← 应用目录优
 | `ESPGPU_GL_TRACE_FRAMES` | `3` | trace 模式下逐调用日志记录的帧数（`-1` = 一直记） |
 | `ESPGPU_GL_TRACE_FILE` | `espgpu-gltrace.txt` | 调用清单输出路径 |
 | `ESPGPU_GL_LOG` | `0` | `1` = 写 `espgpu-gl.log` |
+| `ESPGPU_GL_DEBUG_PLAN` | `0` | `1` = 日志里记每个批次的顶点编码（调带宽用） |
 
 设备打不开时，`espgpu` 模式会自动退回直通（日志里有一行 `switching to passthrough`），
-游戏照常运行，便于先排除游戏侧问题。
+游戏照常运行，便于先排除游戏侧问题。运行中掉线（拔线 / 设备重启）时画面停住、游戏继续，
+`SwapBuffers` 每秒试着重新打开设备一次，连上后纹理和列表缓冲按需重传（日志 `device reconnected`）。
 
 ## 先跑直通 + trace（PLAN R1，不可跳过）
 
@@ -74,14 +76,31 @@ dsda-doom.exe ──SDL──> LoadLibrary("OPENGL32.DLL")   ← 应用目录优
 
 | 项 | 做法 | 每帧 |
 |---|---|---|
-| 顶点 | 位置 I16×3（每批次包围盒中心 + 自适应小数位）+ 纹理 I16×2 + RGB565，约 12 B/顶点 | ~29 KB @2400 顶点 |
-| 合批 | 状态不变的连续 `glBegin/glEnd` 归并；4 顶点 strip / fan 直接当四边形（无索引） | 命令头开销可忽略 |
-| 显示列表 | 第 2 次调用起整张列表上传为设备端缓冲，回放每批次只发 ~24 B | 静态几何趋近 0 |
+| 顶点 | 位置 I16×3（原点吸附 2 的幂网格 + 自适应小数位，网格上的坐标精确；按「可见部分的屏幕误差」检查精度，不够就把相机附近那片单独量化，再不行才 F32）+ 纹理 I16×2 + 颜色（同色成组发 `COLOR`，否则 RGB565） | ~12 B/顶点 |
+| 合批 | 状态变化不立刻 flush：出几何时比较「解析到设备侧的状态」，对设备没区别就继续合批；只差一个 modelview 仿射变换（每块地板一个 `glTranslatef`）时在主机上把顶点变换进批次坐标系；不透明且深度测试写深度的批次之间可以重排——同纹理同光照的墙 / 地板跨整帧并成一批 | `PIPELINE` / `SET_MATRIX` 数降到原来 1/2~1/10 |
+| 坐标系沿用 | 新批次放得下、精度够就沿用设备当前的 `VERTEX_LAYOUT` + 原点，不重发；相邻批次的共享顶点逐位相同，不会裂缝 | `VERTEX_LAYOUT` 每帧个位数 |
+| 显示列表 | 第 2 次调用起整张列表上传为设备端缓冲；连续的三角形类几何合成一条带索引的 `DRAW`；缓冲个数 / 字节按设备上限做 LRU，工作集放不下时多出来的内联回放而不是每帧换来换去 | 每次调用 ~24 B + `SET_MATRIX` |
 | 纹理 | 自动调色板化 1 B/px；主机侧 LRU 镜像，只在换入时上传 | 关卡加载后接近 0 |
-| 下行压缩 | CMD chunk 走 LZ4 block | 再省 30–50%（估计） |
+| 下行压缩 | CMD chunk 走 LZ4 block | 见下 |
+
+本地测试台（`host/gl12/tests/`：仿 prboom-plus 调用流，10×10 格子 ≈ 300 面墙 + 200 块地板 + 40 个精灵 +
+HUD，开雾 `gl_fog 1`、按纹理排序，命令流经真实 `firmware/core` 渲染并按 24 KB chunk 做 LZ 计字节）实测下行：
+
+| 场景 | 改前 | 改后 |
+|---|---:|---:|
+| 整数坐标 | 31.4 KB/帧 | 22.1 KB/帧 |
+| 不规则地板 + 小数坐标（GL 节点那种） | 50.1 KB/帧 | 36.8 KB/帧 |
+| 同上、关雾 | 41.9 KB/帧 | 37.6 KB/帧 |
+| 地板用显示列表（`gl_use_display_lists 1`） | 35.9 KB/帧 | 21.1 KB/帧 |
+| 同上、关雾 | 27.7 KB/帧 | 20.1 KB/帧 |
+
+每帧命令数（整数坐标场景）：`PIPELINE` 446 → 209、`SET_MATRIX` 502 → 38、`VERTEX_LAYOUT` 136 → 2、
+`DRAW` 502 → 230。剩下的 `PIPELINE` 基本都是雾密度随光照逐面变化（glboom 光照模式的 `gl_fog`）；
+关掉 `gl_fog` 还能再省，但画面会变。复现：`sh host/gl12/tests/run.sh`。
 
 上行帧回传按 M2 实测约 7–15 KB/帧。合计仍可能略超 35 KB/帧的预算，届时优先开显示列表、
-降低 `ESPGPU_FPS` 到 20，或把设备分辨率降到 `256x160`。
+降低 `ESPGPU_FPS` 到 20，或把设备分辨率降到 `256x160`。`ESPGPU_GL_DEBUG_PLAN=1`（配合
+`ESPGPU_GL_LOG=1`）会把每个批次的顶点数 / 布局写进 `espgpu-gl.log`，用来查哪类几何最占带宽。
 
 ## 已知缺口 / 风险
 
@@ -91,6 +110,10 @@ dsda-doom.exe ──SDL──> LoadLibrary("OPENGL32.DLL")   ← 应用目录优
 - **`glCopyTexSubImage2D`**：设备的 COPY 只能整张替换，偏移拷贝按「整张纹理对齐到源点」近似
   （DSDA 的 wipe 效果可能偏位）。
 - **点光源**：近似成从眼点指向光源的方向光；不支持聚光、衰减、高光。
+- **`GL_ALPHA` / `GL_LUMINANCE` 纹理配 `GL_REPLACE`**：设备的 TEX 模式对 ALPHA 纹理取 rgb = 1、对 LUMINANCE
+  取 a = 1；GL 规定分别取片元色 / 片元 alpha。配 `GL_MODULATE`（字体、Doom 都是这种）时一致。
+- **重排**：不透明且深度测试写深度的批次会按状态重排合并，深度完全相同的共面面片（`GL_LEQUAL` 下）谁覆盖谁
+  可能与提交顺序不同。Doom 本身没有这类贴花。
 - **RGBA 纹理超过 256 色**：退回 RGBA4444，颜色只有 4 位精度（Doom 自身纹理不会触发）。
 - **DSDA-Doom 新版本若强制 GL 2.0 / GLSL**：我们报告的是 `1.2`，会被拒绝。届时改用 prboom-plus
   2.6.x，或在 trace 里确认它要求的具体能力。
