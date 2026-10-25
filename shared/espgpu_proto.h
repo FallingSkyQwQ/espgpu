@@ -77,6 +77,7 @@ enum {
     ESPGPU_F_CRC = 1u << 1,     /**< 末尾附 2 字节 CRC16-CCITT */
     ESPGPU_F_ACK = 1u << 2,     /**< 请求对端回 ACK */
     ESPGPU_F_URGENT = 1u << 3,  /**< 优先发送 */
+    ESPGPU_F_LZ = 1u << 4,      /**< 载荷经 espgpu_lz 压缩，前 4 字节为解压后长度（仅 CMD / DATA） */
 };
 
 /** 最外层分帧头，固定 12 字节。 */
@@ -120,6 +121,24 @@ enum {
     ESPGPU_OP_QUERY = 0x0D,         /**< 查询统计 */
     ESPGPU_OP_FENCE = 0x0E,         /**< 同步点，设备回 FLUSH 事件 */
     ESPGPU_OP_PIPELINE2D = 0x10,    /**< M2：2D 管线子集 */
+    /* ── 以下为 M2-M6 追加 ── */
+    ESPGPU_OP_TEX_PALETTE = 0x11,   /**< 纹理调色板（GL_EXT_paletted_texture） */
+    ESPGPU_OP_DELETE_TEXTURE = 0x12,/**< 释放纹理（主机侧 LRU 镜像主动换出） */
+    ESPGPU_OP_COLOR = 0x13,         /**< 常量顶点色（布局里没有颜色属性时使用） */
+    ESPGPU_OP_LIGHTING = 0x14,      /**< 顶点光照参数（M5） */
+    ESPGPU_OP_LOAD_PROGRAM = 0x15,  /**< 上传片元 VM 字节码（M6） */
+    ESPGPU_OP_SET_UNIFORMS = 0x16,  /**< 片元 VM 常量寄存器（M6） */
+    ESPGPU_OP_DEPTH_RANGE = 0x17,   /**< glDepthRange */
+};
+
+/** 命令头 flags —— DRAW */
+enum {
+    ESPGPU_DRAWF_3D = 1u << 0, /**< 使用 VERTEX_LAYOUT 定义的顶点格式并走 T&L；未置位 = M2 的 2D 顶点 */
+};
+
+/** 命令头 flags —— UPLOAD_TEXTURE */
+enum {
+    ESPGPU_TEXF_PRIORITY = 1u << 0, /**< 预加载：LRU 换出时最后考虑 */
 };
 
 /* ── 像素格式 ─────────────────────────────────────────────────────── */
@@ -167,7 +186,31 @@ enum {
     ESPGPU_SHADE_TEX_ADD_TEX = 5,   /**< 纹理 + 纹理 */
     ESPGPU_SHADE_TEX_MOD_ADD_COLOR = 6, /**< 纹理 × 纹理 + 顶点色 */
     ESPGPU_SHADE_PROGRAM = 7,       /**< 片元 VM 字节码 */
+    ESPGPU_SHADE_TEX_DECAL = 8,     /**< rgb = mix(色, 纹理, 纹理.a)，a = 色.a（GL_DECAL） */
 };
+
+/*
+ * 3D 管线语义（M3 起，PIPELINE + VERTEX_LAYOUT + DRAW(ESPGPU_DRAWF_3D)）——前端必须按此实现：
+ *
+ * 顶点：整数属性 normalized ? raw/类型最大值 : raw / 2^frac_bits；F32 原值；FIXED16_16 = raw/65536。
+ *       缺省属性：COLOR = COLOR 命令的常量色（初值白），TEXCOORDn = (0,0,0,1)，NORMAL = (0,0,1)。
+ *       POSITION 2 分量补 z=0 w=1，3 分量补 w=1。
+ * 变换：clip = MVP * pos（行主序矩阵，列向量）。透视除法后
+ *       屏幕帧缓冲：NDC y=+1 在视口顶端；视口 / 裁剪矩形为左上角原点。
+ *       FBO 纹理目标：NDC y=-1 落在第 0 行（与 GL 纹理 t=0 一致），视口 / 裁剪为左下角原点。
+ *       深度 = znear + (z_ndc+1)/2*(zfar-znear)，存为 16 位。
+ * 绕序：在 NDC（y 向上）里判定，与 GL 相同；front_face=CCW 即 GL_CCW。
+ * 纹理坐标：归一化 [0,1]，t=0 是上传数据的第一行（与 glTexImage2D 一致）。
+ *       未绑定纹理的单元采样结果为 (1,1,1,1)；R8 = 亮度 (L,L,L,1)；无 alpha 平面时 a=1。
+ * 着色（shade_mode，C = 插值顶点色，T0/T1 = 单元 0/1 采样）：
+ *       FLAT: C   TEX: T0   TEX_MOD_COLOR: T0*C   TEX_MOD_TEX: T0*T1*C
+ *       TEX_ADD: rgb=T0+C a=T0.a*C.a   TEX_ADD_TEX: rgb=T0*C+T1 a=T0.a*C.a
+ *       TEX_MOD_ADD_COLOR: rgb=T0*T1+C a=T0.a   TEX_DECAL: rgb=mix(C,T0,T0.a) a=C.a
+ *       然后依次：雾（f 由 clip w 计算，即眼空间深度）→ alpha 测试 → 深度测试 → 混合。
+ *       帧缓冲没有 alpha 通道，DST_ALPHA 视为 1。
+ * 线 / 点：投影后按 line_width / point_size 展成屏幕对齐的四边形。
+ * CLEAR 受裁剪矩形约束（GL 语义）。
+ */
 
 /** 混合因子（对齐 GL 语义，便于前端 1:1 映射） */
 enum {
@@ -249,18 +292,88 @@ typedef struct {
     uint8_t tex_wrap_v[ESPGPU_MAX_TEXTURE_UNITS];
 } espgpu_pipeline_t;
 
+/**
+ * PIPELINE 命令体 = espgpu_pipeline_t
+ *                 [+ espgpu_pipeline_fog_t]   （命令体长度够才解析）
+ *                 [+ espgpu_pipeline_ext_t]
+ * 追加字段按长度判断是否存在，旧主机发的短命令体仍然合法。
+ */
+typedef struct {
+    float fog_start;
+    float fog_end;
+    float fog_density;
+} espgpu_pipeline_fog_t;
+
+/** 着色插值 */
+enum {
+    ESPGPU_SHADE_MODEL_FLAT = 0,   /**< 取激发顶点（GL：最后一个顶点）的颜色 */
+    ESPGPU_SHADE_MODEL_SMOOTH = 1, /**< 高洛德：顶点色透视校正插值 */
+};
+
+/** 纹理单元 1 的组合方式（多纹理时 shade_mode 用 TEX_MOD_TEX 等） */
+typedef struct {
+    uint8_t shade_model;  /**< ESPGPU_SHADE_MODEL_* */
+    uint8_t color_write;  /**< 0 = 不写颜色（仅深度），非 0 = 写 */
+    uint8_t program_id;   /**< shade_mode == PROGRAM 时使用的片元程序 */
+    uint8_t tex_matrix;   /**< bit0：对 texcoord0 应用 TEXTURE0 矩阵；bit1：texcoord1 / TEXTURE1 */
+    uint8_t lighting;     /**< 1 = 顶点光照（需要 NORMAL 属性 + LIGHTING 命令） */
+    uint8_t depth_bias;   /**< glPolygonOffset 的近似：深度减去 depth_bias（16 位单位） */
+    uint8_t line_width;   /**< 线宽像素，0 视为 1 */
+    uint8_t point_size;   /**< 点大小像素，0 视为 1 */
+} espgpu_pipeline_ext_t;
+
+enum {
+    ESPGPU_BLEND_OP_ADD = 0,
+    ESPGPU_BLEND_OP_SUB = 1,
+    ESPGPU_BLEND_OP_REV_SUB = 2,
+    ESPGPU_BLEND_OP_MIN = 3,
+    ESPGPU_BLEND_OP_MAX = 4,
+};
+
+enum {
+    ESPGPU_FOG_LINEAR = 0,
+    ESPGPU_FOG_EXP = 1,
+    ESPGPU_FOG_EXP2 = 2,
+};
+
+enum {
+    ESPGPU_CULL_NONE = 0,
+    ESPGPU_CULL_FRONT = 1,
+    ESPGPU_CULL_BACK = 2,
+    ESPGPU_CULL_BOTH = 3,
+};
+
+enum {
+    ESPGPU_FRONT_CW = 0,
+    ESPGPU_FRONT_CCW = 1,
+};
+
 /** 矩阵槽位 */
 enum {
     ESPGPU_MATRIX_MVP = 0,    /**< model * view * projection，设备端用它做顶点变换 */
     ESPGPU_MATRIX_MODELVIEW = 1, /**< 供光照计算用 */
     ESPGPU_MATRIX_PROJECTION = 2,
+    ESPGPU_MATRIX_TEXTURE0 = 3, /**< 纹理坐标 0 的矩阵（glMatrixMode(GL_TEXTURE)） */
+    ESPGPU_MATRIX_NORMAL = 4,   /**< 法线矩阵（modelview 左上 3x3 的逆转置），光照用 */
+    ESPGPU_MATRIX_TEXTURE1 = 5,
+    ESPGPU_MATRIX_COUNT = 6,
 };
 
+enum {
+    ESPGPU_MATF_TRANSPOSE = 1u << 0,
+    ESPGPU_MATF_FLOAT = 1u << 1, /**< 载荷是 16 个 float32 而不是 16.16 定点（追加语义） */
+    ESPGPU_MATF_IDENTITY = 1u << 2, /**< 无载荷，置为单位阵 */
+};
+
+/**
+ * 矩阵约定：行主序 m[row*4+col]，列向量右乘：clip = M * (x,y,z,w)^T。
+ * GL 前端传的 column-major 矩阵要么转置后发，要么带 ESPGPU_MATF_TRANSPOSE。
+ */
 typedef struct {
     uint8_t slot;    /**< ESPGPU_MATRIX_* */
-    uint8_t flags;   /**< bit0: 转置 */
+    uint8_t flags;   /**< ESPGPU_MATF_* */
     uint16_t pad;
-    /* 紧随其后：16 个 int32，定点 16.16，行主序 */
+    /* 紧随其后：16 个 int32（定点 16.16）或 16 个 float32，行主序 */
 } espgpu_set_matrix_t;
 
 /** 顶点属性类型 */
@@ -273,6 +386,8 @@ enum {
     ESPGPU_TYPE_U32 = 5,
     ESPGPU_TYPE_F32 = 6,
     ESPGPU_TYPE_FIXED16_16 = 7, /**< 定点 16.16，带宽最省 */
+    ESPGPU_TYPE_RGB565 = 8,     /**< 打包颜色，components 必须为 1，alpha = 1 */
+    ESPGPU_TYPE_RGBA4444 = 9,   /**< 打包颜色，components 必须为 1 */
 };
 
 /** 属性语义槽 */
@@ -290,9 +405,10 @@ typedef struct {
     uint8_t slot;       /**< ESPGPU_ATTR_* */
     uint8_t type;       /**< ESPGPU_TYPE_* */
     uint8_t components; /**< 1..4 */
-    uint8_t normalized;
+    uint8_t normalized; /**< 整数类型：1 = 按类型最大值归一化到 [0,1] / [-1,1] */
     uint16_t offset;    /**< 结构体内偏移 */
-    uint16_t pad;
+    uint8_t frac_bits;  /**< 整数类型且未归一化时的小数位数：值 = raw / 2^frac_bits（原 pad，0 = 整数） */
+    uint8_t pad;
 } espgpu_vertex_attrib_t;
 
 typedef struct {
@@ -311,6 +427,7 @@ enum {
     ESPGPU_PRIM_TRIANGLE_STRIP = 4,
     ESPGPU_PRIM_TRIANGLE_FAN = 5,
     ESPGPU_PRIM_QUADS = 6, /**< 原生四边形，避免 host 端拆成三角形 */
+    ESPGPU_PRIM_LINE_LOOP = 7,
 };
 
 /** 顶点数据来源 */
@@ -394,11 +511,121 @@ typedef struct {
     uint16_t height;
     uint32_t offset;    /**< 本分片在纹理内的字节偏移 */
     uint32_t total_len; /**< 整张纹理的字节数 */
-    uint8_t format;     /**< ESPGPU_FMT_RGB565 / RGBA4444 */
+    uint8_t format;     /**< ESPGPU_FMT_RGB565 / RGBA4444 / INDEX8 / R8 */
     uint8_t filter;
     uint8_t wrap;
     uint8_t pad;
 } espgpu_upload_texture_t;
+
+/* ── M2-M6 追加命令体 ─────────────────────────────────────────────── */
+
+/**
+ * TEX_PALETTE：INDEX8 纹理的调色板。
+ * 命令体 = 本结构 + count × u16 RGB565 + count × u8 alpha。
+ * 可以先于或晚于像素上传；未设置时用灰阶、alpha=255。
+ */
+typedef struct {
+    uint32_t id;
+    uint16_t first;
+    uint16_t count;
+} espgpu_tex_palette_t;
+
+/** DELETE_TEXTURE。id == ESPGPU_TEXTURE_ALL 时清空整个纹理缓存。 */
+typedef struct {
+    uint32_t id;
+} espgpu_delete_texture_t;
+
+#define ESPGPU_TEXTURE_ALL 0xFFFFFFFFu
+
+/** COLOR：常量顶点色，RGBA8888。 */
+typedef struct {
+    uint8_t r, g, b, a;
+} espgpu_color_t;
+
+#define ESPGPU_MAX_LIGHTS 4u
+
+/** LIGHTING 里的一盏灯。方向在眼空间、已归一化、指向光源（GL 的 w=0 灯）。 */
+typedef struct {
+    float dir[3];
+    float diffuse[3];
+} espgpu_light_t;
+
+/**
+ * LIGHTING：命令体 = 本结构 + count × espgpu_light_t。
+ * 颜色 = clamp(ambient + Σ max(0, N·L) × diffuse) × 顶点色（等价 GL_COLOR_MATERIAL 的
+ * AMBIENT_AND_DIFFUSE），alpha 取顶点 alpha。
+ */
+typedef struct {
+    uint8_t enable;
+    uint8_t count;
+    uint16_t pad;
+    float ambient[3];
+} espgpu_lighting_t;
+
+/** LOAD_PROGRAM：命令体 = 本结构 + insn_count × espgpu_vm_insn_t（见 espgpu_vm.h）。 */
+typedef struct {
+    uint8_t program_id;
+    uint8_t varying_count; /**< 使用的 v 寄存器个数 */
+    uint16_t insn_count;
+} espgpu_load_program_t;
+
+/** SET_UNIFORMS：命令体 = 本结构 + count × 4 × float32，写进 c[first..first+count)。 */
+typedef struct {
+    uint8_t first;
+    uint8_t count;
+    uint16_t pad;
+} espgpu_set_uniforms_t;
+
+typedef struct {
+    float znear; /**< [0,1] */
+    float zfar;
+} espgpu_depth_range_t;
+
+/** VIEWPORT 命令体 = espgpu_rect_t（左上角原点、y 向下，与帧缓冲行序一致）。 */
+
+/** FBO 动作 */
+enum {
+    ESPGPU_FBO_BIND_TEXTURE = 0, /**< 渲染到纹理 texture_id（不存在则按 width/height 新建 RGB565） */
+    ESPGPU_FBO_BIND_DEFAULT = 1, /**< 回到屏幕帧缓冲 */
+    ESPGPU_FBO_COPY_TO_TEXTURE = 2, /**< 把当前目标的 (x,y,w,h) 拷进纹理（glCopyTexImage2D） */
+};
+
+typedef struct {
+    uint8_t action;  /**< ESPGPU_FBO_* */
+    uint8_t pad;
+    uint16_t pad2;
+    uint32_t texture_id;
+    uint16_t width, height;
+    uint16_t x, y;   /**< COPY_TO_TEXTURE 的源矩形 */
+} espgpu_fbo_t;
+
+/** FENCE：执行到这里时设备回 EVENT{kind=FENCE, arg=value}。 */
+typedef struct {
+    uint32_t value;
+} espgpu_fence_t;
+
+/**
+ * DATA chunk 载荷头。设备端缓冲（顶点 / 索引）用于显示列表与静态几何，
+ * 一个缓冲可以跨多个 DATA chunk 续写：offset == 0 的那片负责（重新）分配。
+ */
+typedef struct {
+    uint32_t buffer_id;
+    uint32_t offset;
+    uint32_t total_len;
+    uint8_t kind;   /**< ESPGPU_DATA_* */
+    uint8_t flags;  /**< ESPGPU_DATAF_* */
+    uint16_t pad;
+} espgpu_data_hdr_t;
+
+enum {
+    ESPGPU_DATA_BUFFER = 0,
+};
+
+enum {
+    ESPGPU_DATAF_DELETE = 1u << 0, /**< 释放 buffer_id，忽略数据 */
+};
+
+#define ESPGPU_MAX_BUFFERS 256u
 
 /* ════════════════════════════════════════════════════════════════════
  * 3. Frame 层（D2H）
@@ -464,6 +691,18 @@ enum {
     ESPGPU_CTRL_LOG_SUBSCRIBE = 0x0020,
     ESPGPU_CTRL_SOFT_RESET = 0x0030,
     ESPGPU_CTRL_REQUEST_KEYFRAME = 0x0031, /**< 主机解码失败时要求下一帧走非差分 */
+    ESPGPU_CTRL_SET_DEBUG_VIEW = 0x0040,   /**< arg0 = ESPGPU_DEBUG_VIEW_* */
+    ESPGPU_CTRL_SET_CODEC = 0x0041,        /**< arg0 = 命令模式下 PRESENT 使用的编码 */
+};
+
+/** 调试视图：替换 PRESENT 时回传的内容，不影响渲染本身 */
+enum {
+    ESPGPU_DEBUG_VIEW_NONE = 0,
+    ESPGPU_DEBUG_VIEW_DEPTH = 1,    /**< 深度缓冲灰度 */
+    ESPGPU_DEBUG_VIEW_OVERDRAW = 2, /**< 每像素片元数热力图 */
+    ESPGPU_DEBUG_VIEW_TILES = 3,    /**< 每 tile 三角形数热力图 + tile 边框 */
+    ESPGPU_DEBUG_VIEW_WIREFRAME = 4,/**< 三角形边 */
+    ESPGPU_DEBUG_VIEW_COUNT = 5,
 };
 
 /** 状态码 */
@@ -536,6 +775,14 @@ enum {
     ESPGPU_CAP_QUADS = 1u << 5,
     ESPGPU_CAP_LIGHTING = 1u << 6,
     ESPGPU_CAP_OTA = 1u << 7,
+    ESPGPU_CAP_TNL = 1u << 8,          /**< VERTEX_LAYOUT + 3D DRAW + 矩阵 */
+    ESPGPU_CAP_TEX_LRU = 1u << 9,
+    ESPGPU_CAP_PALETTED_TEX = 1u << 10,
+    ESPGPU_CAP_BUFFERS = 1u << 11,     /**< DATA chunk 设备端缓冲 */
+    ESPGPU_CAP_CLOCK = 1u << 12,       /**< SET_CLOCK */
+    ESPGPU_CAP_DEBUG_VIEW = 1u << 13,
+    ESPGPU_CAP_LZ = 1u << 14,          /**< 接受 ESPGPU_F_LZ 压缩的下行 chunk */
+    ESPGPU_CAP_LOG = 1u << 15,         /**< LOG_SUBSCRIBE */
 };
 
 typedef struct {
@@ -587,6 +834,22 @@ typedef struct {
     int16_t psram_temp_c10;
     uint32_t crc_errors;
     uint32_t seq_gaps;
+    /* ── 以下为 M2-M6 追加；主机收到较短的响应时把缺失部分视为 0 ── */
+    uint32_t tex_resident;    /**< 当前驻留纹理数 */
+    uint32_t tex_bytes;       /**< 纹理缓存占用 */
+    uint32_t tex_evictions;   /**< 累计 LRU 换出 */
+    uint32_t tex_misses;      /**< 绘制时纹理不在缓存的次数 */
+    uint32_t triangles;       /**< 上一帧送入光栅的三角形（裁剪/剔除后） */
+    uint32_t culled;          /**< 上一帧被剔除的三角形 */
+    uint32_t bin_bytes;       /**< 上一帧 tile 分箱占用 */
+    uint32_t t_tnl_us;        /**< 上一帧 T&L + 分箱耗时 */
+    uint16_t cpu_freq_mhz;
+    uint8_t debug_view;
+    uint8_t ota_state;        /**< 0 空闲 1 写入中 2 待重启 3 失败 */
+    uint32_t ota_written;
+    uint32_t buffers_bytes;
+    uint32_t lz_in_bytes;     /**< 累计压缩的下行字节（解压前） */
+    uint32_t lz_out_bytes;    /**< 解压后 */
 } espgpu_stats_t;
 
 /** EVENT 类型 */
@@ -596,6 +859,8 @@ enum {
     ESPGPU_EVT_ERROR = 3,
     ESPGPU_EVT_MODE_CHANGED = 4,
     ESPGPU_EVT_OTA_PROGRESS = 5,
+    ESPGPU_EVT_TEXTURE_EVICTED = 6, /**< arg = 被设备 LRU 换出的纹理 id，主机下次绑定前需重传 */
+    ESPGPU_EVT_BUFFER_EVICTED = 7,  /**< arg = 因内存不足被丢弃的缓冲 id */
 };
 
 typedef struct {

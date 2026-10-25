@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "esp_ota_ops.h"
 
 #include "gpu.h"
 #include "usb_descriptors.h"
@@ -59,7 +60,11 @@ void app_main(void)
     }
 
     /* ── GPU ── */
+    espgpu_log_forward_init();
     ESP_ERROR_CHECK(espgpu_gpu_init());
+
+    /* 能走到这里说明新固件基本可用：取消 OTA 回滚（非 OTA 启动时是空操作） */
+    esp_ota_mark_app_valid_cancel_rollback();
 
 #if CONFIG_ESPGPU_FLASH_WINDOW_MS > 0
     /* 关键：ESP32-S3 的 USB-Serial-JTAG 和 USB-OTG 共用 GPIO19/20。
@@ -83,7 +88,7 @@ void app_main(void)
 
     /* ── 任务 ──
      * core0：命令收发 + 统计采样（与 TinyUSB 任务同核）
-     * core1：内容生成 + 编码 + 呈现（M2 起换成光栅器）
+     * core1：测试图案呈现 / 命令模式的帧发送 / 第二个光栅 worker
      *
      * 命令任务的优先级必须高于 TinyUSB 任务（5）：esp_tinyusb 的任务是
      * `while(1) tud_task();`，持续出帧时它几乎一直就绪，同核上优先级更低的
@@ -95,6 +100,12 @@ void app_main(void)
     (void)ok;
 
     ok = xTaskCreatePinnedToCore(espgpu_gpu_present_task, "gpu_present", 6144, NULL, 6, NULL, 1);
+    configASSERT(ok == pdPASS);
+    (void)ok;
+
+    /* 命令模式的帧发送：与下一帧的命令执行重叠。放 core1，
+     * 命令模式下那里的测试图案任务是空闲的（光栅 worker 只在 PRESENT 时短暂占用）。 */
+    ok = xTaskCreatePinnedToCore(espgpu_gpu_sender_task, "gpu_send", 4096, NULL, 7, NULL, 1);
     configASSERT(ok == pdPASS);
     (void)ok;
 
