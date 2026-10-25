@@ -3,6 +3,14 @@
 #   .\tools\doom\run-dsda.ps1 -DoomDir C:\games\dsda-doom -Iwad doom2.wad
 #   .\tools\doom\run-dsda.ps1 -DoomDir C:\games\dsda-doom -Mode passthrough   # 采 GL 调用清单
 #
+# DSDA-Doom 0.30.1 硬性要求 GL_ARB_shader_objects，GL 1.2 会被拒绝；实测可用的是
+# PrBoom-Plus 2.6.66。没有 doom2.wad 时可以用免费的 Freedoom Phase 2（freedoom2.wad）：
+#
+#   .\tools\doom\run-dsda.ps1 `
+#     -DoomDir C:\tmp\doom-test\prboom\prboom-plus-2666-ucrt64 `
+#     -Exe prboom-plus.exe -Iwad C:\tmp\doom-test\freedoom\freedoom-0.13.0\freedoom2.wad
+#
+# 当前实测（320x200，fw 0.2.0）：约 9 fps；-Res 160x120 约 17 fps，更接近可玩。
 # 做三件事：把 opengl32.dll / espgpu.dll 拷到游戏目录、设好环境变量、启动 DOOM2 MAP01。
 param(
     [Parameter(Mandatory = $true)][string]$DoomDir,
