@@ -283,7 +283,8 @@ static void process_vertex(draw_ctx_t *dc, uint32_t index, gp_cvtx_t *o)
         col[2] *= gp_clampf(lb, 0.0f, 1.0f);
     }
 
-    for (int u = 0; u < 2; u++) {
+    /* VM 模式下 TEXCOORDn 是通用 varying：不做纹理矩阵，也不做投影除法 */
+    for (int u = 0; u < 2 && !dc->vm; u++) {
         if (c->ext.tex_matrix & (1u << u)) {
             float t[4];
             mat_vec4(c->mat[u == 0 ? ESPGPU_MATRIX_TEXTURE0 : ESPGPU_MATRIX_TEXTURE1], tc[u], t);

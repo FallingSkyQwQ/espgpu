@@ -70,6 +70,8 @@ target_include_directories(espgpu
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include ${ESPGPU_SHARED_DIR}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(espgpu PRIVATE ESPGPU_BUILD_DLL)
+# MinGW 默认会加 lib 前缀；前端和文档都按 espgpu.dll 找它
+set_target_properties(espgpu PROPERTIES PREFIX "")
 target_link_libraries(espgpu PRIVATE espgpu_core winusb setupapi gdi32)
 
 # ── espgpu-panel.exe — 控制面板 / 帧查看器（Material 3 风格） ───────
