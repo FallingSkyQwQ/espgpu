@@ -172,6 +172,17 @@ espgpu_device_t *espgpu_open(int, char *, size_t)
     return &g_d;
 }
 uint8_t espgpu_preferred_codec(espgpu_device_t *) { return ESPGPU_CODEC_AUTO; }
+/* ESPGPU_GL_LOG 的 profile 用；替身没有设备统计 */
+int espgpu_get_stats(espgpu_device_t *, espgpu_stats_t *st, int)
+{
+    if (st) memset(st, 0, sizeof(*st));
+    return 0;
+}
+int espgpu_get_link_stats(espgpu_device_t *, espgpu_link_stats_t *ls)
+{
+    if (ls) memset(ls, 0, sizeof(*ls));
+    return 0;
+}
 
 int espgpu_set_mode(espgpu_device_t *, const espgpu_mode_t *m, uint8_t, int)
 {
@@ -452,6 +463,7 @@ int espgpu_cmd_fence(espgpu_device_t *, uint32_t v)
 }
 int espgpu_cmd_flush(espgpu_device_t *, int) { return cmd_flush(); }
 int espgpu_wait_fence(espgpu_device_t *, uint32_t, int) { cmd_flush(); return 0; }
+int espgpu_wait_fence_frame(espgpu_device_t *, uint32_t, int) { cmd_flush(); return 0; }
 int espgpu_wait_frame(espgpu_device_t *, uint32_t after, int) { return g_frame_id > after ? 1 : 0; }
 int espgpu_cmd_present(espgpu_device_t *, int)
 {

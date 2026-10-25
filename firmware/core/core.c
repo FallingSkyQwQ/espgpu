@@ -554,6 +554,13 @@ static void do_present(gpu_core_t *c)
         c->last_bin_us = (uint32_t)(c->cy_bin / r);
         c->last_tile_us = (uint32_t)(c->cy_raster / r);
         c->last_io_us = (uint32_t)(c->cy_io / r);
+        c->last_px_seg_us = (uint32_t)(c->cy_px_seg / r);
+        c->last_px_pix_us = (uint32_t)(c->cy_px_pix / r);
+        c->last_px_rows = c->st_px_rows;
+        c->last_px_segs = c->st_px_segs;
+        c->last_px_tested = c->st_px_tested;
+        c->cy_px_seg = c->cy_px_pix = 0;
+        c->st_px_rows = c->st_px_segs = c->st_px_tested = 0;
         c->cy_vtx = c->cy_clip = c->cy_setup = c->cy_bin = c->cy_raster = c->cy_io = 0;
         memcpy(c->last_path, c->st_path, sizeof(c->last_path));
         memset(c->st_path, 0, sizeof(c->st_path));
@@ -622,7 +629,8 @@ static void reset_state(gpu_core_t *c)
 
 gpu_core_t *gpu_core_create(const gpu_core_config_t *cfg, const gpu_core_cb_t *cb)
 {
-    /* 约 4.5 KB，每个热路径都在读（状态、分箱、worker、矩阵）：放内部 SRAM，失败退回 PSRAM */
+    /* 约 7.5 KB（含每个 worker 1.3 KB 的雾表），每个热路径都在读（状态、分箱、worker、矩阵）：
+     * 放内部 SRAM，失败退回 PSRAM */
     gpu_core_t *c = (gpu_core_t *)gp_alloc_fast(sizeof(gpu_core_t));
     if (c == NULL) {
         return NULL;
@@ -796,6 +804,11 @@ void gpu_core_fill_stats(gpu_core_t *c, espgpu_stats_t *s)
     s->tris_fast = c->last_path[GP_PATH_FAST];
     s->tris_px = c->last_path[GP_PATH_PX];
     s->tris_generic = c->last_path[GP_PATH_GENERIC];
+    s->t_px_seg_us = c->last_px_seg_us;
+    s->t_px_pix_us = c->last_px_pix_us;
+    s->px_rows = c->last_px_rows;
+    s->px_segs = c->last_px_segs;
+    s->px_tested = c->last_px_tested;
     s->raster_passes = c->last_flushes;
 }
 

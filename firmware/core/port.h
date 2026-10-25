@@ -29,7 +29,17 @@ uint64_t gp_time_us(void);
  * ESP：CPU 周期（CCOUNT，每核各自计数，worker 只在自己的核上做差）；主机：TSC / 系统计数器。
  * 每帧每个阶段累加几千次，读一次必须只有几个周期，不能走 esp_timer / 系统调用。
  */
+#if defined(ESP_PLATFORM) && defined(__XTENSA__)
+/* 内联读 CCOUNT（与 esp_cpu_get_cycle_count 相同的指令）：像素管线每段读两次，不能是函数调用 */
+static inline uint32_t gp_cycles(void)
+{
+    uint32_t c;
+    __asm__ __volatile__("rsr %0,ccount" : "=a"(c));
+    return c;
+}
+#else
 uint32_t gp_cycles(void);
+#endif
 /** gp_cycles() 每微秒的计数（ESP：CPU MHz）。可以慢，每帧只调一次。 */
 uint32_t gp_cycles_per_us(void);
 

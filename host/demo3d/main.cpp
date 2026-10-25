@@ -364,7 +364,7 @@ int main(int argc, char **argv)
 
     const auto t_start = std::chrono::steady_clock::now();
     uint64_t frames = 0;
-    uint32_t last_id = espgpu_frame_id(dev);
+    uint32_t fence_v = 0;
     /* 绝对截止时间的帧节奏（见 demo/main.cpp）：sleep 超调不再逐帧累积 */
     const auto period = std::chrono::microseconds(1000000 / fps);
     auto deadline = t_start + period;
@@ -473,10 +473,14 @@ int main(int argc, char **argv)
         espgpu_cmd_present(dev, 1000);
         frames++;
 
-        /* 帧同步：等这一帧回来再画。设备慢时（3D 目前只有几 fps）必须等足够久，
-         * 否则每秒塞 24 帧、设备端排队越来越长，GET_STATS 会排在几千帧之后超时。 */
-        if (espgpu_wait_frame(dev, last_id, 2000) == 1) {
-            last_id = espgpu_frame_id(dev);
+        /* 帧同步（背压）：设备慢时（3D 目前只有几 fps）必须每帧都等，否则每秒塞 24 帧、
+         * 设备端排队越来越长，GET_STATS 会排在几千帧之后超时。等的是上一帧在设备上产出
+         * （PRESENT 后的 FENCE），这一帧的命令已经先发出去了：设备光栅上一帧 / 回传上一帧时
+         * 这一帧的命令已经在路上，三段不再串行；主机最多领先一帧。 */
+        espgpu_cmd_fence(dev, ++fence_v);
+        espgpu_cmd_flush(dev, 1000);
+        if (fence_v > 1) {
+            espgpu_wait_fence(dev, fence_v - 1, 2000);
         }
         espgpu_poll(dev, 0);
 

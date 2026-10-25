@@ -177,6 +177,9 @@ struct espgpu_device {
     std::deque<espgpu_event_t> events;
     uint32_t last_fence = 0;
     bool have_fence = false;
+    /** 最新 FENCE 事件带的「设备最后产出的帧号」低 16 位（新固件，见 ESPGPU_EVTF_FENCE_FRAME） */
+    uint16_t fence_frame = 0;
+    bool have_fence_frame = false;
 
     std::condition_variable frame_cv; /**< 与 frame_mu 配合 */
     std::vector<uint8_t> blit_buf;

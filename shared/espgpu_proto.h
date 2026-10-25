@@ -878,12 +878,23 @@ typedef struct {
     uint32_t tris_px;         /**< 像素管线快速路径（光照 / 雾 / alpha / 混合） */
     uint32_t tris_generic;    /**< 通用浮点路径（多纹理 / VM / 其它组合） */
     uint32_t raster_passes;   /**< 光栅遍数（PRESENT 1 次 + arena 满 / FBO / 改纹理引起的刷新） */
+    /* 像素管线快速路径（tris_px）的细分，t_tile_us 的一部分（两个 worker 相加）。
+     * 每行开销 ≈ t_tile_us - t_px_seg_us - t_px_pix_us - 每三角形×tile 的建立 */
+    uint32_t t_px_seg_us;     /**< 段（≤ 8 像素）的属性建立：透视除法、定点化 */
+    uint32_t t_px_pix_us;     /**< 深度测试之后的逐像素内核 */
+    uint32_t px_rows;         /**< 光栅过的行（跨度）数 */
+    uint32_t px_segs;         /**< 深度测试后还有像素、建立了属性的段数 */
+    uint32_t px_tested;       /**< 做过深度测试的像素数（≥ 写出的片元数） */
 } espgpu_stats_t;
+
+/** FENCE 事件的 code 位 */
+#define ESPGPU_EVTF_FENCE_FRAME 0x01u
 
 /** EVENT 类型 */
 enum {
     ESPGPU_EVT_VSYNC = 1,
-    ESPGPU_EVT_FENCE = 2,
+    ESPGPU_EVT_FENCE = 2,           /**< arg = FENCE 值；code & ESPGPU_EVTF_FENCE_FRAME 时 value =
+                                     *   执行这个 FENCE 时最后产出的帧号低 16 位（新固件） */
     ESPGPU_EVT_ERROR = 3,
     ESPGPU_EVT_MODE_CHANGED = 4,
     ESPGPU_EVT_OTA_PROGRESS = 5,

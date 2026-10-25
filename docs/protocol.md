@@ -280,7 +280,7 @@ USB FS 实测 ~0.75 MB/s，24 fps 时每帧预算 ~31 KB；320x200 RGB565 镜头
 | codec | 值 | 说明 |
 |---|---|---|
 | `BLOCK` | 4 | 有损。载荷 = 每 4x4 块一位的位图 + 每个置位块 8 字节 BC1。关键帧 = 位图全置位；差分帧只带变化的块（按设备上的**源图**比较，误差不累积）。320x200 整帧最多 32.5 KB，静止画面只有 500 B 位图。格式见 `shared/espgpu_block.h`（固件、主机、模拟器共用）。 |
-| `AUTO` | 5 | 只作模式值（`SET_MODE.codec` / `SET_CODEC`），不出现在帧头。差分帧放得进预算时发无损 `DELTA_RLE`；放不下就发 `BLOCK` 关键帧并转入有损状态；有损状态下画面连续静止几帧后补一帧无损 `RLE` 关键帧，回到无损。预算 = 720 KB/s ÷ `mode.max_fps`。 |
+| `AUTO` | 5 | 只作模式值（`SET_MODE.codec` / `SET_CODEC`），不出现在帧头。差分帧放得进预算时发无损 `DELTA_RLE`；放不下就发 `BLOCK` 关键帧并转入有损状态；有损状态下画面连续静止几帧后补一帧无损 `RLE` 关键帧，回到无损。预算 = 720 KB/s × max(1 / `mode.max_fps`, 设备生产一帧的实测忙碌时间)：设备只有几 fps 时（Doom 320x200）上行有富余，差分帧大一些也照发无损（issue #5）。忙碌时间不含等发送槽位、等主机命令的时间，否则会正反馈。 |
 
 设备在 `device_info.codecs` 里用 `ESPGPU_CAP_CODEC_BLOCK / AUTO` 上报支持。主机的
 `espgpu_preferred_codec()` 在设备支持时返回 `AUTO`（环境变量 `ESPGPU_CODEC=auto|block|delta|rle|raw`
@@ -300,3 +300,21 @@ USB FS 实测 ~0.75 MB/s，24 fps 时每帧预算 ~31 KB；320x200 RGB565 镜头
 - 收到 `GET_DEVICE_INFO`（每次 `espgpu_open()` 的握手）或 `SET_MODE`：退出命令模式，
   测试图案约 250 ms 后恢复（期间如果又来了命令就直接留在命令模式，不会闪一帧测试图案）。
   主机侧 WinUSB 是独占的：换了程序或改了模式，就说明之前的命令流已经结束。
+
+### 8.12 帧节奏、编码并行与像素管线统计（issue #5）
+
+- **主机节奏**：GL 1.2 前端和 `espgpu-demo3d` 每帧先把命令和 `PRESENT` 发出去，再发一个
+  `FENCE`，然后等**上一帧**的 `FENCE`（设备光栅 + 编码完、交给发送任务时回）。设备光栅 / 回传
+  上一帧时这一帧的命令已经在路上，下行、光栅、上行三段不再串行；主机最多领先设备一帧，
+  设备的发送槽位满了命令任务自己会等，排队有上限。
+- **FENCE 事件**：设备上的事件改由发送任务在帧之间 / 分片之间发出（命令任务不再等 USB 的
+  TX 互斥量）。新固件的 FENCE 事件 `code` 带 `ESPGPU_EVTF_FENCE_FRAME`，`value` = 执行这个
+  FENCE 时最后产出的帧号低 16 位；`espgpu_wait_fence_frame()` 用它等到那一帧真正收到
+  （GL 1.2 的 `glReadPixels`）。退出命令模式时清掉没发出去的事件。
+- **编码并行**：`PRESENT` 时 core1 的光栅 worker 空闲，`BLOCK` / `RLE` / `DELTA_RLE` 都把一帧
+  切成上下两半在两个核上同时编码，再首尾拼接（游程流按像素顺序，拼接后仍合法；`BLOCK`
+  的分界块编号是 8 的倍数，两半的位图字节不重叠）。
+- **统计**：`espgpu_stats_t` 追加 `t_px_seg_us`（像素管线每段的属性建立：透视除法、定点化）、
+  `t_px_pix_us`（深度测试之后的逐像素内核）、`px_rows` / `px_segs` / `px_tested`。
+  都是两个 worker 相加，属于 `t_tile_us` 的一部分；固件串口每 30 帧多打一行 `px:`。
+

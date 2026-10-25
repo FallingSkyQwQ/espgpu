@@ -256,6 +256,14 @@ ESPGPU_API int espgpu_cmd_flush(espgpu_device_t *dev, int timeout_ms);
 ESPGPU_API int espgpu_wait_fence(espgpu_device_t *dev, uint32_t value, int timeout_ms);
 
 /**
+ * espgpu_wait_fence，然后再等到设备执行这个 FENCE 时最后产出的那一帧也收到、解码完
+ * （PRESENT; FENCE; 本函数 → 之后的快照就是这次 PRESENT 的画面）。设备还会领先主机
+ * 回传前几帧时（帧节奏允许一帧在路上）用它代替「等下一个新帧」。旧固件的 FENCE 不带帧号，
+ * 这时只等到 FENCE。0 = 成功，-2 = 超时，-1 = 断线 / 正在关闭。
+ */
+ESPGPU_API int espgpu_wait_fence_frame(espgpu_device_t *dev, uint32_t value, int timeout_ms);
+
+/**
  * 阻塞等待帧号 > after_frame_id 的帧解码完成。返回 1 = 有新帧，0 = 超时，<0 = 出错。
  * 设备帧号从 1 开始，espgpu_frame_id() 返回 0 表示还没收到过帧。
  */

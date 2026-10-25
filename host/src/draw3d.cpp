@@ -601,6 +601,45 @@ int espgpu_wait_frame(espgpu_device_t *dev, uint32_t after_frame_id, int timeout
     return (!dev->connected.load() || !dev->running.load()) ? -1 : 0;
 }
 
+int espgpu_wait_fence_frame(espgpu_device_t *dev, uint32_t value, int timeout_ms)
+{
+    if (dev == nullptr) {
+        return -1;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const int rc = espgpu_wait_fence(dev, value, timeout_ms);
+    if (rc != 0) {
+        return rc;
+    }
+    bool have = false;
+    uint16_t want = 0;
+    {
+        std::lock_guard<std::mutex> lk(dev->evt_mu);
+        have = dev->have_fence_frame;
+        want = dev->fence_frame;
+    }
+    if (!have) {
+        return 0; /* 旧固件：FENCE 不带帧号 */
+    }
+    const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0).count();
+    const int left = timeout_ms > spent ? timeout_ms - static_cast<int>(spent) : 0;
+    ApiRef ref(dev);
+    link_service_keyframe(dev);
+    std::unique_lock<std::mutex> lk(dev->frame_mu);
+    bool ok = false;
+    dev->frame_cv.wait_for(lk, std::chrono::milliseconds(left), [&] {
+        /* 帧号低 16 位按回绕比较：已收到的帧不早于 want */
+        ok = dev->frame_id != 0 &&
+             static_cast<int16_t>(static_cast<uint16_t>(dev->frame_id) - want) >= 0;
+        return ok || !dev->connected.load() || !dev->running.load();
+    });
+    if (ok) {
+        return 0;
+    }
+    return (!dev->connected.load() || !dev->running.load()) ? -1 : -2;
+}
+
 int espgpu_buffer_upload(espgpu_device_t *dev, uint32_t id, const void *data, uint32_t len)
 {
     if (dev == nullptr || id == 0 || (data == nullptr && len != 0)) {

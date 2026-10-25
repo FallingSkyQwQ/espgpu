@@ -208,6 +208,16 @@ int main()
     espgpu_cmd_fence(dev, 7);
     EXPECT(espgpu_wait_fence(dev, 7, 1000) == 0);
 
+    /* PRESENT; FENCE; wait_fence_frame → 这次 PRESENT 的帧已经收到（FENCE 带回帧号） */
+    {
+        setup(dev);
+        const uint32_t before = espgpu_frame_id(dev);
+        EXPECT(espgpu_cmd_present(dev, 1000) == 0);
+        espgpu_cmd_fence(dev, 8);
+        EXPECT(espgpu_wait_fence_frame(dev, 8, 2000) == 0);
+        EXPECT(static_cast<int32_t>(espgpu_frame_id(dev) - before) > 0);
+    }
+
     /* 关闭时唤醒阻塞者：另一个线程在等永远不会来的 fence 和帧 */
     std::atomic<int> rc_f{99}, rc_w{99};
     std::thread t1([&] { rc_f = espgpu_wait_fence(dev, 1000000, 20000); });

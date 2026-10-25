@@ -34,6 +34,7 @@
 #include "frame_chain.h"
 #include "gpu.h"
 #include "log_fwd.h"
+#include "port.h"
 #include "usb_device.h"
 #include "version.h"
 
@@ -81,7 +82,6 @@ typedef struct {
 #define SEND_SLOTS 2
 static send_slot_t s_slots[SEND_SLOTS];
 static QueueHandle_t s_free_q; /* 可写槽位下标 */
-static QueueHandle_t s_send_q; /* 待发槽位下标 */
 
 static chain_tx_t s_chain_tx;     /* 发送任务写 */
 static chain_prod_t s_chain_prod; /* 命令任务写 */
@@ -299,11 +299,27 @@ void espgpu_gpu_set_clut(const uint16_t *clut)
     espgpu_usb_send_chunk(ESPGPU_CHUNK_CLUT, 0, copy, sizeof(copy), 200);
 }
 
+/* ── 核心事件（FENCE / 纹理换出 …）走发送任务 ──
+ * 主机每帧都等一个 FENCE（issue #5 的帧节奏）。核心在命令任务里产生事件，如果当场发，
+ * 要等 USB 的 TX 互斥量：发送任务正在发一个 32 KB 的帧分片时要等 ~45 ms，命令任务每帧都被卡住。
+ * 现在只进队列，由发送任务在帧之间 / 分片之间发出；发送任务空闲时用一个 -1 的「槽位」叫醒它。 */
+#define EVT_QUEUE 32
+static QueueHandle_t s_evt_q;
+static QueueHandle_t s_send_q; /* 待发槽位下标（-1 = 只是叫醒去发事件） */
+
+static void drain_core_events(void)
+{
+    espgpu_event_t ev;
+    while (s_evt_q && xQueueReceive(s_evt_q, &ev, 0) == pdTRUE) {
+        espgpu_usb_send_event(ev.kind, ev.code, ev.value, ev.arg, 200);
+    }
+}
+
 /* ── 帧发送 ───────────────────────────────────────────────────────── */
 
 static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_len,
                             uint8_t codec, uint16_t w, uint16_t h, uint8_t format,
-                            uint32_t frame_id)
+                            uint32_t frame_id, bool drain_events)
 {
     const uint32_t hdr_sz = (uint32_t)sizeof(espgpu_frame_hdr_t);
     const uint32_t frag_cap = ESPGPU_CHUNK_MAX_PAYLOAD - hdr_sz;
@@ -318,6 +334,9 @@ static esp_err_t send_frame(const uint8_t *enc, uint32_t enc_len, uint32_t raw_l
 
     uint32_t off = 0;
     for (uint32_t i = 0; i < frag_count; i++) {
+        if (drain_events && i > 0) {
+            drain_core_events(); /* 分片之间插进去（一个分片是完整的 Chunk，主机分帧不受影响） */
+        }
         uint32_t n = enc_len - off;
         if (n > frag_cap) {
             n = frag_cap;
@@ -419,7 +438,7 @@ void espgpu_gpu_present_task(void *arg)
 
         /* 3. 发送 */
         err = send_frame(g_gpu.enc_buf, res.enc_bytes, res.raw_bytes, codec, g_gpu.fb.width,
-                         g_gpu.fb.height, g_gpu.fb.format, g_gpu.frame_id);
+                         g_gpu.fb.height, g_gpu.fb.format, g_gpu.frame_id, false);
         int64_t t3 = esp_timer_get_time();
 
         if (err == ESP_OK) {
@@ -535,26 +554,174 @@ static void drain_sender(void)
     }
 }
 
+/* ── 编码分到两个核上（issue #2 / #5） ──
+ * PRESENT 回调在命令任务里执行，这时光栅刚结束，core1 上的光栅 worker 空闲：
+ * 用核心的 gp_parallel 把一帧切成上下两半同时编码，编码时间约减半。
+ * 两半各写槽位缓冲的一个区域，最后把后一半的输出挪到前一半后面。 */
+
+typedef struct {
+    const uint16_t *cur;
+    uint16_t *shadow;
+    uint32_t w, h;
+    int key;
+    uint8_t *bitmap;
+    uint8_t *out[2];
+    size_t cap[2];
+    uint32_t by[3];
+    size_t n[2];
+} block_job_t;
+
+static void block_job(void *ctx, int worker)
+{
+    block_job_t *j = (block_job_t *)ctx;
+    j->n[worker] = espgpu_block_encode_rows(j->cur, j->shadow, j->w, j->h, j->key, j->by[worker],
+                                            j->by[worker + 1], j->bitmap, j->out[worker],
+                                            j->cap[worker]);
+}
+
 /** BLOCK 编码一帧到槽位（shadow 同时更新）。块编码只支持 RGB565，命令模式本来就是。 */
 static esp_err_t encode_block(const uint16_t *pixels, uint16_t w, uint16_t h, bool key,
                               send_slot_t *sl, espgpu_fb_encode_result_t *res)
 {
-    const size_t n = espgpu_block_encode(pixels, (uint16_t *)g_gpu.shadow, w, h, key ? 1 : 0,
-                                         sl->buf, sl->cap);
-    if (n == 0) {
+    const uint32_t bw = (w + 3u) / 4u, bh = (h + 3u) / 4u;
+    const uint32_t bmp = espgpu_block_bitmap_bytes(w, h);
+    if (sl->cap < espgpu_block_max_encoded(w, h)) {
+        return ESP_ERR_INVALID_SIZE; /* 槽位是 1.5 x raw，块编码最多 raw / 4：不会发生 */
+    }
+    memset(sl->buf, 0, bmp);
+    const bool two = gp_worker_count() > 1 && bh >= 4u;
+    const uint32_t mid = two ? espgpu_block_split_row(w, h) : bh;
+    block_job_t j = {
+        .cur = pixels,
+        .shadow = (uint16_t *)g_gpu.shadow,
+        .w = w,
+        .h = h,
+        .key = key ? 1 : 0,
+        .bitmap = sl->buf,
+        .out = {sl->buf + bmp, sl->buf + bmp + (size_t)mid * bw * 8u},
+        .cap = {(size_t)mid * bw * 8u, (size_t)(bh - mid) * bw * 8u},
+        .by = {0, mid, bh},
+        .n = {0, 0},
+    };
+    if (two) {
+        gp_parallel(block_job, &j);
+    } else {
+        block_job(&j, 0);
+    }
+    if (j.n[0] == (size_t)-1 || j.n[1] == (size_t)-1) {
         return ESP_ERR_INVALID_SIZE;
     }
+    if (j.n[1] && j.out[0] + j.n[0] != j.out[1]) {
+        memmove(j.out[0] + j.n[0], j.out[1], j.n[1]);
+    }
     res->raw_bytes = (uint32_t)w * h * 2u;
-    res->enc_bytes = (uint32_t)n;
+    res->enc_bytes = (uint32_t)(bmp + j.n[0] + j.n[1]);
     return ESP_OK;
 }
 
-/** AUTO 每帧带宽预算（字节）：链路速率 / 目标帧率，至少 8 KB */
+typedef struct {
+    const uint8_t *cur;
+    uint8_t *shadow;
+    uint8_t codec;
+    size_t off[2], bytes[2];
+    uint8_t *out[2];
+    size_t cap[2];
+    esp_err_t err[2];
+    uint32_t n[2];
+} rle_job_t;
+
+static void rle_job(void *ctx, int worker)
+{
+    rle_job_t *j = (rle_job_t *)ctx;
+    espgpu_fb_encode_result_t r = {0};
+    j->err[worker] = espgpu_encode_update(j->cur + j->off[worker], j->shadow + j->off[worker],
+                                          j->bytes[worker], 2, j->codec, j->out[worker],
+                                          j->cap[worker], &r);
+    j->n[worker] = r.enc_bytes;
+}
+
+/**
+ * 无损编码（RAW / RLE / DELTA_RLE），shadow 同时更新。RLE / DELTA_RLE 的流是按像素顺序的
+ * 一串游程，两半各自编码再首尾相接仍是合法的流（分界处最多少合并一个游程）。
+ * 每半输入 raw/2，输出最坏约 0.51 raw，槽位一半（0.75 raw）放得下。
+ */
+static esp_err_t encode_lossless(const uint8_t *cur, size_t raw, uint8_t codec, send_slot_t *sl,
+                                 espgpu_fb_encode_result_t *res)
+{
+    if (codec == ESPGPU_CODEC_RAW || raw < 16384u || gp_worker_count() < 2) {
+        return espgpu_encode_update(cur, g_gpu.shadow, raw, 2, codec, sl->buf, sl->cap, res);
+    }
+    const size_t half = (raw / 2u) & ~(size_t)127u; /* 64 像素对齐：编码器按 32 位字比较 */
+    rle_job_t j = {
+        .cur = cur,
+        .shadow = g_gpu.shadow,
+        .codec = codec,
+        .off = {0, half},
+        .bytes = {half, raw - half},
+        .out = {sl->buf, sl->buf + sl->cap / 2u},
+        .cap = {sl->cap / 2u, sl->cap - sl->cap / 2u},
+        .err = {ESP_OK, ESP_OK},
+        .n = {0, 0},
+    };
+    gp_parallel(rle_job, &j);
+    if (j.err[0] != ESP_OK) {
+        return j.err[0];
+    }
+    if (j.err[1] != ESP_OK) {
+        return j.err[1];
+    }
+    memmove(sl->buf + j.n[0], j.out[1], j.n[1]);
+    res->raw_bytes = (uint32_t)raw;
+    res->enc_bytes = j.n[0] + j.n[1];
+    return ESP_OK;
+}
+
+/* ── AUTO 的带宽预算 ──
+ * 以前按目标帧率算（24 fps → 30 KB/帧）。设备实际只有几 fps 时（Doom 320x200），
+ * 无损差分其实放得下，却被逼成有损（issue #5）。现在按「设备生产一帧实际忙了多久」算：
+ * 两次 PRESENT 的间隔，减掉等空闲发送槽位的时间、减掉命令任务没活干（等主机命令）的时间。
+ * 这两段都和 USB 上行有关（主机等上一帧收完才发下一帧），算进预算会正反馈：
+ * 无损帧越大 → 等得越久 → 预算越大。一帧的 USB 时间不超过忙碌时间时，发送和下一帧的
+ * 渲染完全重叠，不影响帧率；超过了才改发有损。目标帧率的预算作为下限（与以前相同）。
+ * 这些变量只有命令任务读写（on_core_present 在命令任务里执行）。 */
+static int64_t s_prev_present_us;
+static uint32_t s_prev_wait_us;
+static uint32_t s_cmd_idle_us; /* 上次 PRESENT 以来命令任务阻塞在接收队列上的时间 */
+static uint32_t s_prod_us;     /* 平滑后的忙碌时间，0 = 还没有测量 */
+static volatile uint32_t s_auto_budget_last; /* 只给日志看 */
+
+static void auto_note_present(int64_t now_us, uint32_t wait_us)
+{
+    if (s_prev_present_us) {
+        const int64_t gap = now_us - s_prev_present_us;
+        int64_t dt = gap - (int64_t)s_prev_wait_us - (int64_t)s_cmd_idle_us;
+        if (gap > 2000000) {
+            s_prod_us = 0; /* 主机停过一阵（换了程序）：重新测 */
+        } else {
+            if (dt < 1000) {
+                dt = 1000;
+            }
+            s_prod_us = s_prod_us ? (uint32_t)((3u * (uint64_t)s_prod_us + (uint64_t)dt) / 4u)
+                                  : (uint32_t)dt;
+        }
+    }
+    s_prev_present_us = now_us;
+    s_prev_wait_us = wait_us;
+    s_cmd_idle_us = 0;
+}
+
+/** AUTO 每帧带宽预算（字节）：max(链路速率 / 目标帧率, 链路速率 × 实测忙碌时间)，至少 8 KB */
 static uint32_t auto_budget(void)
 {
     const uint32_t fps = g_gpu.mode.max_fps ? g_gpu.mode.max_fps : 24u;
-    const uint32_t b = CHAIN_AUTO_LINK_BPS / fps;
-    return b < 8192u ? 8192u : b;
+    uint64_t b = CHAIN_AUTO_LINK_BPS / fps;
+    const uint64_t busy = (uint64_t)CHAIN_AUTO_LINK_BPS * s_prod_us / 1000000u;
+    if (busy > b) {
+        b = busy;
+    }
+    b = b < 8192u ? 8192u : b;
+    s_auto_budget_last = (uint32_t)b;
+    return (uint32_t)b;
 }
 
 /**
@@ -574,8 +741,7 @@ static esp_err_t encode_frame(const uint16_t *pixels, uint16_t w, uint16_t h, si
     case ESPGPU_CODEC_RLE:
         *codec_out = g_gpu.frame_codec;
         *key_out = true;
-        return espgpu_encode_update(cur, g_gpu.shadow, raw, 2, g_gpu.frame_codec, sl->buf,
-                                    sl->cap, res);
+        return encode_lossless(cur, raw, g_gpu.frame_codec, sl, res);
 
     case ESPGPU_CODEC_BLOCK:
         *codec_out = ESPGPU_CODEC_BLOCK;
@@ -594,7 +760,7 @@ static esp_err_t encode_frame(const uint16_t *pixels, uint16_t w, uint16_t h, si
             /* 主机画面是精确的：优先无损。放不进预算（镜头在动）就改发有损关键帧。
              * 无损编码已经把 shadow 更新成这一帧，块编码再对它做一遍是无害的拷贝。 */
             const uint8_t c = need_key ? ESPGPU_CODEC_RLE : ESPGPU_CODEC_DELTA_RLE;
-            err = espgpu_encode_update(cur, g_gpu.shadow, raw, 2, c, sl->buf, sl->cap, res);
+            err = encode_lossless(cur, raw, c, sl, res);
             /* 关键帧（周期性兜底 / 主机要求）允许超预算几倍：只是偶尔一帧慢一点，
              * 不值得为此把静止画面降成有损 */
             const uint32_t limit = need_key ? budget * CHAIN_AUTO_REFRESH_SLACK : budget;
@@ -612,8 +778,7 @@ static esp_err_t encode_frame(const uint16_t *pixels, uint16_t w, uint16_t h, si
         /* 有损状态：画面静止了一阵就补一帧无损关键帧，把有损误差清掉 */
         if (p->calm >= CHAIN_AUTO_CALM_FRAMES && p->refresh_backoff == 0) {
             p->calm = 0;
-            err = espgpu_encode_update(cur, g_gpu.shadow, raw, 2, ESPGPU_CODEC_RLE, sl->buf,
-                                       sl->cap, res);
+            err = encode_lossless(cur, raw, ESPGPU_CODEC_RLE, sl, res);
             if (err == ESP_OK && res->enc_bytes <= budget * CHAIN_AUTO_REFRESH_SLACK) {
                 *codec_out = ESPGPU_CODEC_RLE;
                 *key_out = true;
@@ -641,7 +806,7 @@ static esp_err_t encode_frame(const uint16_t *pixels, uint16_t w, uint16_t h, si
         const uint8_t c = chain_pick_delta_rle(p, need_key, raw);
         *codec_out = c;
         *key_out = c != ESPGPU_CODEC_DELTA_RLE;
-        return espgpu_encode_update(cur, g_gpu.shadow, raw, 2, c, sl->buf, sl->cap, res);
+        return encode_lossless(cur, raw, c, sl, res);
     }
     }
 }
@@ -659,7 +824,10 @@ static void on_core_present(void *user, const uint16_t *pixels, uint16_t w, uint
     /* 等一个空闲槽位：发送比渲染慢时在这里形成背压。
      * 超时丢帧不用关键帧：shadow 没动，主机参考帧仍然和它一致。 */
     int slot = -1;
-    if (xQueueReceive(s_free_q, &slot, pdMS_TO_TICKS(500)) != pdTRUE) {
+    const int64_t t_enter = esp_timer_get_time();
+    const bool got = xQueueReceive(s_free_q, &slot, pdMS_TO_TICKS(500)) == pdTRUE;
+    auto_note_present(t_enter, (uint32_t)(esp_timer_get_time() - t_enter));
+    if (!got) {
         g_gpu.stats.frames_dropped++;
         return;
     }
@@ -704,6 +872,10 @@ void espgpu_gpu_sender_task(void *arg)
         if (xQueueReceive(s_send_q, &slot, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        drain_core_events();
+        if (slot < 0) {
+            continue; /* 只是被叫醒发事件 */
+        }
         send_slot_t *sl = &s_slots[slot];
         if (!chain_tx_should_send(&s_chain_tx, sl->key)) {
             /* 断链后的差分帧：参考帧主机没有，发了只会花屏 */
@@ -713,7 +885,7 @@ void espgpu_gpu_sender_task(void *arg)
         }
         const int64_t t0 = esp_timer_get_time();
         esp_err_t err = send_frame(sl->buf, sl->enc_len, sl->raw_len, sl->codec, sl->w, sl->h,
-                                   ESPGPU_FMT_RGB565, sl->frame_id);
+                                   ESPGPU_FMT_RGB565, sl->frame_id, true);
         g_gpu.stats.t_usb_us = (uint32_t)(esp_timer_get_time() - t0);
         /* 先记结果再还槽位：命令任务拿到这个槽位时一定已经看得到 fail_seq */
         chain_tx_done(&s_chain_tx, sl->key, err == ESP_OK);
@@ -746,14 +918,42 @@ void espgpu_gpu_sender_task(void *arg)
                      (unsigned)cs.triangles, (unsigned)cs.culled, (unsigned)cs.tris_fill,
                      (unsigned)cs.tris_fast, (unsigned)cs.tris_px, (unsigned)cs.tris_generic,
                      (unsigned)cs.raster_passes);
+            /* px 路径细分（issue #5）：每像素 / 每段 / 每行各花多少（两个 worker 相加） */
+            ESP_LOGI(TAG,
+                     "  px: rows %u segs %u tested %u frags %u | seg setup %u us pixel %u us | "
+                     "auto budget %u B",
+                     (unsigned)cs.px_rows, (unsigned)cs.px_segs, (unsigned)cs.px_tested,
+                     (unsigned)cs.fill_pixels, (unsigned)cs.t_px_seg_us, (unsigned)cs.t_px_pix_us,
+                     (unsigned)s_auto_budget_last);
         }
     }
 }
 
+/** 核心事件：进队列交给发送任务（见 drain_core_events），命令任务不等 USB */
 static void on_core_event(void *user, const espgpu_event_t *ev)
 {
     (void)user;
-    espgpu_usb_send_event(ev->kind, ev->code, ev->value, ev->arg, 200);
+    espgpu_event_t e = *ev;
+    if (e.kind == ESPGPU_EVT_FENCE && g_gpu.frame_id > 1) {
+        /* 带上最后产出的帧号：主机（glReadPixels）可以等到这一帧真正收到，不靠猜 */
+        e.code |= ESPGPU_EVTF_FENCE_FRAME;
+        e.value = (uint16_t)(g_gpu.frame_id - 1u);
+    }
+    if (s_evt_q == NULL) {
+        espgpu_usb_send_event(e.kind, e.code, e.value, e.arg, 200);
+        return;
+    }
+    /* 满了（发送任务卡在 USB 上）就等一会儿：事件不能丢、也不能乱序（主机按 FENCE 值 >= 判断） */
+    if (xQueueSend(s_evt_q, &e, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "event queue full, event %u dropped", (unsigned)e.kind);
+        return;
+    }
+    /* 发送任务空闲（队列里什么都没有）时叫醒它；否则它醒着，会在帧之间 / 分片之间顺带发出。
+     * 命令任务是 s_send_q 唯一的生产者，所以「空才放」不会把哨兵堆起来 */
+    if (uxQueueMessagesWaiting(s_send_q) == 0) {
+        const int wake = -1;
+        xQueueSend(s_send_q, &wake, 0);
+    }
 }
 
 /* ── 时钟 ─────────────────────────────────────────────────────────── */
@@ -970,6 +1170,11 @@ static void leave_command_mode(void)
     }
     g_gpu.pattern_hold_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + 250u;
     g_gpu.command_mode = false;
+    /* 上一个程序没发出去的事件（FENCE 等）不能漏给下一个主机：它的 FENCE 值可能很大，
+     * 会让新会话的帧节奏等待全部直接通过 */
+    if (s_evt_q) {
+        xQueueReset(s_evt_q);
+    }
     /* 测试图案路径的差分参考（fb 双缓冲）主机早就没有了，第一帧必须是关键帧 */
     g_gpu.force_keyframe = true;
     ESP_LOGI(TAG, "leaving command mode, test patterns resume");
@@ -1230,7 +1435,10 @@ void espgpu_gpu_command_task(void *arg)
         drain_logs();
 
         rx_item_t it;
-        if (xQueueReceive(s_rx_work_q, &it, pdMS_TO_TICKS(100)) != pdTRUE) {
+        const int64_t w0 = esp_timer_get_time();
+        const bool got = xQueueReceive(s_rx_work_q, &it, pdMS_TO_TICKS(100)) == pdTRUE;
+        s_cmd_idle_us += (uint32_t)(esp_timer_get_time() - w0); /* AUTO 预算不算这段 */
+        if (!got) {
             continue;
         }
         uint8_t *payload = s_rx_buf[it.buf];
@@ -1334,7 +1542,9 @@ esp_err_t espgpu_gpu_init(void)
     }
 
     s_free_q = xQueueCreate(SEND_SLOTS, sizeof(int));
-    s_send_q = xQueueCreate(SEND_SLOTS, sizeof(int));
+    /* 多一格给「叫醒」哨兵：哨兵永远不会占掉真正槽位的位置，PRESENT 不会被它卡住 */
+    s_send_q = xQueueCreate(SEND_SLOTS + 1, sizeof(int));
+    s_evt_q = xQueueCreate(EVT_QUEUE, sizeof(espgpu_event_t));
     if (s_free_q == NULL || s_send_q == NULL) {
         return ESP_ERR_NO_MEM;
     }

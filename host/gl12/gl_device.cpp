@@ -213,21 +213,26 @@ void device_present(Context *c)
 
     /* 背压：设备比目标帧率慢时（Doom 在 320x200 上可能只有几 fps），
      * 只等一个帧周期会让主机每秒塞进几十帧，命令在设备端越排越多，
-     * 控制请求和画面延迟都跟着崩。提交下一帧之前先把上一帧等掉；
+     * 控制请求和画面延迟都跟着崩。所以每帧都要等，但等的是「上一帧在设备上已经产出」
+     * （PRESENT 后面跟一个 FENCE：光栅 + 编码完、交给发送任务时设备回 FENCE 事件），
+     * 而且是先把这一帧的命令发出去再等：
+     *   - 设备光栅上一帧的同时，这一帧的命令已经在路上（以前要等上一帧整个回传到主机
+     *     才开始发，下行命令、光栅、上行回传三段完全串行，issue #5）；
+     *   - 上行回传和下一帧的命令执行也重叠（发送任务在 core1，槽位满了设备自己会等）；
+     *   - 主机最多领先设备一帧，排队有上限。
      * 等待有上限（默认至少 1 s），设备真的卡住时最多多排一帧，不会无限增长。 */
     const int bp_ms = g_wait_ms > 1000 ? g_wait_ms : 1000;
-    if (g_sh.inflight) {
-        if (espgpu_wait_frame(dev, g_sh.inflight_before, bp_ms) == 1) {
-            g_sh.last_frame_id = espgpu_frame_id(dev);
-        }
-        g_sh.inflight = false;
-    }
-
     flush_pending(c);
-    const uint32_t before = espgpu_frame_id(dev);
     espgpu_cmd_present(dev, 1000);
-    g_sh.inflight_before = before;
+    const uint32_t fv = ++g_sh.fence;
+    espgpu_cmd_fence(dev, fv);
+    espgpu_cmd_flush(dev, 1000);
+    if (g_sh.inflight) {
+        espgpu_wait_fence(dev, g_sh.inflight_fence, bp_ms);
+    }
+    g_sh.inflight_fence = fv;
     g_sh.inflight = true;
+    g_sh.last_frame_id = espgpu_frame_id(dev);
 
     /* 帧周期 */
     const LONGLONG period = g_sh.qpf.QuadPart / g_sh.fps;
@@ -299,6 +304,10 @@ void device_present(Context *c)
                      ds.t_bin_us / 1000.0, ds.t_tile_us / 1000.0, ds.t_tile_io_us / 1000.0,
                      ds.t_encode_us / 1000.0, ds.t_usb_us / 1000.0, ds.tris_fill, ds.tris_fast,
                      ds.tris_px, ds.tris_generic, ds.raster_passes, ds.fill_pixels, ls.in_kbps);
+            /* px 路径细分（issue #5）：tile 时间里段建立 / 逐像素各占多少，余下是每行 + 每三角形 */
+            log_line("perf: px rows %u segs %u tested %u | seg setup %.1f pixel %.1f ms",
+                     ds.px_rows, ds.px_segs, ds.px_tested, ds.t_px_seg_us / 1000.0,
+                     ds.t_px_pix_us / 1000.0);
             s_perf_t0 = now2;
             s_perf_f0 = g_sh.frame;
         }

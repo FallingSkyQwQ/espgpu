@@ -111,7 +111,14 @@ void ctrl_resp(EmuState *e, const espgpu_ctrl_req_t &req, uint16_t status, const
 
 void on_event(void *user, const espgpu_event_t *ev)
 {
-    emit(static_cast<EmuState *>(user), ESPGPU_CHUNK_EVENT, ev, sizeof(*ev));
+    auto *e = static_cast<EmuState *>(user);
+    espgpu_event_t out = *ev;
+    if (out.kind == ESPGPU_EVT_FENCE && e->frame_id > 1) {
+        /* 与固件相同：带上最后产出的帧号（on_present 在同一线程里递增 frame_id） */
+        out.code |= ESPGPU_EVTF_FENCE_FRAME;
+        out.value = static_cast<uint16_t>(e->frame_id - 1);
+    }
+    emit(e, ESPGPU_CHUNK_EVENT, &out, sizeof(out));
 }
 
 /** PRESENT：按 RLE 编码后分片发出（RLE 比 RAW 少拷很多字节，解码也走正常路径） */

@@ -71,11 +71,14 @@ void gp_log(int level, const char *fmt, ...)
     }
 }
 
-/* 分段计时（统计里的 t_vtx_us / t_setup_us / t_tile_us …）：读 CCOUNT 约 8 个周期 */
+/* 分段计时（统计里的 t_vtx_us / t_setup_us / t_tile_us …）：Xtensa 上 gp_cycles() 在 port.h 里
+ * 内联读 CCOUNT；其它架构（RISC-V 的 ESP32-C/H/P）走这里 */
+#if !defined(__XTENSA__)
 IRAM_ATTR uint32_t gp_cycles(void)
 {
     return (uint32_t)esp_cpu_get_cycle_count();
 }
+#endif
 
 uint32_t gp_cycles_per_us(void)
 {

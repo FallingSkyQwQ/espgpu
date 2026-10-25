@@ -172,6 +172,8 @@ void dispatch(espgpu_device *dev, const espgpu_chunk_hdr_t &hdr, const uint8_t *
             if (ev.kind == ESPGPU_EVT_FENCE) {
                 dev->last_fence = ev.arg;
                 dev->have_fence = true;
+                dev->have_fence_frame = (ev.code & ESPGPU_EVTF_FENCE_FRAME) != 0;
+                dev->fence_frame = ev.value;
             }
             dev->events.push_back(ev);
             while (dev->events.size() > 1024) {

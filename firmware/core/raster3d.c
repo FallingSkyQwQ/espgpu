@@ -342,6 +342,7 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
     const bool vm = (t->flags & GP_TF_VM) != 0 && s->vm && s->prog;
 
     const int o_col = t->o_col, o_t0 = t->o_t0, o_t1 = t->o_t1, o_fog = t->o_fog;
+    const bool icol = o_col >= 0 && !(t->cflags & GP_TC_COLOR); /* 否则颜色是常量 const_rgba */
 
     const uint32_t Cconst = ((uint32_t)t->const_rgba[3] << 24) | ((uint32_t)t->const_rgba[0] << 16) |
                             ((uint32_t)t->const_rgba[1] << 8) | t->const_rgba[2];
@@ -500,7 +501,7 @@ GP_HOT static void raster_tri_generic(tile_ctx_t *tc, const gp_tri_t *t, const g
                     }
                     out = float_rgba(o);
                 } else {
-                    const uint32_t C = o_col >= 0 ? float_rgba(&va[o_col]) : Cconst;
+                    const uint32_t C = icol ? float_rgba(&va[o_col]) : Cconst;
                     uint32_t T0 = 0xFFFFFFFFu, T1 = 0xFFFFFFFFu;
                     if (s0) {
                         T0 = lin0 ? gp_sample_linear(s0, va[o_t0], va[o_t0 + 1])
@@ -872,6 +873,8 @@ typedef struct {
     uint8_t rep_u, rep_v;    /* 段起点折回（REPEAT / MIRROR） */
     uint8_t lin;             /* 双线性 */
     float fpu, fpv;          /* 折回周期 */
+    float ifpu, ifpv;        /* 1 / 周期（折回用乘法，不调 floorf、不做除法） */
+    float wlo_u, whi_u, wlo_v, whi_v; /* 段起点在 [lo, hi) 内就不用折回：2 的幂 REPEAT 靠掩码，范围放宽到 ±4096 */
     /* 片元 */
     uint8_t mod;             /* 输出 = T × C（否则 = T） */
     uint8_t fog;
@@ -880,7 +883,12 @@ typedef struct {
     cmpf_t zf, af;
     uint32_t aref;
     uint32_t fog_rb, fog_g;  /* 雾色 r<<16|b、g */
-    uint32_t crb, cga;       /* o_col < 0 时的常量色，8.8 打包（同 RB / GA 步进量） */
+    uint32_t crb, cga;       /* 常量色（无颜色属性或 GP_TC_COLOR），8.8 打包（同 RB / GA 步进量） */
+    uint8_t ccol;            /* 颜色是常量：调制遍直接乘常数，不逐像素算插值 */
+    uint8_t cgray;           /* 常量色 r == g == b（Doom 的亮度）：r、b 打包一次乘 */
+    uint8_t cr, cg, cb, ca;
+    const uint32_t *fog_rbt; /* 雾表（worker 里）：f → mul_rb(雾色 rb, 255-f) */
+    const uint8_t *fog_gt;   /*                  f → gp_mul8(雾色 g, 255-f) */
 } pxs_t;
 
 /** 打包通道 × 标量 /255（每半字与 gp_mul8 逐位相同；每半字 ≤ 65153，两半互不进位） */
@@ -1133,40 +1141,42 @@ GP_INLINE void px_fetch_n(const pxs_t *k, const int kind, const uint8_t *ix, int
 }
 
 /**
- * 一段（≤ 8 像素）分几遍做：深度 → 取样 → 调制 → 雾 → alpha 测试 → 写出。
- * 每遍是只有几个活跃变量的小循环（不溢出寄存器），开关在段级判断一次而不是逐像素；
- * 深度 / alpha 测试把通过的像素下标无分支地压紧到 ix[]，后面几遍只算通过的像素
- * （逐像素的定点量由 起点 + 下标 × 步进 一次乘法得到）。
+ * 一段（≤ 8 像素）的深度遍：通过的像素下标无分支地压紧到 ix[]，深度值存 zz[]。
+ * 在段的属性建立（透视除法等）之前做：整段被挡住时那些都省掉（Doom 按纹理排序画，
+ * 被深度挡住的段约占两成）。返回通过的像素数。
  */
-GP_INLINE uint32_t px_seg(const pxs_t *k, int kind, bool lin, const px_seg_t *sg, uint16_t *cp,
-                          uint16_t *dp, int len, int32_t U, int32_t dU, int32_t V, int32_t dV)
+GP_INLINE int px_depth(const pxs_t *k, uint32_t Z, uint32_t dZ, const uint16_t *dp, int len,
+                       uint8_t *ix, uint16_t *zz)
 {
-    uint8_t ix[SEG];
-    uint16_t zz[SEG];
-    uint32_t trb[SEG], tga[SEG];
     int n = 0;
-
-    /* 深度 */
     if (k->ztest) {
         const cmpf_t zf = k->zf;
-        uint32_t Z = sg->Z;
-        for (int i = 0; i < len; i++, Z += sg->dZ) {
+        for (int i = 0; i < len; i++, Z += dZ) {
             const uint32_t zi = zfix16(Z);
             ix[n] = (uint8_t)i;
             zz[n] = (uint16_t)zi;
             n += cmpf(&zf, zi, dp[i]) ? 1 : 0;
         }
-        if (n == 0) {
-            return 0;
-        }
     } else {
-        uint32_t Z = sg->Z;
-        for (int i = 0; i < len; i++, Z += sg->dZ) {
+        for (int i = 0; i < len; i++, Z += dZ) {
             ix[i] = (uint8_t)i;
             zz[i] = (uint16_t)zfix16(Z);
         }
         n = len;
     }
+    return n;
+}
+
+/**
+ * 一段（≤ 8 像素）深度之后的几遍：取样 → 调制 → 雾 → alpha 测试 → 写出。
+ * 每遍是只有几个活跃变量的小循环（不溢出寄存器），开关在段级判断一次而不是逐像素；
+ * 只算 px_depth 留下的 n 个像素（逐像素的定点量由 起点 + 下标 × 步进 一次乘法得到）。
+ */
+GP_INLINE uint32_t px_seg(const pxs_t *k, int kind, bool lin, const px_seg_t *sg, uint16_t *cp,
+                          uint16_t *dp, int n, uint8_t *ix, uint16_t *zz, int32_t U, int32_t dU,
+                          int32_t V, int32_t dV)
+{
+    uint32_t trb[SEG], tga[SEG];
 
     /* 取样 → trb = r<<16|b，tga = a<<16|g */
     if (kind == PK_NONE) {
@@ -1191,8 +1201,26 @@ GP_INLINE uint32_t px_seg(const pxs_t *k, int kind, bool lin, const px_seg_t *sg
         }
     }
 
-    /* 调制 T × C（gp_mul8，与通用路径相同） */
-    if (k->mod) {
+    /* 调制 T × C（gp_mul8，与通用路径相同；mul_rb 每半字与 gp_mul8 逐位相同） */
+    if (k->mod && k->ccol) {
+        const uint32_t cr = k->cr, cg = k->cg, cb = k->cb, ca = k->ca;
+        const bool na = k->need_a != 0;
+        if (k->cgray) {
+            for (int j = 0; j < n; j++) {
+                const uint32_t q = tga[j];
+                const uint32_t a = na ? gp_mul8(q >> 16, ca) : 255u;
+                trb[j] = mul_rb(trb[j], cr);
+                tga[j] = (a << 16) | gp_mul8(q & 255u, cr);
+            }
+        } else {
+            for (int j = 0; j < n; j++) {
+                const uint32_t t = trb[j], q = tga[j];
+                const uint32_t a = na ? gp_mul8(q >> 16, ca) : 255u;
+                trb[j] = (gp_mul8(t >> 16, cr) << 16) | gp_mul8(t & 255u, cb);
+                tga[j] = (a << 16) | gp_mul8(q & 255u, cg);
+            }
+        }
+    } else if (k->mod) {
         const uint32_t RB = sg->RB, GA = sg->GA, dRB = sg->dRB, dGA = sg->dGA;
         const bool na = k->need_a != 0;
         for (int j = 0; j < n; j++) {
@@ -1210,12 +1238,16 @@ GP_INLINE uint32_t px_seg(const pxs_t *k, int kind, bool lin, const px_seg_t *sg
 
     /* 雾 */
     if (k->fog) {
-        const uint32_t F = sg->F, dF = sg->dF, frb = k->fog_rb, fg = k->fog_g;
+        /* mix_rb / mix_1 的雾色那一半只和 f 有关，查表（逐位相同）。f 由夹过的端点插值而来，
+         * 总在 [0,255]；& 255 只是防御 */
+        const uint32_t F = sg->F, dF = sg->dF;
+        const uint32_t *frt = k->fog_rbt;
+        const uint8_t *fgt = k->fog_gt;
         for (int j = 0; j < n; j++) {
-            const uint32_t f = (F + ix[j] * dF) >> 8;
+            const uint32_t f = ((F + ix[j] * dF) >> 8) & 255u;
             const uint32_t q = tga[j];
-            trb[j] = mix_rb(trb[j], frb, f);
-            tga[j] = (q & 0x00FF0000u) | mix_1(q & 255u, fg, f);
+            trb[j] = mul_rb(trb[j], f) + frt[f];
+            tga[j] = (q & 0x00FF0000u) | (gp_mul8(q & 255u, f) + fgt[f]);
         }
     }
 
@@ -1264,27 +1296,30 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
     if (!span_init(&sp, t, lo, hi, y0, y1)) {
         return;
     }
+    gp_worker_t *w = tc->w;
     const bool affine = (t->flags & GP_TF_AFFINE) != 0;
     const bool lin = kind != PK_NONE && k->lin;
 
-    /* 需要插值的量：槽 0 u、1 v、2..5 r g b a、6 雾 → 平面下标 */
-    int pl[7], sl[7], na = 0;
+    /* 需要插值的量：槽 0 u、1 v、2..5 r g b a、6 雾。平面先拷到栈上（三角形记录在 PSRAM 的 arena 里） */
+    gp_plane_t P[7];
+    int sl[7], na = 0;
     if (kind != PK_NONE) {
-        pl[na] = t->o_t0; sl[na++] = 0;
-        pl[na] = t->o_t0 + 1; sl[na++] = 1;
+        P[na] = t->att[t->o_t0]; sl[na++] = 0;
+        P[na] = t->att[t->o_t0 + 1]; sl[na++] = 1;
     }
-    const bool icol = k->mod && t->o_col >= 0;
+    const bool icol = k->mod && !k->ccol;
     if (icol) {
         for (int ch = 0; ch < 4; ch++) {
-            pl[na] = t->o_col + ch; sl[na++] = 2 + ch;
+            P[na] = t->att[t->o_col + ch]; sl[na++] = 2 + ch;
         }
     }
     const bool ifog = k->fog;
     if (ifog) {
-        pl[na] = t->o_fog; sl[na++] = 6;
+        P[na] = t->att[t->o_fog]; sl[na++] = 6;
     }
+    const gp_plane_t piw = t->iw;
 
-    uint32_t frags = 0;
+    uint32_t frags = 0, rows = 0, segs = 0, tested = 0, cy_seg = 0, cy_pix = 0;
 
     px_seg_t sg;
     sg.RB = k->crb;
@@ -1293,102 +1328,156 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
     sg.F = 0;
     sg.dF = 0;
     float sv[7] = {0}, ev[7] = {0};
+    uint8_t ix[SEG];
+    uint16_t zz[SEG];
 
     for (int y = y0; y <= y1; y++) {
         int L, R;
         if (!span_next(&sp, &L, &R)) {
             continue;
         }
+        rows++;
         uint16_t *crow = tc->cbuf + (size_t)(y - tc->ty0) * tc->cstride - tc->tx0;
         uint16_t *drow = tc->dbuf ? tc->dbuf + (size_t)(y - tc->ty0) * GP_TILE - tc->tx0 : NULL;
         const float fy = (float)y;
         row_zfix(t, L, R, fy, &sg.Z, &sg.dZ);
         bool have_end = false;
+        /* 一行内 1/w 几乎不变（不抬头低头时的地板 / 天花板、远处的墙）：w = 1/(1/w) 在行内
+         * 线性插值，整行只除两次，不再每段除。1/w 在行内相对变化 ε 时，线性插值 w 的相对误差
+         * 约 ε²/4，texel 坐标的误差约 ε²/4·|u|。要求 ε ≤ 2e-3 且 ε²·max(|u|,|v|) ≤ 6e-5，
+         * 即误差不超过定点精度（1/65536 texel）；颜色 / 雾在 [0,1]，误差可以忽略。 */
+        float wsl = 0.0f, kw = 0.0f;
+        bool wrow = false;
+        if (!affine && L < R) {
+            const float iwl = plane_at(&piw, (float)L, fy), iwr = plane_at(&piw, (float)R, fy);
+            const float d = fabsf(iwr - iwl), a = fabsf(iwl);
+            if (iwl != 0.0f && iwr != 0.0f && d <= 2e-3f * a) {
+                wsl = 1.0f / iwl;
+                wrow = true;
+                if (kind != PK_NONE) {
+                    const float um = fabsf(plane_at(&P[0], (float)L, fy) * wsl) +
+                                     fabsf(plane_at(&P[1], (float)L, fy) * wsl) + 1.0f;
+                    wrow = d * d * um <= 6e-5f * a * a;
+                }
+                if (wrow) {
+                    kw = (1.0f / iwr - wsl) * k_inv_row[R - L];
+                }
+            }
+        }
+        const float fl = (float)L;
 
         for (int xs = L; xs <= R; xs += SEG) {
             const int len = (R - xs + 1) < SEG ? (R - xs + 1) : SEG;
-            const int steps = (xs + SEG <= R) ? SEG : len - 1;
-            const float fx = (float)xs;
-            const float fe = fx + (float)steps;
-            if (affine) {
-                for (int j = 0; j < na; j++) {
-                    sv[sl[j]] = plane_at(&t->att[pl[j]], fx, fy);
-                    ev[sl[j]] = plane_at(&t->att[pl[j]], fe, fy);
-                }
-            } else {
-                if (have_end) {
+            tested += (uint32_t)len;
+            /* 深度先测：整段被挡住就不做下面的透视除法 / 定点化 */
+            const int n = px_depth(k, sg.Z, sg.dZ, drow ? drow + xs : NULL, len, ix, zz);
+            if (n == 0) {
+                have_end = false; /* 下一段的起点要重新算 */
+                goto seg_done;
+            }
+            {
+                const uint32_t cy0 = gp_cycles();
+                const int steps = (xs + SEG <= R) ? SEG : len - 1;
+                const float fx = (float)xs;
+                const float fe = fx + (float)steps;
+                if (affine) {
                     for (int j = 0; j < na; j++) {
-                        sv[sl[j]] = ev[sl[j]];
+                        sv[sl[j]] = plane_at(&P[j], fx, fy);
+                        ev[sl[j]] = plane_at(&P[j], fe, fy);
                     }
                 } else {
-                    const float iw_s = plane_at(&t->iw, fx, fy);
-                    const float ws = iw_s != 0.0f ? 1.0f / iw_s : 0.0f;
-                    for (int j = 0; j < na; j++) {
-                        sv[sl[j]] = plane_at(&t->att[pl[j]], fx, fy) * ws;
+                    if (have_end) {
+                        for (int j = 0; j < na; j++) {
+                            sv[sl[j]] = ev[sl[j]];
+                        }
+                    } else {
+                        float ws = wsl + (fx - fl) * kw;
+                        if (!wrow) {
+                            const float iw_s = plane_at(&piw, fx, fy);
+                            ws = iw_s != 0.0f ? 1.0f / iw_s : 0.0f;
+                        }
+                        for (int j = 0; j < na; j++) {
+                            sv[sl[j]] = plane_at(&P[j], fx, fy) * ws;
+                        }
                     }
-                }
-                /* 段终点：中间段取下一段起点（可复用，1/w 每段只除一次）；最后一段取 R 本身 */
-                if (steps > 0) {
-                    const float iw_e = plane_at(&t->iw, fe, fy);
-                    const float we = iw_e != 0.0f ? 1.0f / iw_e : 0.0f;
-                    for (int j = 0; j < na; j++) {
-                        ev[sl[j]] = plane_at(&t->att[pl[j]], fe, fy) * we;
+                    /* 段终点：中间段取下一段起点（可复用，1/w 每段只除一次）；最后一段取 R 本身 */
+                    if (steps > 0) {
+                        float we = wsl + (fe - fl) * kw;
+                        if (!wrow) {
+                            const float iw_e = plane_at(&piw, fe, fy);
+                            we = iw_e != 0.0f ? 1.0f / iw_e : 0.0f;
+                        }
+                        for (int j = 0; j < na; j++) {
+                            ev[sl[j]] = plane_at(&P[j], fe, fy) * we;
+                        }
+                    } else {
+                        for (int j = 0; j < na; j++) {
+                            ev[sl[j]] = sv[sl[j]];
+                        }
                     }
-                } else {
-                    for (int j = 0; j < na; j++) {
-                        ev[sl[j]] = sv[sl[j]];
+                    have_end = true;
+                }
+                const float il = k_inv[steps];
+
+                if (icol) {
+                    pack88(fix88(sv[2]), fix88(ev[2]), fix88(sv[4]), fix88(ev[4]), il, &sg.RB, &sg.dRB);
+                    pack88(fix88(sv[3]), fix88(ev[3]), fix88(sv[5]), fix88(ev[5]), il, &sg.GA, &sg.dGA);
+                }
+                if (ifog) {
+                    const int32_t fs = fix88(sv[6]), fe8 = fix88(ev[6]);
+                    sg.F = (uint32_t)fs;
+                    sg.dF = (uint32_t)(int32_t)((float)(fe8 - fs) * il);
+                }
+
+                int32_t U = 0, V = 0, dU = 0, dV = 0;
+                if (kind != PK_NONE) {
+                    float u = sv[0], v = sv[1];
+                    const float du = (ev[0] - u) * il, dv = (ev[1] - v) * il;
+                    /* 折回起点（周期不变，减的是周期的整数倍，结果精确）：REPEAT 到 [0, n)，MIRROR 到
+                     * [0, 2n)。2 的幂 REPEAT 的 texel 下标本来就用掩码，只有坐标太大放不进定点时才折回。
+                     * 乘倒数 + gp_floor_i 代替 floorf(u / n)：差一时起点略出 [0, n)，逐像素的越界
+                     * 检查（px_wrap）会接住，取到的 texel 不变 */
+                    if (k->rep_u && !(u >= k->wlo_u && u < k->whi_u)) {
+                        u -= (float)gp_floor_i(u * k->ifpu) * k->fpu;
                     }
+                    if (k->rep_v && !(v >= k->wlo_v && v < k->whi_v)) {
+                        v -= (float)gp_floor_i(v * k->ifpv) * k->fpv;
+                    }
+                    const float uo = lin ? u - 0.5f : u, vo = lin ? v - 0.5f : v;
+                    const float uz = uo + du * (float)(len - 1);
+                    const float vz = vo + dv * (float)(len - 1);
+                    if (!(fabsf(uo) < 16000.0f && fabsf(uz) < 16000.0f && fabsf(vo) < 16000.0f &&
+                          fabsf(vz) < 16000.0f)) {
+                        frags += px_seg_slow(k, &sg, crow, drow, xs, len, u, du, v, dv);
+                        goto seg_done;
+                    }
+                    /* 四舍五入到 1/65536（与 fast 路径相同）；段两端都在 ±16000 内，int32 不会溢出 */
+                    U = gp_floor_i(uo * 65536.0f + 0.5f);
+                    V = gp_floor_i(vo * 65536.0f + 0.5f);
+                    dU = len > 1 ? gp_floor_i(du * 65536.0f + 0.5f) : 0;
+                    dV = len > 1 ? gp_floor_i(dv * 65536.0f + 0.5f) : 0;
                 }
-                have_end = true;
+                const uint32_t cy1 = gp_cycles();
+                frags += px_seg(k, kind, lin, &sg, crow + xs, drow ? drow + xs : NULL, n, ix, zz, U,
+                                dU, V, dV);
+                cy_pix += gp_cycles() - cy1;
+                cy_seg += cy1 - cy0;
+                segs++;
             }
-            const float il = k_inv[steps];
-
-            if (icol) {
-                pack88(fix88(sv[2]), fix88(ev[2]), fix88(sv[4]), fix88(ev[4]), il, &sg.RB, &sg.dRB);
-                pack88(fix88(sv[3]), fix88(ev[3]), fix88(sv[5]), fix88(ev[5]), il, &sg.GA, &sg.dGA);
-            }
-            if (ifog) {
-                const int32_t fs = fix88(sv[6]), fe8 = fix88(ev[6]);
-                sg.F = (uint32_t)fs;
-                sg.dF = (uint32_t)(int32_t)((float)(fe8 - fs) * il);
-            }
-
-            int32_t U = 0, V = 0, dU = 0, dV = 0;
-            if (kind != PK_NONE) {
-                float u = sv[0], v = sv[1];
-                const float du = (ev[0] - u) * il, dv = (ev[1] - v) * il;
-                /* 折回起点：REPEAT 到 [0, n)，MIRROR 到 [0, 2n)（周期不变） */
-                if (k->rep_u && (u < 0.0f || u >= k->fpu)) {
-                    u -= floorf(u / k->fpu) * k->fpu;
-                }
-                if (k->rep_v && (v < 0.0f || v >= k->fpv)) {
-                    v -= floorf(v / k->fpv) * k->fpv;
-                }
-                const float uo = lin ? u - 0.5f : u, vo = lin ? v - 0.5f : v;
-                const float uz = uo + du * (float)(len - 1);
-                const float vz = vo + dv * (float)(len - 1);
-                if (!(fabsf(uo) < 16000.0f && fabsf(uz) < 16000.0f && fabsf(vo) < 16000.0f &&
-                      fabsf(vz) < 16000.0f)) {
-                    frags += px_seg_slow(k, &sg, crow, drow, xs, len, u, du, v, dv);
-                    goto seg_done;
-                }
-                /* 四舍五入到 1/65536（与 fast 路径相同）；段两端都在 ±16000 内，int32 不会溢出 */
-                U = gp_floor_i(uo * 65536.0f + 0.5f);
-                V = gp_floor_i(vo * 65536.0f + 0.5f);
-                dU = len > 1 ? gp_floor_i(du * 65536.0f + 0.5f) : 0;
-                dV = len > 1 ? gp_floor_i(dv * 65536.0f + 0.5f) : 0;
-            }
-
-            frags += px_seg(k, kind, lin, &sg, crow + xs, drow ? drow + xs : NULL, len, U, dU, V, dV);
         seg_done:
             sg.Z += sg.dZ * len;
         }
     }
-    tc->w->fragments += frags;
+    w->fragments += frags;
+    w->n_px_rows += rows;
+    w->n_px_segs += segs;
+    w->n_px_tested += tested;
+    w->cy_px_seg += cy_seg;
+    w->cy_px_pix += cy_pix;
 }
 
 /** 能否走像素管线快速路径：能则填好 k、返回取样方式（PK_*），否则 -1 */
-static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k)
+static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k, gp_worker_t *w)
 {
 #ifdef GP_TEST_NO_PX
     return -1; /* 测试用：强制走通用路径，与快速路径逐像素对比 */
@@ -1435,6 +1524,12 @@ static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k)
             k->rep_v = sm->wrap_v != ESPGPU_WRAP_CLAMP;
             k->fpu = (float)(sm->wrap_u == ESPGPU_WRAP_MIRROR ? 2 * tex->w : tex->w);
             k->fpv = (float)(sm->wrap_v == ESPGPU_WRAP_MIRROR ? 2 * tex->h : tex->h);
+            k->ifpu = 1.0f / k->fpu;
+            k->ifpv = 1.0f / k->fpv;
+            k->wlo_u = k->mu != ~0u ? -4096.0f : 0.0f;
+            k->whi_u = k->mu != ~0u ? 4096.0f : k->fpu;
+            k->wlo_v = k->mv != ~0u ? -4096.0f : 0.0f;
+            k->whi_v = k->mv != ~0u ? 4096.0f : k->fpv;
         } else if (sh == ESPGPU_SHADE_TEX) {
             return -1; /* 无纹理的 TEX = 白色：少见，通用路径 */
         }
@@ -1442,11 +1537,17 @@ static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k)
     /* TEX_MOD_COLOR / FLAT：T × C（FLAT 与无纹理时 T = 白，gp_mul8(255, c) == c）。
      * 常量白色（2D 精灵、COLOR 255）：gp_mul8(t, 255) == t，省掉逐像素 4 次乘法 */
     const uint8_t *cc = t->const_rgba;
+    k->ccol = (t->o_col < 0 || (t->cflags & GP_TC_COLOR)) ? 1 : 0;
     k->mod = sh != ESPGPU_SHADE_TEX &&
-             !(kind != PK_NONE && t->o_col < 0 && cc[0] == 255 && cc[1] == 255 && cc[2] == 255 &&
+             !(kind != PK_NONE && k->ccol && cc[0] == 255 && cc[1] == 255 && cc[2] == 255 &&
                cc[3] == 255);
     k->crb = ((uint32_t)cc[0] << 24) | ((uint32_t)cc[2] << 8) | 0x00800080u;
     k->cga = ((uint32_t)cc[1] << 24) | ((uint32_t)cc[3] << 8) | 0x00800080u;
+    k->cr = cc[0];
+    k->cg = cc[1];
+    k->cb = cc[2];
+    k->ca = cc[3];
+    k->cgray = (cc[0] == cc[1] && cc[1] == cc[2]) ? 1 : 0;
 
     if (s->blend) {
         if (s->bop != ESPGPU_BLEND_OP_ADD) {
@@ -1471,6 +1572,20 @@ static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k)
     k->fog = (s->fog && t->o_fog >= 0) ? 1 : 0;
     k->fog_rb = ((uint32_t)s->fog_r << 16) | s->fog_b;
     k->fog_g = s->fog_g;
+    if (k->fog) {
+        /* 雾表每个 worker 一份，雾色变了才重建（256 项，Doom 一整关只有一种雾色） */
+        const uint32_t key = 0x80000000u | ((uint32_t)s->fog_r << 16) | ((uint32_t)s->fog_g << 8) |
+                             s->fog_b;
+        if (w->fog_key != key) {
+            for (uint32_t f = 0; f < 256u; f++) {
+                w->fog_rb_tab[f] = mul_rb(k->fog_rb, 255u - f);
+                w->fog_g_tab[f] = (uint8_t)gp_mul8(k->fog_g, 255u - f);
+            }
+            w->fog_key = key;
+        }
+        k->fog_rbt = w->fog_rb_tab;
+        k->fog_gt = w->fog_g_tab;
+    }
     k->ztest = s->depth_test;
     k->zwrite = s->depth_write;
     k->zany = (k->ztest || k->zwrite) ? 1 : 0;
@@ -1700,7 +1815,7 @@ static void raster_tile(gpu_core_t *c, int worker, int tile)
             } else if (!count_frags && state_is_fast(t, s)) {
                 raster_tri_fast(&tc, t, s);
                 w->n_path[GP_PATH_FAST]++;
-            } else if (!count_frags && (kind = px_setup(t, s, &pk)) >= 0) {
+            } else if (!count_frags && (kind = px_setup(t, s, &pk, w)) >= 0) {
                 raster_tri_px(&tc, t, &pk, kind);
                 w->n_path[GP_PATH_PX]++;
             } else {
@@ -1755,6 +1870,8 @@ void gp_raster_frame(gpu_core_t *c)
         gp_worker_t *w = &c->workers[i];
         w->fragments = 0;
         w->cy_raster = w->cy_io = 0;
+        w->cy_px_seg = w->cy_px_pix = 0;
+        w->n_px_rows = w->n_px_segs = w->n_px_tested = 0;
         memset(w->n_path, 0, sizeof(w->n_path));
     }
     if (c->nworkers > 1) {
@@ -1768,6 +1885,11 @@ void gp_raster_frame(gpu_core_t *c)
         f += w->fragments;
         c->cy_raster += w->cy_raster;
         c->cy_io += w->cy_io;
+        c->cy_px_seg += w->cy_px_seg;
+        c->cy_px_pix += w->cy_px_pix;
+        c->st_px_rows += w->n_px_rows;
+        c->st_px_segs += w->n_px_segs;
+        c->st_px_tested += w->n_px_tested;
         for (int k = 0; k < 4; k++) {
             c->st_path[k] += w->n_path[k];
         }

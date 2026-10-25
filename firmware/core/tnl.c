@@ -691,7 +691,7 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
     uint32_t flags = ol->flags & ~(uint32_t)GP_TF_2D;
     t->type = GP_REC_TRI;
     t->n_att = (uint8_t)n_att;
-    t->pad = 0;
+    t->cflags = 0;
     t->o_col = ol->off_color;
     t->o_t0 = ol->off_t0;
     t->o_t1 = ol->off_t1;
@@ -793,6 +793,23 @@ bool gp_setup_tri(gpu_core_t *c, const gp_wvtx_t *v0, const gp_wvtx_t *v1, const
     }
     if (unit) {
         flags |= GP_TF_UNIT;
+        /* 三个顶点颜色相同：光栅时直接用常量（像素管线每段少插值 4 个通道，见 GP_TC_COLOR）。
+         * 舍入与 float_rgba 相同，通用路径和快速路径取到的是同一个字节 */
+        if (oc >= 0 && !(flags & GP_TF_VM)) {
+            const float *c0 = flat_col ? flat_col : &V[0]->a[oc];
+            bool same = flat_col != NULL;
+            if (!same) {
+                const float *c1 = &V[1]->a[oc], *c2 = &V[2]->a[oc];
+                same = c0[0] == c1[0] && c0[1] == c1[1] && c0[2] == c1[2] && c0[3] == c1[3] &&
+                       c0[0] == c2[0] && c0[1] == c2[1] && c0[2] == c2[2] && c0[3] == c2[3];
+            }
+            if (same) {
+                t->cflags |= GP_TC_COLOR;
+                for (int i = 0; i < 4; i++) {
+                    t->const_rgba[i] = (uint8_t)(c0[i] * 255.0f + 0.5f);
+                }
+            }
+        }
     }
     t->flags = (uint8_t)flags;
 

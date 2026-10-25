@@ -158,6 +158,12 @@ enum {
     GP_TF_2D = 1u << 7,          /* 仅用于 olayout：用 2D 管线状态快照 */
 };
 
+/** gp_tri_t.cflags */
+enum {
+    GP_TC_COLOR = 1u << 0, /* 有颜色属性，但三个顶点颜色相同（且在 [0,1]）：光栅时取 const_rgba，不插值。
+                            * GL 前端按帧合批时 glColor 变成逐顶点属性，Doom 的墙 / 地面每个多边形一个亮度 */
+};
+
 /** 平面方程 p(x,y) = c + dx*x + dy*y，(x,y) 为整数像素坐标（中心已折进 c） */
 typedef struct {
     float c, dx, dy;
@@ -167,7 +173,7 @@ typedef struct {
     uint8_t type;   /* GP_REC_TRI */
     uint8_t flags;  /* GP_TF_* */
     uint8_t n_att;
-    uint8_t pad;
+    uint8_t cflags; /* GP_TC_*：建立时发现的常量属性 */
     int8_t o_col, o_t0, o_t1, o_fog; /* 属性偏移，-1 = 无 */
     int16_t bx0, by0, bx1, by1; /* 像素包围盒（含），已与裁剪矩形 / 目标求交 */
     uint32_t state_off;
@@ -250,6 +256,14 @@ typedef struct {
     uint32_t cy_raster;  /* tile 内光栅（不含 tile 取 / 写回） */
     uint32_t cy_io;      /* tile 颜色 / 深度取入与写回 */
     uint32_t n_path[4];  /* 走 fill / fast / px / generic 的三角形×tile 数 */
+    /* 像素管线快速路径的细分计数（issue #5：定位每像素 / 每段 / 每行的开销） */
+    uint32_t cy_px_seg;  /* 段的属性建立（透视除法、定点化） */
+    uint32_t cy_px_pix;  /* 段内逐像素内核（深度之后的取样 / 调制 / 雾 / 写出） */
+    uint32_t n_px_rows, n_px_segs, n_px_tested;
+    /* 雾表：f → mul_rb(雾色 rb, 255-f) / gp_mul8(雾色 g, 255-f)，雾色变化时重建 */
+    uint32_t fog_key;    /* 雾色 r<<16|g<<8|b，| 1<<31 表示有效 */
+    uint32_t fog_rb_tab[256];
+    uint8_t fog_g_tab[256];
 } gp_worker_t;
 
 enum { GP_PATH_FILL = 0, GP_PATH_FAST, GP_PATH_PX, GP_PATH_GENERIC };
@@ -339,6 +353,9 @@ struct gpu_core {
     /* 分段计时（gp_cycles 单位，按帧累加；PRESENT 时换算成 µs 存进 last_*） */
     uint64_t cy_vtx, cy_clip, cy_setup, cy_bin, cy_raster, cy_io;
     uint32_t st_path[4];
+    uint64_t cy_px_seg, cy_px_pix;
+    uint32_t st_px_rows, st_px_segs, st_px_tested;
+    uint32_t last_px_seg_us, last_px_pix_us, last_px_rows, last_px_segs, last_px_tested;
     uint32_t last_vtx_us, last_clip_us, last_setup_us, last_bin_us, last_tile_us, last_io_us;
     uint32_t last_path[4];
     uint32_t last_flushes;

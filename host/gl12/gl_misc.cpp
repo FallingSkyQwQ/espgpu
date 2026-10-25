@@ -99,9 +99,13 @@ void impl_glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GL
         std::lock_guard<std::recursive_mutex> lk(g_sh.mu);
         flush_pending(c);
         espgpu_cmd_present(g_sh.dev, 1000);
-        if (espgpu_wait_frame(g_sh.dev, g_sh.last_frame_id, 500) == 1) {
-            g_sh.last_frame_id = espgpu_frame_id(g_sh.dev);
-        }
+        /* 设备上可能还有上一帧在回传（device_present 让主机领先设备一帧）：FENCE 带回设备
+         * 最后产出的帧号，等到那一帧收到为止（大的无损帧 USB 上要 100+ ms，不能靠猜） */
+        const uint32_t v = ++g_sh.fence;
+        espgpu_cmd_fence(g_sh.dev, v);
+        espgpu_wait_fence_frame(g_sh.dev, v, 1500);
+        g_sh.last_frame_id = espgpu_frame_id(g_sh.dev);
+        g_sh.inflight = false;
         const size_t cap = static_cast<size_t>(g_sh.dev_w) * g_sh.dev_h * 4;
         std::vector<uint8_t> bgra(cap);
         int fw = 0, fh = 0;
