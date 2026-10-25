@@ -1749,7 +1749,13 @@ static bool state_is_fill(const gp_tri_t *t, const gp_rstate_t *s)
            (s->smp[0].tex == NULL || !(t->flags & GP_TF_TEX0) || t->o_t0 < 0);
 }
 
-static void raster_tile(gpu_core_t *c, int worker, int tile)
+/**
+ * 一个 64x64 tile 的全部光栅（fill / fast / px / generic 路径都内联在里面）。
+ * 整个函数放 IRAM：它原来在 flash，内层循环在 240 MHz 下被取指拖慢 —— 实测
+ * 只换这一个属性，Doom 静止 12.8 → 14.9 fps（tile 110 → 91 ms，pixel 64 → 54 ms），
+ * 说明 13 KB 的函数 + 逐像素循环把 flash 指令 cache 压得很厉害。
+ */
+GP_HOT static void raster_tile(gpu_core_t *c, int worker, int tile)
 {
     gp_bin_t *b = &c->bins[tile];
     if (b->count == 0) {
