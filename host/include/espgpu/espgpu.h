@@ -191,6 +191,10 @@ ESPGPU_API int espgpu_cmd_draw_buffer(espgpu_device_t *dev, uint8_t prim, uint32
 ESPGPU_API int espgpu_cmd_bind_texture_unit(espgpu_device_t *dev, uint8_t unit, uint32_t id,
                                             uint8_t filter, uint8_t wrap);
 
+/** 同上，s / t 两个方向各自的 wrap（Doom 天空：s 重复、t 夹取）。 */
+ESPGPU_API int espgpu_cmd_bind_texture_uv(espgpu_device_t *dev, uint8_t unit, uint32_t id,
+                                          uint8_t filter, uint8_t wrap_u, uint8_t wrap_v);
+
 /**
  * 上传纹理，format = RGB565 / RGBA4444（2 B/px）或 INDEX8 / R8（1 B/px）。
  * flags = ESPGPU_TEXF_*。

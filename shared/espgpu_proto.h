@@ -136,6 +136,11 @@ enum {
     ESPGPU_DRAWF_3D = 1u << 0, /**< 使用 VERTEX_LAYOUT 定义的顶点格式并走 T&L；未置位 = M2 的 2D 顶点 */
 };
 
+/** 命令头 flags —— BIND_TEXTURE */
+enum {
+    ESPGPU_BINDF_WRAP_V = 1u << 0, /**< espgpu_bind_texture_t.pad 的低字节是 t 方向 wrap（否则 u/v 都用 wrap） */
+};
+
 /** 命令头 flags —— UPLOAD_TEXTURE */
 enum {
     ESPGPU_TEXF_PRIORITY = 1u << 0, /**< 预加载：LRU 换出时最后考虑 */

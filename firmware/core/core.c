@@ -987,7 +987,8 @@ static void exec_one(gpu_core_t *c, const espgpu_cmd_t *cmd, const uint8_t *body
                 c->bind_id[b.unit] = b.texture;
                 c->bind_filter[b.unit] = b.filter;
                 c->bind_wrap_u[b.unit] = b.wrap;
-                c->bind_wrap_v[b.unit] = b.wrap;
+                c->bind_wrap_v[b.unit] =
+                    (cmd->flags & ESPGPU_BINDF_WRAP_V) ? (uint8_t)(b.pad & 0xFF) : b.wrap;
                 c->rstate_off = 0;
                 c->rstate_2d_off = 0;
             }

@@ -272,6 +272,22 @@ int espgpu_cmd_bind_texture_unit(espgpu_device_t *dev, uint8_t unit, uint32_t id
     return 0;
 }
 
+int espgpu_cmd_bind_texture_uv(espgpu_device_t *dev, uint8_t unit, uint32_t id, uint8_t filter,
+                               uint8_t wrap_u, uint8_t wrap_v)
+{
+    if (dev == nullptr || unit >= ESPGPU_MAX_TEXTURE_UNITS || id > 0xFFFF) {
+        return -1;
+    }
+    espgpu_bind_texture_t b{};
+    b.unit = unit;
+    b.texture = static_cast<uint16_t>(id);
+    b.filter = filter;
+    b.wrap = wrap_u;
+    b.pad = wrap_v;
+    cmd_push(dev, ESPGPU_OP_BIND_TEXTURE, ESPGPU_BINDF_WRAP_V, &b, sizeof(b));
+    return 0;
+}
+
 int espgpu_cmd_upload_texture_ex(espgpu_device_t *dev, uint32_t id, uint16_t width,
                                  uint16_t height, uint8_t format, const void *pixels,
                                  uint8_t flags)
