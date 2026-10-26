@@ -153,3 +153,63 @@
 
 需要重新验证的风险：`-O2` + IRAM 下内层循环的实际耗时；双核领取 tile 时与 USB
 任务的 core0 争用；PSRAM 深度缓冲的 tile 拷入拷出开销（只有开深度测试时才发生）。
+
+---
+
+## px 路径实测画像与优化（320x200，fw f761808 + 本分支）
+
+用 UART 的 `px:` 行 + 临时计数（per-worker 求和）把 `t_tile_us` 拆开，Doom 静止
+（Freedoom MAP01、`-nomonsters`、5373 行 / 帧）：
+
+| 项 | 优化前 | 优化后 |
+|---|---:|---:|
+| tile（两 worker 求和） | 132.6 ms | 108–112 ms |
+| 段建立（seg setup） | 21 ms | 14 ms |
+| 逐像素内核（pixel） | 74 ms | 63–67 ms |
+| 行头（span/1/w 判定） | 11.6 ms | 11.6 ms |
+| 三角形头 + tile 扫描 | ~24 ms | ~24 ms |
+| fps | 11.2–11.5 | 11.9–12.8 |
+| px 段数（每帧） | 11900 | 7800 |
+
+关键发现（用统计字段临时导出，命令行 `px:` 行看不到）：
+
+- **px 段 100% 是常量色**（`glColor` 每三角形一次，`ccol`），一半 r/g/b 不同；
+  23% 走混合（HUD / 精灵），5% 有 alpha 测试。所以“顶点色插值”的融合内核在 Doom
+  上一段都命中不了 —— 热路径是常量色。
+- 平均一段只有 6–7 像素、一行 ~14 像素两段：**段建立的固定开销比逐像素还重**
+  （21 ms vs 74 ms，而像素数是 84k）。把 px 路径的段长从 8 提到 16 后段数少 35%，
+  段建立掉 1/3。
+- 通用 / fast 路径**不能**跟着改：`GP_VM_SPAN`（vm.c）的 span 缓冲按 8 像素开，
+  两者必须一致（`#define GP_VM_SPAN 8 /* = raster3d.c 的 SEG */`）。px 路径的段长
+  是独立的 `PX_SEG`。
+
+主机侧新增：`ESPGPU_GL_DUMP=<path>` + `ESPGPU_GL_DUMP_FRAME=<n>`（默认 90）把设备
+回传的帧存成 BMP（`perf: tex ... KB in ...` 一行给出纹理驻留量）。窗口被遮挡时
+`CopyFromScreen` 抓不到 GL 画面，用这个直接看设备侧光栅器的真实输出。
+
+---
+
+## 内层循环在 flash 里：取指比算术贵得多
+
+上面那批「段建立 / 融合内核 / 段长」的改动之后，px 内层循环仍然 ~200 周期/片元，
+而且出现了两个反常现象：**关雾（少 ~25% 指令）像素时间不变**、**把所有纹理压成 16x16
+（工作集 256 B）像素时间也不变**。两条只能用「取指瓶颈」解释 —— 代码在 flash。
+
+实测（每一次都只改这一个属性，算法不动，320x200，Doom MAP01 静止）：
+
+| 改动 | 效果 |
+|---|---|
+| `raster_tile`（13 KB，fill/fast/px/generic 全内联）加 `IRAM_ATTR` | 12.8 → **14.9 fps**；tile 110 → 91 ms，pixel 64 → 54 ms |
+| T&L 链（`fetch_attr` `get_vertex` `clip_poly` `draw_triangle` `gp_setup_tri` `gp_draw3d`）加 `GP_HOT` | demo3d tnl 40 → **22 ms**；Doom DEMO1 vtx 10.4 → 2.5、setup 11.8 → 2.4 ms |
+| `px_setup`（每三角形×tile）加 `GP_HOT` | +0.2 fps |
+| `raster3d.c / tnl.c / tex.c / vm.c` 单独 `-O3`（不能全局：IDF spiffs 会挂在 `-Werror`） | 15.8 → **16.3 fps**，pixel 50 → 47 ms |
+| 融合内核两像素展开 | pixel −3% |
+
+**教训：先确认代码在 IRAM 里，再抠指令。**`IRAM_ATTR` 的静态函数被 `always_inline`
+内联进 flash 函数时，属性会失效 —— 看 ELF 符号表（`.iram0.text` vs `.flash.text`）
+确认，或者用 `idf.py size`。IRAM 预算：S3 上 `iram0_0_seg` 有 358 KB，实测用了 ~100 KB。
+
+同样口径下的死路（已回退）：BC1 编码器搬 IRAM 无变化（enc 34.3 → 34.0 ms，算术受限）；
+把 Doom 的雾关掉、纹理压到 16x16 也无变化（见上）。
+
+

@@ -28,6 +28,10 @@
 #include "core_internal.h"
 
 #define SEG 8
+/* px 路径（Doom 这类批量小三角形）的段长单独一份：段建立的固定开销按段摊，
+ * Doom 320x200 一行平均只有 ~7 像素、两段，16 像素一段能省掉一半的段建立。
+ * 通用 / fast 路径仍是 SEG（VM 的 span 缓冲 GP_VM_SPAN 与 SEG 对应，不能跟着变）。 */
+#define PX_SEG 16
 
 typedef struct {
     gpu_core_t *c;
@@ -329,9 +333,11 @@ static inline uint32_t zfix16(uint32_t Z)
     return (Z > ZFIX_OFF ? Z - ZFIX_OFF : 0u) >> 15;
 }
 
-/* 1/n，n = 0..SEG（常量折叠，与运行时 1.0f / n 逐位相同） */
-static const float k_inv[SEG + 1] = {0.0f, 1.0f / 1, 1.0f / 2, 1.0f / 3, 1.0f / 4,
-                                     1.0f / 5, 1.0f / 6, 1.0f / 7, 1.0f / 8};
+/* 1/n，n = 0..max(SEG, PX_SEG)（常量折叠，与运行时 1.0f / n 逐位相同） */
+static const float k_inv[PX_SEG + 1] = {0.0f, 1.0f / 1, 1.0f / 2, 1.0f / 3, 1.0f / 4,
+                                     1.0f / 5, 1.0f / 6, 1.0f / 7, 1.0f / 8, 1.0f / 9,
+                                     1.0f / 10, 1.0f / 11, 1.0f / 12, 1.0f / 13, 1.0f / 14,
+                                     1.0f / 15, 1.0f / 16};
 
 /* ── 通用路径 ─────────────────────────────────────────────────────── */
 
@@ -1141,7 +1147,7 @@ GP_INLINE void px_fetch_n(const pxs_t *k, const int kind, const uint8_t *ix, int
 }
 
 /**
- * 一段（≤ 8 像素）的深度遍：通过的像素下标无分支地压紧到 ix[]，深度值存 zz[]。
+ * 一段（≤ PX_SEG，16 像素）的深度遍：通过的像素下标无分支地压紧到 ix[]，深度值存 zz[]。
  * 在段的属性建立（透视除法等）之前做：整段被挡住时那些都省掉（Doom 按纹理排序画，
  * 被深度挡住的段约占两成）。返回通过的像素数。
  */
@@ -1168,15 +1174,103 @@ GP_INLINE int px_depth(const pxs_t *k, uint32_t Z, uint32_t dZ, const uint16_t *
 }
 
 /**
- * 一段（≤ 8 像素）深度之后的几遍：取样 → 调制 → 雾 → alpha 测试 → 写出。
+ * 融合段：最近邻 + 常量色调制 + 可选雾 + 无 alpha 测试 / 混合。
+ * 实测（Doom / PrBoom gl，320x200）：px 段 100% 是常量色（glColor 每个三角形一次）、
+ * 一半 r/g/b 不同，所以热路径是「取样 → 常量色调制 → 雾 → 写出」四遍。
+ * 合成一遍：中间值留在寄存器里，省掉 trb / tga 在栈上的来回存取和每遍重算 ix[j]。
+ * 运算顺序与多遍版本完全相同，输出逐位一致。
+ */
+/**
+ * 一个片元：取样 → 常量色调制 → 雾 → 输出 RGB565。
+ * 单独成 inline 函数是为了让 px_fused_n 手动两像素展开时两次调用互相独立：
+ * Xtensa 是顺序流水，一个像素的链（取样依赖 → 乘 → 乘）不展开就只能干等。
+ */
+GP_INLINE uint32_t px_fused_px(const pxs_t *k, int kind, int i, const px_seg_t *sg, int32_t U,
+                               int32_t dU, int32_t V, int32_t dV)
+{
+    const uint32_t mu = k->mu, mv = k->mv;
+    const int tw = k->tw, th = k->th;
+    int iu = (int)((uint32_t)((U + (uint32_t)i * dU) >> 16) & mu);
+    int iv = (int)((uint32_t)((V + (uint32_t)i * dV) >> 16) & mv);
+    if ((unsigned)iu >= (unsigned)tw) iu = px_wrap(iu, tw, k->wu);
+    if ((unsigned)iv >= (unsigned)th) iv = px_wrap(iv, th, k->wv);
+    const uint32_t ti = (uint32_t)(iv * tw + iu);
+    uint32_t rb, g;
+    if (kind == PK_565) {
+        const uint32_t p = k->px[ti];
+        rb = rb_of565(p);
+        g = g_of565(p);
+    } else {
+        const uint32_t v = k->idx[ti];
+        if (k->px) {
+            const uint32_t p = k->px[v]; /* 调色板 */
+            rb = rb_of565(p);
+            g = g_of565(p);
+        } else {
+            rb = (v << 16) | v;
+            g = v;
+        }
+    }
+    if (k->cgray) {
+        rb = mul_rb(rb, k->cr);
+        g = gp_mul8(g, k->cr);
+    } else {
+        rb = (gp_mul8(rb >> 16, k->cr) << 16) | gp_mul8(rb & 255u, k->cb);
+        g = gp_mul8(g, k->cg);
+    }
+    if (k->fog) {
+        const uint32_t f = ((sg->F + (uint32_t)i * sg->dF) >> 8) & 255u;
+        rb = mul_rb(rb, f) + k->fog_rbt[f];
+        g = gp_mul8(g, f) + k->fog_gt[f];
+    }
+    return pack_rbg(rb, g);
+}
+
+GP_INLINE uint32_t px_fused_n(const pxs_t *k, int kind, const px_seg_t *sg, uint16_t *cp,
+                              uint16_t *dp, int n, const uint8_t *ix, const uint16_t *zz,
+                              int32_t U, int32_t dU, int32_t V, int32_t dV, bool dense)
+{
+    const bool zw = k->zwrite != 0;
+    int j = 0;
+    /* 两像素展开：两次取样 / 调制 / 雾 / 打包互不依赖，流水线能交错起来 */
+    if (dense) {
+        for (; j + 1 < n; j += 2) {
+            const uint32_t c0 = px_fused_px(k, kind, j, sg, U, dU, V, dV);
+            const uint32_t c1 = px_fused_px(k, kind, j + 1, sg, U, dU, V, dV);
+            cp[j] = (uint16_t)c0;
+            cp[j + 1] = (uint16_t)c1;
+            if (zw) {
+                dp[j] = zz[j];
+                dp[j + 1] = zz[j + 1];
+            }
+        }
+    }
+    for (; j < n; j++) {
+        /* 整段的像素都通过深度时没有压缩，下标直接是 j（省掉 ix 的间接访存） */
+        const int i = dense ? j : ix[j];
+        cp[i] = (uint16_t)px_fused_px(k, kind, i, sg, U, dU, V, dV);
+        if (zw) {
+            dp[i] = zz[j];
+        }
+    }
+    return (uint32_t)n;
+}
+
+/**
+ * 一段（≤ PX_SEG，16 像素）深度之后的几遍：取样 → 调制 → 雾 → alpha 测试 → 写出。
  * 每遍是只有几个活跃变量的小循环（不溢出寄存器），开关在段级判断一次而不是逐像素；
  * 只算 px_depth 留下的 n 个像素（逐像素的定点量由 起点 + 下标 × 步进 一次乘法得到）。
  */
 GP_INLINE uint32_t px_seg(const pxs_t *k, int kind, bool lin, const px_seg_t *sg, uint16_t *cp,
                           uint16_t *dp, int n, uint8_t *ix, uint16_t *zz, int32_t U, int32_t dU,
-                          int32_t V, int32_t dV)
+                          int32_t V, int32_t dV, int len)
 {
-    uint32_t trb[SEG], tga[SEG];
+    uint32_t trb[PX_SEG], tga[PX_SEG];
+
+    /* 融合路径：最近邻 + 常量色调制（Doom 的墙 / 地板，实测 100% 常量色）→ 单遍 */
+    if (!lin && kind != PK_NONE && k->mod && k->ccol && !k->atest && !k->blend) {
+        return px_fused_n(k, kind, sg, cp, dp, n, ix, zz, U, dU, V, dV, n == len);
+    }
 
     /* 取样 → trb = r<<16|b，tga = a<<16|g */
     if (kind == PK_NONE) {
@@ -1328,8 +1422,8 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
     sg.F = 0;
     sg.dF = 0;
     float sv[7] = {0}, ev[7] = {0};
-    uint8_t ix[SEG];
-    uint16_t zz[SEG];
+    uint8_t ix[PX_SEG];
+    uint16_t zz[PX_SEG];
 
     for (int y = y0; y <= y1; y++) {
         int L, R;
@@ -1366,8 +1460,8 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
         }
         const float fl = (float)L;
 
-        for (int xs = L; xs <= R; xs += SEG) {
-            const int len = (R - xs + 1) < SEG ? (R - xs + 1) : SEG;
+        for (int xs = L; xs <= R; xs += PX_SEG) {
+            const int len = (R - xs + 1) < PX_SEG ? (R - xs + 1) : PX_SEG;
             tested += (uint32_t)len;
             /* 深度先测：整段被挡住就不做下面的透视除法 / 定点化 */
             const int n = px_depth(k, sg.Z, sg.dZ, drow ? drow + xs : NULL, len, ix, zz);
@@ -1377,7 +1471,7 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
             }
             {
                 const uint32_t cy0 = gp_cycles();
-                const int steps = (xs + SEG <= R) ? SEG : len - 1;
+                const int steps = (xs + PX_SEG <= R) ? PX_SEG : len - 1;
                 const float fx = (float)xs;
                 const float fe = fx + (float)steps;
                 if (affine) {
@@ -1459,7 +1553,7 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
                 }
                 const uint32_t cy1 = gp_cycles();
                 frags += px_seg(k, kind, lin, &sg, crow + xs, drow ? drow + xs : NULL, n, ix, zz, U,
-                                dU, V, dV);
+                                dU, V, dV, len);
                 cy_pix += gp_cycles() - cy1;
                 cy_seg += cy1 - cy0;
                 segs++;
@@ -1477,7 +1571,7 @@ GP_HOT static void raster_tri_px(tile_ctx_t *tc, const gp_tri_t *t, const pxs_t 
 }
 
 /** 能否走像素管线快速路径：能则填好 k、返回取样方式（PK_*），否则 -1 */
-static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k, gp_worker_t *w)
+GP_HOT static int px_setup(const gp_tri_t *t, const gp_rstate_t *s, pxs_t *k, gp_worker_t *w)
 {
 #ifdef GP_TEST_NO_PX
     return -1; /* 测试用：强制走通用路径，与快速路径逐像素对比 */
@@ -1675,7 +1769,13 @@ static bool state_is_fill(const gp_tri_t *t, const gp_rstate_t *s)
            (s->smp[0].tex == NULL || !(t->flags & GP_TF_TEX0) || t->o_t0 < 0);
 }
 
-static void raster_tile(gpu_core_t *c, int worker, int tile)
+/**
+ * 一个 64x64 tile 的全部光栅（fill / fast / px / generic 路径都内联在里面）。
+ * 整个函数放 IRAM：它原来在 flash，内层循环在 240 MHz 下被取指拖慢 —— 实测
+ * 只换这一个属性，Doom 静止 12.8 → 14.9 fps（tile 110 → 91 ms，pixel 64 → 54 ms），
+ * 说明 13 KB 的函数 + 逐像素循环把 flash 指令 cache 压得很厉害。
+ */
+GP_HOT static void raster_tile(gpu_core_t *c, int worker, int tile)
 {
     gp_bin_t *b = &c->bins[tile];
     if (b->count == 0) {

@@ -48,6 +48,8 @@ dsda-doom.exe ──SDL──> LoadLibrary("OPENGL32.DLL")   ← 应用目录优
 | `ESPGPU_GL_TRACE_FILE` | `espgpu-gltrace.txt` | 调用清单输出路径 |
 | `ESPGPU_GL_LOG` | `0` | `1` = 写 `espgpu-gl.log` |
 | `ESPGPU_GL_DEBUG_PLAN` | `0` | `1` = 日志里记每个批次的顶点编码（调带宽用） |
+| `ESPGPU_GL_DUMP` | 空 | 给了路径就把设备回传的帧存成 24 位 BMP（窗口遮挡时确认画面用） |
+| `ESPGPU_GL_DUMP_FRAME` | `90` | 上面那个 dump 在第几帧存 |
 
 设备打不开时，`espgpu` 模式会自动退回直通（日志里有一行 `switching to passthrough`），
 游戏照常运行，便于先排除游戏侧问题。运行中掉线（拔线 / 设备重启）时画面停住、游戏继续，
